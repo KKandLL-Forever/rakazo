@@ -123,7 +123,7 @@ async function mirrorRun(deps: MessagingDeliveryDeps, runId: string): Promise<vo
   const createdAt = Date.now();
   const rows = messages
     .flatMap((message) => {
-      const body = extractText(message.blocks);
+      const body = extractDmText(message.blocks);
       const parts = body ? splitOutboundBody(identity.provider, body) : [];
       return [
         ...parts.map((part, index) => ({
@@ -682,6 +682,54 @@ function extractArtifactIds(blocks: unknown): string[] {
       ? [block.artifactId]
       : [],
   );
+}
+
+/** Tells the user where to act on a card that a chat conversation cannot answer. */
+const OPEN_APP_HINT = "请在 Rakazo 网页中处理";
+
+interface CardBlock {
+  kind?: unknown;
+  text?: unknown;
+  detail?: unknown;
+  status?: unknown;
+  dismissed?: unknown;
+  input?: unknown;
+  approvalEffectId?: unknown;
+  actions?: unknown;
+}
+
+/**
+ * A DM carries the bot's text and the cards it is waiting on, so a paused run is never invisible
+ * in the chat. A free-text reply does not answer a card, so credentials, approvals and computer
+ * takeovers only point to the app. Groups keep `extractText`: cards never go to a room.
+ */
+function extractDmText(blocks: unknown): string {
+  if (!Array.isArray(blocks)) return "";
+  return blocks
+    .map(dmBlockText)
+    .filter((text): text is string => text !== null)
+    .join("\n")
+    .trim();
+}
+
+/** The text a block contributes, or null for a block that is not sent. */
+function dmBlockText(block: CardBlock | null): string | null {
+  if (typeof block !== "object" || block === null || typeof block.text !== "string") return null;
+  if (block.kind === "text") return block.text;
+  if (block.kind === "computer") return `${block.text}\n${OPEN_APP_HINT}`;
+  if (block.kind !== "ask" || block.status === "answered" || block.dismissed === true) return null;
+  // The detail of a credential or approval request is not for a chat transcript.
+  if (block.input === "secret" || block.approvalEffectId) return `${block.text}\n${OPEN_APP_HINT}`;
+  const options = Array.isArray(block.actions)
+    ? block.actions.flatMap((action: { label?: unknown } | null, index) =>
+        typeof action?.label === "string"
+          ? [`${String.fromCharCode(65 + index)}. ${action.label}`]
+          : [],
+      )
+    : [];
+  return [block.text, typeof block.detail === "string" ? block.detail : "", ...options]
+    .filter(Boolean)
+    .join("\n");
 }
 
 function extractText(blocks: unknown): string {

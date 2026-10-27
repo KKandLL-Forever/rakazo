@@ -1550,3 +1550,77 @@ describe("accepted outbound bookkeeping failures", () => {
     },
   );
 });
+
+describe("deliverMessagingOutbound cards in a DM", () => {
+  async function sentBodies(blocks: unknown[]) {
+    const deps = createDeps({ messages: [{ id: "m-1", blocks }] });
+    await deliverMessagingOutbound(deps, { runId: "run-1" }, context);
+    const calls = deps.sendToThread.mock.calls as unknown as Array<[{ body: string }]>;
+    return calls.map(([request]) => request.body);
+  }
+
+  it("sends a computer takeover with a pointer to the app", async () => {
+    expect(
+      await sentBodies([{ kind: "computer", state: "Needs you", text: "Scan the sign-in code." }]),
+    ).toEqual(["Scan the sign-in code.\n请在 Rakazo 网页中处理"]);
+  });
+
+  it("sends a question with its detail and lettered options, without a pointer", async () => {
+    expect(
+      await sentBodies([
+        {
+          kind: "ask",
+          text: "Add the note now?",
+          detail: "It has two attachments.",
+          status: "pending",
+          actions: [
+            { id: "now", label: "Add it now" },
+            { id: "later", label: "Only keep the rule" },
+          ],
+        },
+      ]),
+    ).toEqual(["Add the note now?\nIt has two attachments.\nA. Add it now\nB. Only keep the rule"]);
+  });
+
+  it.each([
+    [
+      "a credential request",
+      { kind: "ask", text: "Need an API key.", input: "secret", detail: "stored as KEY=abc" },
+    ],
+    [
+      "an approval",
+      {
+        kind: "ask",
+        text: "Allow fetching example.test?",
+        approvalEffectId: "effect-1",
+        detail: "GET https://example.test/private",
+        actions: [
+          { id: "allow", label: "Allow" },
+          { id: "deny", label: "Deny" },
+        ],
+      },
+    ],
+  ])("sends %s as its question only, with a pointer to the app", async (_label, block) => {
+    const [body] = await sentBodies([block]);
+    expect(body).toBe(`${block.text}\n请在 Rakazo 网页中处理`);
+  });
+
+  it.each([
+    ["answered", { kind: "ask", text: "Details?", status: "answered", answer: "yes" }],
+    ["dismissed", { kind: "ask", text: "Token?", input: "secret", dismissed: true }],
+  ])("sends nothing for a %s question", async (_label, block) => {
+    expect(await sentBodies([block])).toEqual([]);
+  });
+
+  it("keeps the spacing between text blocks and ignores other card kinds", async () => {
+    expect(
+      await sentBodies([
+        { kind: "text", text: "first" },
+        { kind: "text", text: "" },
+        { kind: "text", text: "second" },
+        { kind: "progress", text: "working" },
+        { kind: "choice", question: "Pick one", options: [] },
+      ]),
+    ).toEqual(["first\n\nsecond"]);
+  });
+});

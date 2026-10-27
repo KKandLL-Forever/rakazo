@@ -294,7 +294,7 @@ export function messagingPlatformsFromEnv(
   if (env.larkAppId && env.larkAppSecret && env.larkVerificationToken) {
     platforms.push({
       provider: "lark",
-      capabilities: { direct: true, groups: false, receipt: null },
+      capabilities: { direct: true, groups: false, receipt: "typing" },
       // Webhook-only: ws/long-connection incoming would consume events so
       // the HTTP webhook at /api/v1/messaging/webhook/lark never sees them.
       adapter: new LazyLarkAdapter({

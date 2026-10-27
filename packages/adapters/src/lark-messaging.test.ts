@@ -143,6 +143,8 @@ beforeEach(() => {
         headers: { "content-type": "application/octet-stream" },
       };
     }
+    const reaction = /\/im\/v1\/messages\/([^/]+)\/reactions(?:\/[^/]+)?$/.exec(url);
+    if (reaction) return { code: 0, data: { reaction_id: `re-${reaction[1]}` } };
     if (url.endsWith("/auth/v3/tenant_access_token/internal")) {
       return { code: 0, tenant_access_token: "test-access-token", expire: 7200 };
     }
@@ -461,7 +463,7 @@ describe("Lark messaging conformance", () => {
     expect(adapter.parseMessage(payload.event).text).toBe(expected);
   });
 
-  it("uses the selected API origin and keeps typing passive", async () => {
+  it("uses the selected API origin and shows no indicator without an inbound message", async () => {
     const adapter = new LazyLarkAdapter({
       appId: "test-app",
       appSecret: "test-secret",
@@ -470,7 +472,7 @@ describe("Lark messaging conformance", () => {
       domain: Domain.Lark,
       httpInstance,
     });
-    await adapter.startTyping();
+    await adapter.startTyping(encodeThreadId({ chatId: "oc-test" }));
     expect(request).not.toHaveBeenCalled();
     await adapter.openDM!("ou-test");
     expect(request).toHaveBeenCalledWith(
@@ -554,5 +556,93 @@ describe("Lark inbound images", () => {
     expect(request).not.toHaveBeenCalledWith(
       expect.objectContaining({ url: expect.stringContaining("/resources/") }),
     );
+  });
+});
+
+describe("Lark working indicator", () => {
+  async function receive(...payloads: ReturnType<typeof message>[]) {
+    const { surface, events } = createSurface();
+    for (const payload of payloads) await surface.handleWebhook("lark", webhook(payload));
+    return { surface, events: events as MessagingInboundMessage[] };
+  }
+  function secondMessage() {
+    const payload = message();
+    payload.header.event_id = "event-test-2";
+    payload.event.message.message_id = "om-test-2";
+    return payload;
+  }
+  // The reaction calls in the order they were made, as "METHOD message".
+  function reactionCalls() {
+    return request.mock.calls
+      .map(([call]) => call as { url: string; method?: string })
+      .filter((call) => call.url.includes("/reactions"))
+      .map((call) => `${call.method} ${/messages\/([^/]+)\//.exec(call.url)![1]}`);
+  }
+
+  it("marks the newest message when a run starts and clears it once the reply is sent", async () => {
+    const { surface, events } = await receive(message());
+    const [{ threadId, handle }] = events as [MessagingInboundMessage];
+    await surface.acknowledge(threadId, handle, context);
+    expect(request).toHaveBeenCalledWith(
+      expect.objectContaining({
+        method: "POST",
+        url: expect.stringMatching(/\/im\/v1\/messages\/om-test\/reactions$/),
+        data: { reaction_type: { emoji_type: "Typing" } },
+      }),
+    );
+    expect(reactionCalls()).toEqual(["POST om-test"]);
+    await surface.sendToThread({ threadId, body: "done" }, context);
+    expect(request).toHaveBeenCalledWith(
+      expect.objectContaining({
+        method: "DELETE",
+        url: expect.stringMatching(/\/messages\/om-test\/reactions\/re-om-test$/),
+      }),
+    );
+    expect(reactionCalls()).toEqual(["POST om-test", "DELETE om-test"]);
+  });
+
+  it("marks a message only once", async () => {
+    const { surface, events } = await receive(message());
+    const [{ threadId, handle }] = events as [MessagingInboundMessage];
+    await surface.acknowledge(threadId, handle, context);
+    await surface.acknowledge(threadId, handle, context);
+    expect(reactionCalls()).toEqual(["POST om-test"]);
+  });
+
+  it("moves the indicator to a newer message", async () => {
+    const { surface, events } = await receive(message());
+    const [{ threadId, handle }] = events as [MessagingInboundMessage];
+    await surface.acknowledge(threadId, handle, context);
+    await surface.handleWebhook("lark", webhook(secondMessage()));
+    await surface.acknowledge(threadId, "om-test-2", context);
+    expect(reactionCalls()).toEqual(["POST om-test", "DELETE om-test", "POST om-test-2"]);
+  });
+
+  it("still delivers the reply when the indicator cannot be removed", async () => {
+    const { surface, events } = await receive(message());
+    const [{ threadId, handle }] = events as [MessagingInboundMessage];
+    await surface.acknowledge(threadId, handle, context);
+    const respond = request.getMockImplementation()!;
+    request.mockImplementation(async (call: { method?: string }) => {
+      if (call.method === "DELETE") throw new Error("Reaction is gone");
+      return respond(call);
+    });
+    expect(await surface.sendToThread({ threadId, body: "done" }, context)).toEqual({
+      handle: "om-reply",
+    });
+  });
+
+  it("removes the indicator when no reply ever comes", async () => {
+    const { surface, events } = await receive(message());
+    const [{ threadId, handle }] = events as [MessagingInboundMessage];
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      await surface.acknowledge(threadId, handle, context);
+      expect(reactionCalls()).toEqual(["POST om-test"]);
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      expect(reactionCalls()).toEqual(["POST om-test", "DELETE om-test"]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

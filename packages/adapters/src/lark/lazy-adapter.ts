@@ -29,7 +29,6 @@ export class LarkAdapterBase {
   renderFormatted(content: FormattedContent) {
     return stringifyMarkdown(content);
   }
-  async startTyping() {}
   async fetchMessages(): Promise<never> {
     throw new NotImplementedError("Lark message history is not supported");
   }
@@ -84,6 +83,9 @@ export class LazyLarkAdapter extends LarkAdapterBase implements Adapter {
   }
   async openDM(userId: string) {
     return (await this.load()).openDM(userId);
+  }
+  async startTyping(threadId: string) {
+    await (await this.load()).startTyping(threadId);
   }
   async disconnect() {
     await this.implementation?.disconnect();

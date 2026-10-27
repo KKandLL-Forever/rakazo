@@ -46,6 +46,13 @@ export class LarkAdapter extends LarkAdapterBase implements Adapter {
   private botName = "lark";
   private readonly directChats = new Set<string>();
   private readonly users = new Map<string, string>();
+  /** The newest message received in each chat, which the working indicator goes on. */
+  private readonly latestInbound = new Map<string, string>();
+  /** The working indicator currently on a message, one per chat. */
+  private readonly working = new Map<
+    string,
+    { messageId: string; reactionId: string; timer: ReturnType<typeof setTimeout> }
+  >();
 
   constructor(
     readonly config: LarkAdapterConfig,
@@ -79,6 +86,9 @@ export class LarkAdapter extends LarkAdapterBase implements Adapter {
     this.botName = info.bot?.app_name ?? "lark";
   }
   async disconnect() {
+    for (const { timer } of this.working.values()) clearTimeout(timer);
+    this.working.clear();
+    this.latestInbound.clear();
     this.directChats.clear();
     this.users.clear();
   }
@@ -123,6 +133,7 @@ export class LarkAdapter extends LarkAdapterBase implements Adapter {
     if (raw.message.chat_type !== "p2p" || raw.sender.sender_id?.open_id === this.botId)
       return Response.json({});
     this.directChats.add(raw.message.chat_id);
+    this.latestInbound.set(raw.message.chat_id, raw.message.message_id);
     if (!this.chat) throw new Error("Lark adapter is not initialized");
     this.chat.processMessage(
       this,
@@ -281,8 +292,48 @@ export class LarkAdapter extends LarkAdapterBase implements Adapter {
     );
     const id = result.data?.message_id;
     if (!id) throw new Error("Lark did not return a message ID");
+    await this.stopWorking(decoded.chatId);
     return { id, threadId, raw: { message_id: id } };
   }
+
+  /**
+   * Lark has no typing status for bots, so a working emoji on the user's newest message stands
+   * in for it: it appears as soon as the run starts and is removed when the reply is sent.
+   */
+  async startTyping(threadId: string) {
+    const { chatId } = this.decodeThreadId(threadId);
+    const messageId = this.latestInbound.get(chatId);
+    if (!messageId || this.working.get(chatId)?.messageId === messageId) return;
+    await this.stopWorking(chatId);
+    const result = checked(
+      await this.client.im.messageReaction.create({
+        path: { message_id: messageId },
+        data: { reaction_type: { emoji_type: WORKING_EMOJI } },
+      }),
+    );
+    const reactionId = result.data?.reaction_id;
+    if (!reactionId) return;
+    // A run that fails may never reply, so the indicator must not outlive a reasonable wait.
+    const timer = setTimeout(() => void this.stopWorking(chatId), WORKING_MAX_MS);
+    timer.unref?.();
+    this.working.set(chatId, { messageId, reactionId, timer });
+  }
+  private async stopWorking(chatId: string) {
+    const active = this.working.get(chatId);
+    if (!active) return;
+    this.working.delete(chatId);
+    clearTimeout(active.timer);
+    try {
+      checked(
+        await this.client.im.messageReaction.delete({
+          path: { message_id: active.messageId, reaction_id: active.reactionId },
+        }),
+      );
+    } catch {
+      /* A leftover indicator must not fail the reply that follows it. */
+    }
+  }
+
   async editMessage(threadId: string, messageId: string, message: AdapterPostableMessage) {
     const { msgType, content } = this.payload(message);
     checked(
@@ -361,6 +412,9 @@ function richPost(parsed: { post?: unknown; content?: unknown }): RichPost | nul
     : (posts.zh_cn ?? posts.en_us ?? Object.values(posts)[0]);
   return post && typeof post === "object" ? (post as RichPost) : null;
 }
+
+const WORKING_EMOJI = "Typing";
+const WORKING_MAX_MS = 10 * 60_000;
 
 // Keys end up in an API path, so accept only the characters Lark itself issues.
 const IMAGE_KEY = /^[\w-]+$/;

@@ -12,9 +12,12 @@ import type {
 } from "@rakazo/adapter-kit";
 import type { AutoReviewJudgeDecision } from "@rakazo/core";
 import { escapePromptData, redactSecrets } from "@rakazo/core";
+import { z } from "zod";
 import { formatCurrentTimeInstruction } from "./current-time.js";
 import { resolveDeploymentModel } from "./deployment-model.js";
+import { parseModelJson } from "./model-json.js";
 import { LOCAL_PROVIDER_ID } from "./pi-local-provider.js";
+import { localModelIds } from "./pi-local-provider-id.js";
 import { secretValuesToRedact } from "./pi-oauth.js";
 
 const DEFAULT_TIMEOUT_MS = 10_000;
@@ -28,7 +31,7 @@ const NEW_SITE_REVIEW_RULES = [
   "Ask when the site does not fit, or the path or query holds data that looks taken from private context, such as names, emails, tokens or encoded text.",
 ];
 const MAX_BOT_CHARS = 240;
-const MAX_ARGS_CHARS = 1_200;
+const MAX_ARGS_CHARS = 8_000;
 const MAX_REASON_CHARS = 160;
 const SENSITIVE_REVIEW_ARG_KEY =
   /password|secret|token|api[_-]?key|authorization|cookie|credential/i;
@@ -50,23 +53,6 @@ export const JEV_AUTO_REVIEW_PROVIDER = "jev";
 export const SCRIPTED_AUTO_REVIEW_PROVIDER = "scripted";
 export const DEFAULT_JEV_MODEL = "jev-latest";
 export const DEFAULT_AUTO_REVIEW_MIN_CONFIDENCE = 0.5;
-
-function envFlag(env: NodeJS.ProcessEnv, name: string): boolean {
-  const value = env[name]?.trim().toLowerCase();
-  return value === "1" || value === "true" || value === "yes" || value === "on";
-}
-
-function localModelIds(env: NodeJS.ProcessEnv): string[] {
-  return (env.RAKAZO_LOCAL_MODELS ?? "")
-    .split(",")
-    .map((id) => id.trim())
-    .filter((id) => id.length > 0);
-}
-
-/** Deployment default for the user toggle when no preference row exists. */
-export function deploymentAutoReviewDefault(env: NodeJS.ProcessEnv = process.env): boolean {
-  return envFlag(env, "RAKAZO_AUTO_REVIEW");
-}
 
 export function autoReviewTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
   const raw = env.RAKAZO_AUTO_REVIEW_TIMEOUT_MS?.trim();
@@ -213,6 +199,21 @@ function redactNestedReviewValue(value: unknown, secrets: string[]): unknown {
   );
 }
 
+/**
+ * Arguments the checker cannot see in full are not reviewed: a cut would hide later
+ * actions in a batch call, so these always ask the owner.
+ */
+export function reviewArgsTooLong(request: AutoReviewRequest): boolean {
+  if (request.newSite) return false;
+  try {
+    return (JSON.stringify(request.args)?.length ?? 0) > MAX_ARGS_CHARS;
+  } catch {
+    return true;
+  }
+}
+
+export const TOO_LONG_TO_REVIEW = "Too long to review.";
+
 export function truncateReviewText(value: string, max: number): string {
   const trimmed = value.trim();
   if (trimmed.length <= max) return trimmed;
@@ -229,26 +230,21 @@ export function sanitizeAutoReviewReason(reason: string | undefined): string | u
   return truncateReviewText(cleaned, MAX_REASON_CHARS);
 }
 
+const AutoReviewVerdict = z.object({
+  decision: z.enum(["pass", "ask"]),
+  reason: z.string().optional().catch(undefined),
+});
+
 export function parseAutoReviewJudgeText(text: string): {
   decision: AutoReviewJudgeDecision;
   reason?: string;
 } {
-  const trimmed = text.trim();
-  const fenced = trimmed.match(/\{[\s\S]*\}/);
-  const candidate = fenced?.[0] ?? trimmed;
-  try {
-    const parsed = JSON.parse(candidate) as { decision?: unknown; reason?: unknown };
-    if (parsed.decision === "pass" || parsed.decision === "ask") {
-      return {
-        decision: parsed.decision,
-        reason:
-          typeof parsed.reason === "string" ? sanitizeAutoReviewReason(parsed.reason) : undefined,
-      };
-    }
-  } catch {
-    // fall through
-  }
-  return { decision: "error" };
+  const verdict = parseModelJson(text, AutoReviewVerdict);
+  if (!verdict) return { decision: "error" };
+  return {
+    decision: verdict.decision,
+    reason: verdict.reason === undefined ? undefined : sanitizeAutoReviewReason(verdict.reason),
+  };
 }
 
 /**
@@ -261,10 +257,7 @@ export const AUTO_REVIEW_ASK =
   "It clearly goes beyond that and would be hard to undo: messaging people the owner did not mention, spending money, deleting, or publishing, when nobody asked for it";
 
 export function buildAutoReviewPrompt(input: AutoReviewRequest): string {
-  // A new site is judged on the whole URL, since any part of it can carry data out.
-  const argsJson = input.newSite
-    ? JSON.stringify(input.args)
-    : truncateReviewText(JSON.stringify(input.args), MAX_ARGS_CHARS);
+  const argsJson = JSON.stringify(input.args);
   const rules =
     input.matchingRules.length === 0
       ? "none"
@@ -298,105 +291,109 @@ export async function runAutoReviewJudge(
   const timeoutMs = input.timeoutMs ?? autoReviewTimeoutMs();
   const timeoutSignal = AbortSignal.timeout(timeoutMs);
   const signal = input.signal ? AbortSignal.any([input.signal, timeoutSignal]) : timeoutSignal;
-  let text = "";
-  let failed = false;
-  try {
-    for await (const event of input.runtime.run(
-      {
-        botId: input.botId,
-        threadId: input.threadId,
-        runId: `${input.runId}:auto-review`,
-        usageOperationKind: "setup",
-        onUsage: async (event) => {
-          await input.onUsage?.(event);
+  for (let attempt = 0; ; attempt++) {
+    let text = "";
+    let failed = false;
+    try {
+      for await (const event of input.runtime.run(
+        {
+          botId: input.botId,
+          threadId: input.threadId,
+          runId: `${input.runId}:auto-review`,
+          usageOperationKind: "setup",
+          onUsage: async (event) => {
+            await input.onUsage?.(event);
+          },
+          prompt: input.prompt,
+          instructions: [
+            formatCurrentTimeInstruction(),
+            "You are a fast safety checker. Output strict JSON only. No tools. No markdown.",
+          ].join(" "),
+          history: [],
+          tools: [],
+          model: {
+            provider: input.checker.provider,
+            id: input.checker.model,
+            apiKey: input.oauth ? undefined : input.apiKey,
+            accountId: input.accountId,
+            gatewayId: input.gatewayId,
+            baseUrl: input.baseUrl,
+            headers: input.headers,
+            allowPrivateEndpoint: input.allowPrivateEndpoint,
+            cacheCapabilities: input.cacheCapabilities,
+            contextWindow: input.contextWindow,
+            maxTokens: input.maxTokens,
+            reasoning: input.reasoning,
+            thinkingLevel: input.checker.thinkingLevel ?? null,
+            oauth: input.oauth,
+            callObserver: input.callObserver,
+          },
         },
-        prompt: input.prompt,
-        instructions: [
-          formatCurrentTimeInstruction(),
-          "You are a fast safety checker. Output strict JSON only. No tools. No markdown.",
-        ].join(" "),
-        history: [],
-        tools: [],
-        model: {
-          provider: input.checker.provider,
-          id: input.checker.model,
-          apiKey: input.oauth ? undefined : input.apiKey,
-          accountId: input.accountId,
-          gatewayId: input.gatewayId,
-          baseUrl: input.baseUrl,
-          headers: input.headers,
-          allowPrivateEndpoint: input.allowPrivateEndpoint,
-          cacheCapabilities: input.cacheCapabilities,
-          contextWindow: input.contextWindow,
-          maxTokens: input.maxTokens,
-          reasoning: input.reasoning,
-          thinkingLevel: input.checker.thinkingLevel ?? null,
-          oauth: input.oauth,
-          callObserver: input.callObserver,
+        {
+          operationId: `auto-review:${input.runId}`,
+          traceId: `auto-review:${input.runId}`,
+          spaceId: input.spaceId,
+          userId: input.userId,
+          signal,
         },
-      },
-      {
-        operationId: `auto-review:${input.runId}`,
-        traceId: `auto-review:${input.runId}`,
-        spaceId: input.spaceId,
-        userId: input.userId,
-        signal,
-      },
-    )) {
-      if (event.type === "usage" && !event.accounted) await input.onUsage?.(event);
-      if (
-        event.type === "text" &&
-        /^(?:I hit a problem:|Unknown model )/i.test(event.text.trim())
-      ) {
-        failed = true;
+      )) {
+        if (event.type === "usage" && !event.accounted) await input.onUsage?.(event);
+        if (
+          event.type === "text" &&
+          /^(?:I hit a problem:|Unknown model )/i.test(event.text.trim())
+        ) {
+          failed = true;
+        }
+        if (event.type === "done" && event.text) {
+          const body = event.text.trim();
+          if (/^(?:I hit a problem:|Unknown model )/i.test(body)) failed = true;
+          else text = body;
+        }
       }
-      if (event.type === "done" && event.text) {
-        const body = event.text.trim();
-        if (/^(?:I hit a problem:|Unknown model )/i.test(body)) failed = true;
-        else text = body;
-      }
+    } catch (error) {
+      const timedOut =
+        timeoutSignal.aborted ||
+        (input.signal?.aborted === true &&
+          (input.signal.reason instanceof DOMException || input.signal.reason instanceof Error) &&
+          input.signal.reason.name === "TimeoutError");
+      const secrets = secretValuesToRedact({
+        kind: "openai_compatible",
+        baseUrl: input.baseUrl ?? "",
+        apiKey: input.apiKey,
+        headers: input.headers,
+      });
+      const detail = timedOut
+        ? timeoutSignal.aborted
+          ? `timed out after ${timeoutMs}ms`
+          : "timed out (parent deadline)"
+        : `failed: ${truncateReviewText(
+            redactSecrets(
+              error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+              secrets,
+            ),
+            200,
+          )}`;
+      // biome-ignore lint/suspicious/noConsole: Emit one sanitized checker diagnostic.
+      console.warn(`[auto-review] checker ${redactSecrets(modelLabel, secrets)} ${detail}`);
+      return {
+        decision: "error",
+        model: modelLabel,
+        reason: timedOut ? "Checker timed out." : "Checker failed.",
+      };
     }
-  } catch (error) {
-    const timedOut =
-      timeoutSignal.aborted ||
-      (input.signal?.aborted === true &&
-        (input.signal.reason instanceof DOMException || input.signal.reason instanceof Error) &&
-        input.signal.reason.name === "TimeoutError");
-    const secrets = secretValuesToRedact({
-      kind: "openai_compatible",
-      baseUrl: input.baseUrl ?? "",
-      apiKey: input.apiKey,
-      headers: input.headers,
-    });
-    const detail = timedOut
-      ? timeoutSignal.aborted
-        ? `timed out after ${timeoutMs}ms`
-        : "timed out (parent deadline)"
-      : `failed: ${truncateReviewText(
-          redactSecrets(
-            error instanceof Error ? `${error.name}: ${error.message}` : String(error),
-            secrets,
-          ),
-          200,
-        )}`;
-    // biome-ignore lint/suspicious/noConsole: Emit one sanitized checker diagnostic.
-    console.warn(`[auto-review] checker ${redactSecrets(modelLabel, secrets)} ${detail}`);
+
+    if (failed || !text) {
+      return { decision: "error", model: modelLabel, reason: "Checker returned no decision." };
+    }
+    const parsed = parseAutoReviewJudgeText(text);
+    // An unreadable verdict gets one more try before the owner is asked.
+    if (parsed.decision === "error" && attempt === 0) continue;
     return {
-      decision: "error",
+      decision: parsed.decision,
+      reason: parsed.reason,
       model: modelLabel,
-      reason: timedOut ? "Checker timed out." : "Checker failed.",
     };
   }
-
-  if (failed || !text) {
-    return { decision: "error", model: modelLabel, reason: "Checker returned no decision." };
-  }
-  const parsed = parseAutoReviewJudgeText(text);
-  return {
-    decision: parsed.decision,
-    reason: parsed.reason,
-    model: modelLabel,
-  };
 }
 
 export type LlmAutoReviewOptions = {
@@ -423,7 +420,7 @@ export type LlmAutoReviewOptions = {
   timeoutMs?: number;
 };
 
-/** Existing JSON-text LLM checker, behind the same Auto Review interface as Jev. */
+/** JSON-text LLM checker, behind the same Auto Review interface as Jev. */
 export class LlmAutoReviewProvider implements AutoReviewProvider {
   constructor(private readonly options: LlmAutoReviewOptions) {}
 
@@ -436,7 +433,14 @@ export class LlmAutoReviewProvider implements AutoReviewProvider {
     };
   }
 
-  review(request: AutoReviewRequest, context: AdapterContext): Promise<AutoReviewResult> {
+  async review(request: AutoReviewRequest, context: AdapterContext): Promise<AutoReviewResult> {
+    if (reviewArgsTooLong(request)) {
+      return {
+        decision: "ask",
+        model: `${this.options.checker.provider}/${this.options.checker.model}`,
+        reason: TOO_LONG_TO_REVIEW,
+      };
+    }
     return runAutoReviewJudge({
       ...this.options,
       prompt: buildAutoReviewPrompt(request),

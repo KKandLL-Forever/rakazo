@@ -6,7 +6,13 @@ import { readBodyCapped } from "./web-ssrf.js";
 
 /** A 2,000-character utterance should stay far below this, even at high MP3 bitrates. */
 export const MAX_SYNTHESIZED_AUDIO_BYTES = 16 * 1024 * 1024;
+export const MAX_SPEAK_CHARS = 2000;
 export const MAX_VOICE_JSON_BYTES = 1024 * 1024;
+
+/** Header-safe speech model id. A connection override wins over the deployment default. */
+export function isSpeechModelId(value: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(value);
+}
 
 /** Client disconnect plus a hard deadline — `context.signal` is always set. */
 export function voiceDeadline(signal: AbortSignal, ms: number): AbortSignal {
@@ -177,7 +183,7 @@ export function voiceAccountIssue(
   return !reason || reason === "invalid_api_key" ? "VOICE_KEY_REJECTED" : undefined;
 }
 
-/** The error a failed provider request throws; account issues carry their code. */
+/** The error a failed provider request throws; any 401 or 403 is the user's account to fix. */
 export function voiceRequestError(
   status: number,
   provider: string,
@@ -188,7 +194,9 @@ export function voiceRequestError(
 ): Error {
   const message = voiceHttpError(status, provider, what, body);
   const code = voiceAccountIssue(status, rawBody);
-  return code ? new VoiceAccountError(code, message) : new Error(message);
+  return code || status === 401 || status === 403
+    ? new VoiceAccountError(code, message)
+    : new Error(message);
 }
 
 export async function requireOk(res: Response, provider: string, what: string): Promise<Response> {
@@ -223,4 +231,15 @@ export async function verifyVoiceHttpGet(options: {
       message: voiceUnreachable(options.provider),
     };
   }
+}
+
+const LANGUAGE_TAG = /^([A-Za-z]{2,3})(?:-[A-Za-z0-9]{2,8})*$/;
+
+/**
+ * The lowercase primary language subtag speech-to-text providers expect, or undefined when the
+ * value is not a tag we can honor ("es-ES" and "es" both ask for Spanish).
+ */
+export function voiceLanguageHint(language: string | undefined): string | undefined {
+  const match = LANGUAGE_TAG.exec(language?.trim() ?? "");
+  return match?.[1] ? match[1].toLowerCase() : undefined;
 }

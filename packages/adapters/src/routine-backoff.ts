@@ -14,6 +14,13 @@ interface RoutineBackoffDeps {
   jobs: JobPublisher;
 }
 
+/**
+ * The routine a run belongs to, and who started it. A run started by someone other than the
+ * routine's owner, such as a member's test, used their accounts, so it says nothing about the
+ * owner's: it neither backs the schedule off nor clears it.
+ */
+export type RoutineRunRef = { routineId: string; userId: string };
+
 type RoutineSchedule = {
   active: boolean;
   crons: string[];
@@ -37,18 +44,16 @@ const ACCOUNT_REFUSAL_KINDS = new Set<RunErrorKind>([
 ]);
 
 /**
- * Whether the provider refused the account in a way that stays refused until the user acts.
- * Rate limits, timeouts, unusable output and limits that reset on a date do not count.
+ * Whether the provider refused the account in a way that stays refused until the user acts or
+ * until the reset it named, with that reset. Rate limits, timeouts, unusable output and periodic
+ * limits without a reset time do not count.
  */
-export function isModelAccountRefusal(error: unknown): boolean {
-  if (!(error instanceof ModelAccountError)) return false;
+export function modelAccountRefusal(error: unknown): { resetAt?: Date } | undefined {
+  if (!(error instanceof ModelAccountError)) return undefined;
   const { kind, period, resetAt } = normalizeRunError(error.message);
-  return (
-    kind !== undefined &&
-    ACCOUNT_REFUSAL_KINDS.has(kind) &&
-    (period === undefined || period === "none") &&
-    resetAt === undefined
-  );
+  if (kind === undefined || !ACCOUNT_REFUSAL_KINDS.has(kind)) return undefined;
+  if (resetAt !== undefined) return { resetAt: new Date(resetAt) };
+  return period === undefined || period === "none" ? {} : undefined;
 }
 
 export function routineAccountBackoffMs(failures: number): number {
@@ -59,19 +64,26 @@ export function routineAccountBackoffMs(failures: number): number {
 }
 
 /**
- * A missing or refused model connection of the user's own fails every run the same way until
- * the user fixes it, so a frequent routine would keep firing against it. Push
- * its next run out by a gap that doubles with each such failure in a row.
+ * A missing or refused model connection of the user's own, or a spent computer allowance, fails
+ * every run the same way until the user acts or the period resets, so a frequent routine would
+ * keep firing against it. Push
+ * its next run out by a gap that doubles with each such failure in a row, or to the reset the
+ * provider named, at most a day away.
  */
 export async function backOffRoutineAfterAccountError(
   deps: RoutineBackoffDeps,
-  routineId: string,
+  run: RoutineRunRef,
   now = new Date(),
+  resetAt?: Date,
 ): Promise<void> {
-  await updateSchedule(deps, routineId, "routine.backoff", (routine) => {
+  await updateSchedule(deps, run, "routine.backoff", (routine) => {
     const accountFailures = routine.accountFailures + 1;
     if (!routine.active || !routine.nextRunAt) return { accountFailures };
-    const resumeAt = new Date(now.getTime() + routineAccountBackoffMs(accountFailures));
+    const resumeAt = new Date(
+      resetAt
+        ? Math.min(resetAt.getTime(), now.getTime() + ROUTINE_ACCOUNT_BACKOFF_MAX_MS)
+        : now.getTime() + routineAccountBackoffMs(accountFailures),
+    );
     if (routine.nextRunAt >= resumeAt) return { accountFailures };
     // A timer routine keeps its cadence after the gap; a change trigger just checks again then.
     const nextRunAt =
@@ -88,18 +100,24 @@ export async function backOffRoutineAfterAccountError(
  */
 export async function clearRoutineBackoff(
   deps: RoutineBackoffDeps,
-  routineId: string,
+  run: RoutineRunRef,
   now = new Date(),
 ): Promise<void> {
   // Most completions have nothing to clear; skip the locked write for them.
   const held = await deps.prisma.routine
-    .count({ where: { id: routineId, accountFailures: { gt: 0 } } })
+    .count({
+      where: {
+        id: run.routineId,
+        accountFailures: { gt: 0 },
+        userId: run.userId,
+      },
+    })
     .catch((error: unknown) => {
       getLogger().error("routine.backoff_clear", error);
       return 0;
     });
   if (held === 0) return;
-  await updateSchedule(deps, routineId, "routine.backoff_clear", (routine) => {
+  await updateSchedule(deps, run, "routine.backoff_clear", (routine) => {
     if (routine.accountFailures === 0) return null;
     if (!routine.active || !routine.nextRunAt || routine.watch != null) {
       return { accountFailures: 0 };
@@ -117,10 +135,11 @@ export async function clearRoutineBackoff(
  */
 async function updateSchedule(
   deps: RoutineBackoffDeps,
-  routineId: string,
+  run: RoutineRunRef,
   logMessage: string,
   change: (routine: RoutineSchedule) => { accountFailures: number; nextRunAt?: Date } | null,
 ): Promise<void> {
+  const { routineId } = run;
   try {
     const nextRunAt = await deps.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
       await tx.$queryRaw`SELECT id FROM routines WHERE id = ${routineId} FOR UPDATE`;
@@ -133,8 +152,10 @@ async function updateSchedule(
           watch: true,
           nextRunAt: true,
           accountFailures: true,
+          userId: true,
         },
       });
+      if (routine && routine.userId !== run.userId) return null;
       const data = routine ? change(routine) : null;
       if (!data) return null;
       await tx.routine.update({ where: { id: routineId }, data });

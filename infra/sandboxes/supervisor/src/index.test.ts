@@ -5,7 +5,8 @@ import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { resolveSupervisorToken } from "@rakazo/core";
-import { describe, expect, it } from "vitest";
+import type Docker from "dockerode";
+import { describe, expect, it, vi } from "vitest";
 import {
   MAX_SUPERVISOR_FILE_REQUEST_BYTES,
   MAX_SUPERVISOR_REQUEST_BYTES,
@@ -30,6 +31,7 @@ import {
   containerActionStep,
   containerActionSteps,
   controlHandlesActions,
+  createComputerWithNameRetry,
   createDockerStreamDemuxer,
   currentComputerScreens,
   DOCKER_BROWSER_ALIASES,
@@ -39,15 +41,20 @@ import {
   hasValidBearerToken,
   interactiveScreenCommand,
   isComputerControlUnavailable,
+  isManagedComputer,
   nextScreenIndex,
   normalizeWorkspaceRelative,
   oldestIdleScreen,
+  pageBrowserNotReady,
   parseObservation,
   preferComputerControl,
   releaseAssignedScreen,
+  removeOwnedComputer,
   resetManagedScreensCommand,
+  SCREEN_REUSE_MS,
   sandboxCommandTimedOut,
   sandboxTimeoutCommand,
+  screenRecentlyEnsured,
   screenReleaseStopCommand,
   shouldReplayComputerActions,
   stopExtraScreenCommand,
@@ -72,10 +79,8 @@ describe("computer screen readiness", () => {
   });
 
   it("does not treat an open TCP port as ready when nothing is serving HTTP on it yet", async () => {
-    // Regression test: a bare TCP accept (e.g. the Docker port mapping coming
-    // up before websockify inside the container does) must not be mistaken
-    // for the screen being ready — that gap is exactly what caused
-    // "socket hang up" in the browser.
+    // A bare TCP accept (the port mapping up before websockify) is not ready:
+    // that gap caused "socket hang up" in the browser.
     const server = net.createServer((socket) => socket.destroy());
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
     const address = server.address();
@@ -199,6 +204,15 @@ describe("sandbox supervisor HTTP boundary", () => {
     expect(hasValidBearerToken("Basic credentials", token)).toBe(false);
     expect(hasValidBearerToken(`Bearer ${"x".repeat(token.length)}`, token)).toBe(false);
     expect(hasValidBearerToken(`Bearer ${token}`, token)).toBe(true);
+    expect(hasValidBearerToken(`bearer ${token}`, token)).toBe(true);
+    expect(hasValidBearerToken(`BEARER ${token}`, token)).toBe(true);
+    expect(hasValidBearerToken(`bEaReR ${token}`, token)).toBe(true);
+    expect(hasValidBearerToken("bearer Secret-token", "secret-token")).toBe(false);
+    expect(hasValidBearerToken(`Bearer${token}`, token)).toBe(false);
+    expect(hasValidBearerToken(`Bearer  ${token}`, token)).toBe(false);
+    expect(hasValidBearerToken(`Bearer\t${token}`, token)).toBe(false);
+    expect(hasValidBearerToken(`Bearer ${token}x`, token)).toBe(false);
+    expect(hasValidBearerToken(`Bearer ${token.slice(0, -1)}`, token)).toBe(false);
   });
 
   it("bounds authenticated control request bodies before JSON parsing", async () => {
@@ -778,6 +792,37 @@ describe("sandbox supervisor input containment", () => {
       expect(nextScreenIndex(assigned, `bot-${index}`)).toBe(index);
   });
 
+  it("trusts a screen's setup for a short time unless it is released or human-held", () => {
+    const now = 1_000_000;
+    expect(screenRecentlyEnsured({ index: 0, ensuredAt: now }, now + SCREEN_REUSE_MS - 1)).toBe(
+      true,
+    );
+    expect(screenRecentlyEnsured({ index: 0, ensuredAt: now }, now + SCREEN_REUSE_MS)).toBe(false);
+    expect(screenRecentlyEnsured({ index: 0 }, now)).toBe(false);
+    expect(screenRecentlyEnsured({ index: 0, ensuredAt: now, controlled: true }, now)).toBe(false);
+    expect(screenRecentlyEnsured({ index: 0, ensuredAt: now, controlToken: "token" }, now)).toBe(
+      false,
+    );
+    const assigned = new Map<string, ScreenAssignment>([["bot", { index: 0, ensuredAt: now }]]);
+    releaseAssignedScreen(assigned, "bot");
+    completeWarmReleasedScreen(assigned, "bot", 0, now);
+    expect(screenRecentlyEnsured(assigned.get("bot"), now)).toBe(false);
+  });
+
+  it("recognizes only a page helper that reached no browser before acting", () => {
+    const output = (value: object) => ({ code: 0, stdout: JSON.stringify(value) });
+    expect(pageBrowserNotReady(output({ ok: false, error: "CDP not ready on port 9222: x" }))).toBe(
+      true,
+    );
+    expect(
+      pageBrowserNotReady(output({ ok: false, error: "CDP not ready", uncertain: true })),
+    ).toBe(false);
+    expect(pageBrowserNotReady(output({ ok: false, error: "Element not found" }))).toBe(false);
+    expect(pageBrowserNotReady(output({ ok: true }))).toBe(false);
+    expect(pageBrowserNotReady({ code: 1, stdout: "" })).toBe(false);
+    expect(pageBrowserNotReady({ code: 0, stdout: "not json" })).toBe(false);
+  });
+
   it("frees a released screen slot so a ninth Team bot can reuse it", () => {
     const assigned = new Map<string, ScreenAssignment>();
     for (let index = 0; index < 8; index += 1) {
@@ -1105,8 +1150,8 @@ describe("sandbox supervisor input containment", () => {
 });
 
 describe("docker exec stream demux", () => {
-  const frame = (type: number, text: string) => {
-    const payload = Buffer.from(text, "utf8");
+  const frame = (type: number, text: string | Buffer) => {
+    const payload = typeof text === "string" ? Buffer.from(text, "utf8") : text;
     const header = Buffer.alloc(8);
     header[0] = type;
     header.writeUInt32BE(payload.length, 4);
@@ -1184,6 +1229,37 @@ describe("docker exec stream demux", () => {
     });
   });
 
+  it("keeps UTF-8 characters split across frames and chunks intact", () => {
+    const stderr = Buffer.from("😀é\n");
+    const multiplexed = Buffer.concat([
+      ...[...Buffer.from("é😀\n")].flatMap((byte, i) => [
+        frame(1, Buffer.from([byte])),
+        frame(2, stderr.subarray(i, i + 1)),
+      ]),
+      frame(2, Buffer.from([0xf0])),
+      frame(1, Buffer.from([0xe2])),
+      frame(2, Buffer.from([0x9f])),
+      frame(1, Buffer.from([0x82])),
+    ]);
+    const cases = [
+      [multiplexed, { stdout: "é😀\n\ufffd", stderr: "😀é\n\ufffd" }],
+      [
+        Buffer.concat([Buffer.from("raw é😀\n"), Buffer.from([0xe2, 0x82])]),
+        { stdout: "raw é😀\n\ufffd", stderr: "" },
+      ],
+      [Buffer.from([0x61, 0xc3]), { stdout: "a\ufffd", stderr: "" }],
+    ] as const;
+    for (const [bytes, expected] of cases) {
+      const demuxer = createDockerStreamDemuxer();
+      const live = [...bytes].flatMap((byte) => demuxer.push(Buffer.from([byte])));
+      live.push(...demuxer.finish());
+      const streamed = { stdout: "", stderr: "" };
+      for (const piece of live) streamed[piece.stream] += piece.data;
+      expect(streamed).toEqual(expected);
+      expect(demuxDockerStream(bytes)).toEqual(expected);
+    }
+  });
+
   it("rejects frames with nonzero reserved header padding as raw stdout", () => {
     // type 1, nonzero padding, size 0 — would look like an empty stdout frame without the check
     const padded = Buffer.from([0x01, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00]);
@@ -1203,5 +1279,100 @@ describe("computer command identity", () => {
       "NPM_CONFIG_PREFIX=/home/rakazo/.local",
       "PIP_USER=1",
     ]);
+  });
+});
+
+describe("computer name recovery", () => {
+  const conflict = Object.assign(new Error("container name already in use"), { statusCode: 409 });
+  function holder(labels: Record<string, string>, image = "computer") {
+    return {
+      Id: "leftover",
+      Config: { Labels: labels, Image: image },
+    } as Docker.ContainerInspectInfo;
+  }
+  const owned = { "rakazo.botId": "bot", "rakazo.spaceId": "space", "rakazo.managed": "true" };
+  function recovery(info: Docker.ContainerInspectInfo) {
+    const remove = vi.fn().mockResolvedValue(undefined);
+    const cleared = vi.fn();
+    const inspect = vi.fn().mockResolvedValue(info);
+    const reclaim = () =>
+      removeOwnedComputer(
+        { inspect } as Pick<Docker.Container, "inspect">,
+        remove,
+        (candidate) => isManagedComputer(candidate, "bot", "space", "computer"),
+        cleared,
+      );
+    return { remove, cleared, inspect, reclaim };
+  }
+
+  it("clears an owned leftover by inspected ID and retries create once", async () => {
+    const { reclaim, remove, cleared } = recovery(holder(owned));
+    const created = { id: "new" };
+    const create = vi.fn().mockRejectedValueOnce(conflict).mockResolvedValue(created);
+    await expect(createComputerWithNameRetry(create, reclaim)).resolves.toBe(created);
+    expect(create).toHaveBeenCalledTimes(2);
+    expect(remove).toHaveBeenCalledExactlyOnceWith("leftover");
+    expect(cleared).toHaveBeenCalledExactlyOnceWith("leftover");
+  });
+
+  it.each([
+    { ...owned, "rakazo.botId": "other" },
+    { ...owned, "rakazo.spaceId": "other" },
+    {} as Record<string, string>,
+    { "rakazo.botId": "bot", "rakazo.spaceId": "space" },
+  ])("preserves a non-owned name holder and the original error: %j", async (labels) => {
+    const { reclaim, remove, cleared } = recovery(holder(labels, "unmanaged"));
+    const create = vi.fn().mockRejectedValue(conflict);
+    await expect(createComputerWithNameRetry(create, reclaim)).rejects.toBe(conflict);
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(remove).not.toHaveBeenCalled();
+    expect(cleared).not.toHaveBeenCalled();
+  });
+
+  it("accepts the existing legacy identity and image management rule", () => {
+    expect(
+      isManagedComputer(
+        holder({ "rakazo.botId": "bot", "rakazo.workspaceId": "space" }),
+        "bot",
+        "space",
+        "computer",
+      ),
+    ).toBe(true);
+  });
+
+  it("preserves the original error when inspection or removal fails", async () => {
+    for (const stage of ["inspect", "remove"] as const) {
+      const recoveryAttempt = recovery(holder(owned));
+      recoveryAttempt[stage].mockRejectedValue(new Error("unavailable"));
+      await expect(
+        createComputerWithNameRetry(async () => {
+          throw conflict;
+        }, recoveryAttempt.reclaim),
+      ).rejects.toBe(conflict);
+      expect(recoveryAttempt.cleared).not.toHaveBeenCalled();
+    }
+  });
+
+  it("does not retry a second create conflict", async () => {
+    const create = vi.fn().mockRejectedValue(conflict);
+    const reclaim = vi.fn().mockResolvedValue(true);
+    await expect(createComputerWithNameRetry(create, reclaim)).rejects.toBe(conflict);
+    expect(create).toHaveBeenCalledTimes(2);
+    expect(reclaim).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([409, 500])("does not retry a start failure (status %s)", async (statusCode) => {
+    const error = Object.assign(new Error("address already in use"), { statusCode });
+    const start = vi.fn().mockRejectedValue(error);
+    const create = vi.fn(async () => ({ start }));
+    const reclaim = vi.fn();
+    await expect(
+      (async () => {
+        const container = await createComputerWithNameRetry(create, reclaim);
+        await container.start();
+      })(),
+    ).rejects.toBe(error);
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(reclaim).not.toHaveBeenCalled();
   });
 });

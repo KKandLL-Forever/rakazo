@@ -1,6 +1,7 @@
 /// <reference path="./linkify-it.d.ts" />
 
 import type { MessageBlock } from "@rakazo/contracts";
+import { urlSite } from "@rakazo/core/egress";
 import LinkifyIt from "linkify-it";
 import type { ReactNode } from "react";
 import { createContext, useContext, useEffect, useSyncExternalStore } from "react";
@@ -10,7 +11,16 @@ export type ChatMarkdownProps = {
   streaming?: boolean;
   /** Draws a mention link from `withMentions`; returning nothing leaves its plain name. */
   renderMention?: (id: string, name: string) => ReactNode;
+  /** Opens a page linked as `[title](page:<pageId>)`; without it the title stays plain text. */
+  onOpenPage?: (pageId: string) => void;
 };
+
+const PAGE_URL_PATTERN = /^page:([A-Za-z0-9_-]{1,64})$/;
+
+/** The page id of a `page:<pageId>` link, if this href is one. */
+export function markdownPageId(href: string | undefined): string | undefined {
+  return href ? PAGE_URL_PATTERN.exec(href)?.[1] : undefined;
+}
 
 const MENTION_URL_PREFIX = "rakazo-mention:";
 
@@ -150,7 +160,11 @@ const safeProtocols = new Set(["http", "https", "mailto", "tel"]);
 
 export type PlainTextPart =
   | { type: "text"; value: string }
-  | { type: "link"; value: string; href: string };
+  | { type: "link"; value: string; href: string }
+  | { type: "page"; value: string; pageId: string };
+
+// The link pageReply puts before a sent reply: `[title](page:<pageId>)`, title brackets escaped.
+const PLAIN_PAGE_LINK = /\[((?:\\[\\[\]]|[^\\[\]\n])*)\]\(page:([A-Za-z0-9_-]{1,64})\)/g;
 
 function appendPlainText(parts: PlainTextPart[], value: string) {
   if (!value) return;
@@ -163,13 +177,25 @@ function appendPlainText(parts: PlainTextPart[], value: string) {
 }
 
 /**
- * Split plain user-message text into literal runs and tappable links.
- * User bubbles stay plain text on web and mobile. Bold, headings, and other
- * markdown remain characters. Links use the same explicit autolinker as bot
- * messages, so a balanced parenthesis stays inside the URL and a closing
- * parenthesis that only wraps the surrounding prose does not.
+ * User bubbles stay plain text: markdown remains characters, except a page link, which opens the
+ * page as it does in bot messages. Links use the bot messages' autolinker, so a balanced
+ * parenthesis stays inside the URL and one wrapping the prose does not.
  */
 export function plainTextLinkParts(text: string): PlainTextPart[] {
+  const parts: PlainTextPart[] = [];
+  let cursor = 0;
+  for (const match of text.matchAll(PLAIN_PAGE_LINK)) {
+    if (match.index > cursor) parts.push(...urlLinkParts(text.slice(cursor, match.index)));
+    const value = match[1]!.replace(/\\([\\[\]])/g, "$1");
+    parts.push({ type: "page", value, pageId: match[2]! });
+    cursor = match.index + match[0].length;
+  }
+  if (cursor === 0) return urlLinkParts(text);
+  if (cursor < text.length) parts.push(...urlLinkParts(text.slice(cursor)));
+  return parts;
+}
+
+function urlLinkParts(text: string): PlainTextPart[] {
   const matches = plainTextLinkify.match(text);
   if (!matches || matches.length === 0) return [{ type: "text", value: text }];
 
@@ -239,6 +265,25 @@ export function markdownLinkRequiresConfirmation(url: string, appOrigin?: string
   } catch {
     return true;
   }
+}
+
+/**
+ * The site "Always open" trusts for a link: its registrable domain, so every subdomain is
+ * included, while each tenant of a shared host stays its own site. The server stores the same.
+ */
+export function markdownLinkSite(url: string): string | undefined {
+  return urlSite(url);
+}
+
+/** Whether a link shows the external-link prompt: it leaves the app to a site not trusted. */
+export function markdownLinkNeedsPrompt(
+  url: string,
+  appOrigin?: string | null,
+  trustedSites: readonly string[] = [],
+): boolean {
+  if (!markdownLinkRequiresConfirmation(url, appOrigin)) return false;
+  const site = markdownLinkSite(url);
+  return !site || !trustedSites.includes(site);
 }
 
 export type MarkdownLinkDisplayParts = {
@@ -521,4 +566,12 @@ export function closeUnterminatedFence(markdown: string): string {
   }
 
   return openFence ? `${markdown}\n${openFence.marker.repeat(openFence.length)}` : markdown;
+}
+
+/**
+ * A fence explicitly marked as plain text, such as a draft email: it wraps in the body font. Every
+ * other fence, including one with no language, keeps the monospaced font and sideways scrolling.
+ */
+export function isProseFence(language: string): boolean {
+  return ["text", "txt", "plaintext"].includes(language.toLowerCase());
 }

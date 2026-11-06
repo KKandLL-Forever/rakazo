@@ -124,11 +124,12 @@ it("selects an available provider when the saved self-hosted provider is hidden"
   }
 });
 
-it("saves a Fish speech model on the existing provider pane", async () => {
+it("saves a speech model on the existing pane of a provider that takes one", async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   voice.catalog.mockResolvedValue([
-    { id: "fish-audio", name: "Fish Audio", description: "", transcribe: true },
-    { id: "elevenlabs", name: "ElevenLabs", description: "", transcribe: true },
+    { id: "fish-audio", name: "Fish Audio", description: "", transcribe: true, speechModel: true },
+    { id: "elevenlabs", name: "ElevenLabs", description: "", transcribe: true, speechModel: true },
+    { id: "openai", name: "OpenAI", description: "", transcribe: true },
   ]);
   voice.credentials.mockResolvedValue([fish, eleven]);
   voice.status.mockResolvedValue({
@@ -144,7 +145,7 @@ it("saves a Fish speech model on the existing provider pane", async () => {
       : [{ id: "voice-1", label: "Aria" }],
   );
   voice.setSpeechModel.mockImplementation(async ({ speechModel }: { speechModel: string }) => ({
-    ...fish,
+    ...eleven,
     speechModel,
   }));
 
@@ -172,7 +173,7 @@ it("saves a Fish speech model on the existing provider pane", async () => {
     expect(input?.placeholder).toBe("Optional");
 
     await act(async () => {
-      chooseProvider("elevenlabs");
+      chooseProvider("openai");
     });
     await act(async () => {
       await Promise.resolve();
@@ -180,27 +181,27 @@ it("saves a Fish speech model on the existing provider pane", async () => {
     expect(speechModelInput(container)).toBeUndefined();
 
     await act(async () => {
-      chooseProvider("fish-audio");
+      chooseProvider("elevenlabs");
     });
     await act(async () => {
       await Promise.resolve();
     });
-    const fishInput = speechModelInput(container);
-    if (!fishInput) throw new Error("Missing speech model field");
+    const elevenInput = speechModelInput(container);
+    if (!elevenInput) throw new Error("Missing speech model field");
     await act(async () => {
-      fishInput.focus();
+      elevenInput.focus();
       const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
-      setter?.call(fishInput, "s1");
-      fishInput.dispatchEvent(new Event("input", { bubbles: true }));
+      setter?.call(elevenInput, "eleven_v4");
+      elevenInput.dispatchEvent(new Event("input", { bubbles: true }));
     });
     await act(async () => {
-      fishInput.blur();
+      elevenInput.blur();
     });
 
     expect(voice.setSpeechModel).toHaveBeenCalledWith({
       scope: "account",
-      provider: "fish-audio",
-      speechModel: "s1",
+      provider: "elevenlabs",
+      speechModel: "eleven_v4",
     });
   } finally {
     await act(async () => root.unmount());
@@ -364,6 +365,215 @@ it.each([
     }
   },
 );
+
+it("keeps self-hosted edits typed while a reconnect is in flight", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  const saved = {
+    ...fish,
+    provider: "openai-compatible",
+    voiceId: "",
+    endpoint: "http://127.0.0.1:8000/v1",
+    ttsModel: "saved-speech",
+    sttModel: "saved-transcription",
+  };
+  voice.catalog
+    .mockReset()
+    .mockResolvedValue([
+      { id: "openai-compatible", name: "Self-hosted", description: "", transcribe: true },
+    ]);
+  voice.credentials.mockReset().mockResolvedValue([saved]);
+  voice.status.mockReset().mockResolvedValue({ ready: true, provider: "openai-compatible" });
+  voice.voices.mockReset().mockResolvedValue([]);
+  let releaseConnect: () => void = () => undefined;
+  voice.connect
+    .mockReset()
+    .mockImplementationOnce(
+      () => new Promise((resolve) => (releaseConnect = () => resolve(saved))),
+    );
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  const type = async (input: HTMLInputElement, value: string) => {
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      setter?.call(input, value);
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+  };
+  try {
+    await act(async () => {
+      root.render(
+        withQueries(<VoiceSettingsOverlay embedded scope="account" onClose={() => undefined} />),
+      );
+    });
+    await vi.waitFor(() =>
+      expect(labelledInput(container, "Server URL").value).toBe(saved.endpoint),
+    );
+    const reconnect = [...container.querySelectorAll("button")].find(
+      (button) => button.textContent === "Reconnect",
+    );
+    if (!reconnect) throw new Error("Missing reconnect button");
+    await act(async () => {
+      reconnect.click();
+    });
+    // Typed while the connect is in flight; the request carries the values from the click.
+    await type(labelledInput(container, "Server URL"), "http://127.0.0.1:7000/v1");
+    await type(labelledInput(container, "Speech model"), "typed-speech");
+    await type(labelledInput(container, "API key"), "replacement-typed-key");
+    await act(async () => {
+      releaseConnect();
+    });
+
+    expect(voice.connect).toHaveBeenCalledWith(
+      expect.objectContaining({ baseUrl: saved.endpoint, ttsModel: saved.ttsModel, apiKey: "" }),
+    );
+    // The refresh that lands with the answer keeps what was typed after it started.
+    await vi.waitFor(() => expect(voice.credentials).toHaveBeenCalledTimes(2));
+    expect(labelledInput(container, "Server URL").value).toBe("http://127.0.0.1:7000/v1");
+    expect(labelledInput(container, "Speech model").value).toBe("typed-speech");
+    expect(labelledInput(container, "API key").value).toBe("replacement-typed-key");
+    expect(labelledInput(container, "Transcription model").value).toBe("saved-transcription");
+  } finally {
+    await act(async () => root.unmount());
+    container.remove();
+    vi.unstubAllGlobals();
+  }
+});
+
+it("shows what a reconnect saved for fields edited before it started", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  const saved = {
+    ...fish,
+    provider: "openai-compatible",
+    voiceId: "",
+    endpoint: "http://127.0.0.1:8000/v1",
+    ttsModel: "saved-speech",
+    sttModel: "saved-transcription",
+  };
+  voice.catalog
+    .mockReset()
+    .mockResolvedValue([
+      { id: "openai-compatible", name: "Self-hosted", description: "", transcribe: true },
+    ]);
+  // The server adds the missing /v1 and keeps the speech model the blank field left out.
+  voice.credentials
+    .mockReset()
+    .mockResolvedValueOnce([saved])
+    .mockResolvedValue([{ ...saved, endpoint: "http://127.0.0.1:7000/v1" }]);
+  voice.status.mockReset().mockResolvedValue({ ready: true, provider: "openai-compatible" });
+  voice.voices.mockReset().mockResolvedValue([]);
+  let releaseConnect: () => void = () => undefined;
+  voice.connect
+    .mockReset()
+    .mockImplementationOnce(
+      () => new Promise((resolve) => (releaseConnect = () => resolve(saved))),
+    );
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  const type = async (input: HTMLInputElement, value: string) => {
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      setter?.call(input, value);
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+  };
+  try {
+    await act(async () => {
+      root.render(
+        withQueries(<VoiceSettingsOverlay embedded scope="account" onClose={() => undefined} />),
+      );
+    });
+    await vi.waitFor(() =>
+      expect(labelledInput(container, "Server URL").value).toBe(saved.endpoint),
+    );
+    await type(labelledInput(container, "Server URL"), "http://127.0.0.1:7000");
+    await type(labelledInput(container, "Speech model"), "");
+    const reconnect = [...container.querySelectorAll("button")].find(
+      (button) => button.textContent === "Reconnect",
+    );
+    if (!reconnect) throw new Error("Missing reconnect button");
+    await act(async () => {
+      reconnect.click();
+    });
+    await type(labelledInput(container, "Transcription model"), "typed-transcription");
+    await act(async () => {
+      releaseConnect();
+    });
+
+    expect(voice.connect).toHaveBeenCalledWith(
+      expect.objectContaining({ baseUrl: "http://127.0.0.1:7000", ttsModel: undefined }),
+    );
+    await vi.waitFor(() => expect(voice.credentials).toHaveBeenCalledTimes(2));
+    expect(labelledInput(container, "Server URL").value).toBe("http://127.0.0.1:7000/v1");
+    expect(labelledInput(container, "Speech model").value).toBe("saved-speech");
+    expect(labelledInput(container, "Transcription model").value).toBe("typed-transcription");
+  } finally {
+    await act(async () => root.unmount());
+    container.remove();
+    vi.unstubAllGlobals();
+  }
+});
+
+it("follows the voice a reconnect saves when the voice field was edited and reverted", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  const saved = {
+    ...fish,
+    provider: "openai-compatible",
+    voiceId: "af_heart",
+    endpoint: "http://127.0.0.1:8000/v1",
+    ttsModel: "saved-speech",
+    sttModel: "saved-transcription",
+  };
+  voice.catalog
+    .mockReset()
+    .mockResolvedValue([
+      { id: "openai-compatible", name: "Self-hosted", description: "", transcribe: true },
+    ]);
+  // The connect on a new endpoint drops the old voice; the server picks another.
+  voice.credentials
+    .mockReset()
+    .mockResolvedValueOnce([saved])
+    .mockResolvedValue([{ ...saved, voiceId: "voice_new", endpoint: "http://127.0.0.1:7000/v1" }]);
+  voice.status.mockReset().mockResolvedValue({ ready: true, provider: "openai-compatible" });
+  voice.voices.mockReset().mockResolvedValue([{ id: "voice_new", label: "November" }]);
+  voice.connect.mockReset().mockResolvedValue(saved);
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  const type = async (input: HTMLInputElement, value: string) => {
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      setter?.call(input, value);
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+  };
+  try {
+    await act(async () => {
+      root.render(
+        withQueries(<VoiceSettingsOverlay embedded scope="account" onClose={() => undefined} />),
+      );
+    });
+    await vi.waitFor(() => expect(labelledInput(container, "Voice").value).toBe("af_heart"));
+    // Edit the voice and put the saved one back; the field still counts as edited.
+    await type(labelledInput(container, "Voice"), "am_custom");
+    await type(labelledInput(container, "Voice"), "af_heart");
+    const reconnect = [...container.querySelectorAll("button")].find(
+      (button) => button.textContent === "Reconnect",
+    );
+    if (!reconnect) throw new Error("Missing reconnect button");
+    await act(async () => {
+      reconnect.click();
+    });
+
+    await vi.waitFor(() => expect(voice.credentials).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(labelledInput(container, "Voice").value).toBe("voice_new"));
+  } finally {
+    await act(async () => root.unmount());
+    container.remove();
+    vi.unstubAllGlobals();
+  }
+});
 
 it.each([null, "space-edited"])("plays a sample for the bound space %s", async (spaceId) => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
@@ -698,3 +908,162 @@ it("picks a Space's own voice from the account's connections without managing th
     vi.unstubAllGlobals();
   }
 });
+
+it("saves a typed self-hosted voice on blur without dropping other unsaved edits", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  const saved = {
+    ...fish,
+    provider: "openai-compatible",
+    voiceId: "af_heart",
+    endpoint: "http://127.0.0.1:8000/v1",
+    ttsModel: "",
+    sttModel: "",
+  };
+  voice.catalog
+    .mockReset()
+    .mockResolvedValue([
+      { id: "openai-compatible", name: "Self-hosted", description: "", transcribe: true },
+    ]);
+  voice.credentials.mockReset().mockResolvedValue([saved]);
+  voice.status.mockReset().mockResolvedValue({ ready: true, provider: "openai-compatible" });
+  voice.voices.mockReset().mockResolvedValue([{ id: "af_heart", label: "Heart" }]);
+  voice.setVoice.mockReset().mockResolvedValue({ ready: true, provider: "openai-compatible" });
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  const type = async (input: HTMLInputElement, value: string) => {
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      setter?.call(input, value);
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+  };
+  const blur = async (input: HTMLInputElement) => {
+    await act(async () => {
+      input.dispatchEvent(new FocusEvent("focusout", { bubbles: true }));
+    });
+  };
+  try {
+    await act(async () => {
+      root.render(
+        withQueries(<VoiceSettingsOverlay embedded scope="account" onClose={() => undefined} />),
+      );
+    });
+    await vi.waitFor(() => expect(labelledInput(container, "Voice").value).toBe("af_heart"));
+
+    await blur(labelledInput(container, "Voice"));
+    await type(labelledInput(container, "Voice"), "  ");
+    await blur(labelledInput(container, "Voice"));
+    expect(voice.setVoice).not.toHaveBeenCalled();
+
+    await type(labelledInput(container, "Server URL"), "http://127.0.0.1:9000/v1");
+    await type(labelledInput(container, "Voice"), " am_custom ");
+    await blur(labelledInput(container, "Voice"));
+    expect(voice.setVoice).toHaveBeenCalledWith({
+      scope: "account",
+      voiceId: "am_custom",
+      provider: "openai-compatible",
+    });
+    await vi.waitFor(() => expect(voice.credentials).toHaveBeenCalledTimes(2));
+    expect(labelledInput(container, "Server URL").value).toBe("http://127.0.0.1:9000/v1");
+  } finally {
+    await act(async () => root.unmount());
+    container.remove();
+    vi.unstubAllGlobals();
+  }
+});
+
+it("connects a keyless provider without asking for a key", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  voice.catalog.mockResolvedValue([
+    { id: "macos", name: "Server (Mac)", description: "", transcribe: false, keyless: true },
+  ]);
+  voice.credentials.mockResolvedValue([]);
+  voice.status.mockResolvedValue({
+    configured: false,
+    ready: false,
+    transcribe: false,
+    provider: null,
+    voiceId: "",
+  });
+  voice.connect.mockClear().mockResolvedValue(undefined);
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  try {
+    await act(async () => {
+      root.render(
+        withQueries(<VoiceSettingsOverlay embedded scope="account" onClose={() => undefined} />),
+      );
+    });
+    expect(container.textContent).not.toContain("API key");
+    const connect = [...container.querySelectorAll("button")].find(
+      (button) => button.textContent === "Connect",
+    );
+    expect(connect?.disabled).toBe(false);
+    await act(async () => connect!.click());
+    expect(voice.connect).toHaveBeenCalledWith(
+      expect.objectContaining({ provider: "macos", apiKey: "" }),
+    );
+  } finally {
+    await act(async () => root.unmount());
+    container.remove();
+    vi.unstubAllGlobals();
+  }
+});
+
+it.each(["account", "space"] as const)(
+  "activates a connected keyless provider with one voice in %s settings",
+  async (scope) => {
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    voice.catalog.mockResolvedValue([
+      { id: "fish-audio", name: "Fish Audio", description: "", transcribe: true },
+      { id: "macos", name: "Server (Mac)", description: "", transcribe: false, keyless: true },
+    ]);
+    voice.credentials.mockResolvedValue([
+      fish,
+      { ...eleven, id: "cred-macos", provider: "macos", voiceId: "Albert", transcribe: false },
+    ]);
+    voice.status.mockResolvedValue({ ready: true, provider: "fish-audio", voiceId: "voice-1" });
+    voice.voices.mockResolvedValue([{ id: "Albert", label: "Albert" }]);
+    const saved = { ready: true, provider: "macos", voiceId: "Albert" };
+    voice.setVoice.mockClear().mockResolvedValue(saved);
+    const client = new QueryClient();
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    try {
+      await act(async () => {
+        root.render(
+          withQueries(
+            <VoiceSettingsOverlay embedded scope={scope} onClose={() => undefined} />,
+            client,
+          ),
+        );
+      });
+      const select = [...container.querySelectorAll("select")].find((select) =>
+        [...select.options].some((option) => option.value === "macos"),
+      );
+      expect(select).toBeTruthy();
+      await act(async () => {
+        select!.value = "macos";
+        select!.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+      expect(voice.setVoice).toHaveBeenCalledExactlyOnceWith({
+        scope,
+        provider: "macos",
+        voiceId: "Albert",
+      });
+      expect(container.textContent).not.toContain("API key");
+      expect(container.textContent).not.toContain("Replace key");
+      expect(
+        [...container.querySelectorAll("select")].find((select) => select.value === "Albert"),
+      ).toBeTruthy();
+    } finally {
+      await act(async () => root.unmount());
+      container.remove();
+      client.clear();
+      vi.unstubAllGlobals();
+    }
+  },
+);

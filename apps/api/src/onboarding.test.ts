@@ -1,7 +1,7 @@
 import type * as db from "@rakazo/db";
 import { appendEventInTransaction } from "@rakazo/db";
 import { describe, expect, it, vi } from "vitest";
-import { chooseFocus, markAppConnected, promptFocus } from "./onboarding.js";
+import { chooseFocus, dismissFocus, markAppConnected, promptFocus } from "./onboarding.js";
 
 const posted = vi.hoisted(() => [] as Array<{ blocks: unknown[]; markUnread?: boolean }>);
 vi.mock("@rakazo/db", async (original) => ({
@@ -12,6 +12,8 @@ vi.mock("@rakazo/db", async (original) => ({
   }),
   appendEventInTransaction: vi.fn(async () => ({ seq: 1 })),
 }));
+// These transactions lock the thread row, which snapshot reads hold for up to 15s.
+const budget = { timeout: 20_000 };
 function fixture(catalog: unknown[]) {
   posted.length = 0;
   const tx = {
@@ -51,6 +53,7 @@ describe("onboarding connection suggestions", () => {
     // The reply to the user's pick is read; suggestions after the catalog wait stay unread.
     expect(posted[0]?.markUnread).toBe(false);
     expect(posted.slice(1).every((message) => message.markUnread === true)).toBe(true);
+    expect(deps.prisma.$transaction).toHaveBeenCalledWith(expect.any(Function), budget);
   });
   it("uses the available connector and omits unavailable apps", async () => {
     const { deps, actor } = fixture([
@@ -76,7 +79,7 @@ describe("promptFocus", () => {
     const run = {
       findFirst: vi.fn(async () => (options.introRun ? { id: "intro" } : null)),
     };
-    Object.assign(tx, { run, agentImport: { findFirst: vi.fn(async () => null) } });
+    Object.assign(tx, { run });
     return { deps, actor, run };
   }
 
@@ -86,6 +89,7 @@ describe("promptFocus", () => {
     expect(posted.flatMap((message) => message.blocks)).toContainEqual(
       expect.objectContaining({ kind: "choice" }),
     );
+    expect(deps.prisma.$transaction).toHaveBeenCalledWith(expect.any(Function), budget);
   });
 
   it("leaves the question to a bot whose creation intro is queued or running", async () => {
@@ -125,13 +129,24 @@ it("marks only the authorized connector when provider slugs collide", async () =
     where: { id: "cards" },
     data: { blocks: [blocks[0], { ...blocks[1], status: "connected" }] },
   });
+  expect(deps.prisma.$transaction).toHaveBeenCalledWith(expect.any(Function), budget);
+});
+
+it("dismisses the pending focus card under the thread-lock budget", async () => {
+  const { deps, actor, tx } = fixture([]);
+  await dismissFocus(deps, actor, "bot");
+  expect(tx.message.update).toHaveBeenCalledWith({
+    where: { id: "choice" },
+    data: { blocks: [{ kind: "choice", answerId: expect.any(String) }] },
+  });
+  expect(deps.prisma.$transaction).toHaveBeenCalledWith(expect.any(Function), budget);
 });
 
 it("does not trust a client's connected claim", async () => {
   const { deps, actor, tx } = fixture([
     { connectorId: "pipedream", slug: "slack", connected: false },
   ]);
-  deps.prisma.message = { findMany: vi.fn() } as never;
+  Object.assign(deps.prisma, { message: { findMany: vi.fn() } });
   await markAppConnected(deps, actor, "bot", "slack", "pipedream", "thread");
   expect(deps.prisma.message.findMany).not.toHaveBeenCalled();
   expect(tx.message.update).not.toHaveBeenCalled();
@@ -141,7 +156,7 @@ it("rejects a thread from another user or space before reading its messages", as
   const { deps, actor, tx } = fixture([
     { connectorId: "pipedream", slug: "slack", connected: true },
   ]);
-  deps.prisma.thread = { findFirst: vi.fn(async () => null) } as never;
+  Object.assign(deps.prisma, { thread: { findFirst: vi.fn(async () => null) } });
   await expect(
     markAppConnected(deps, actor, "bot", "slack", "pipedream", "other-thread"),
   ).rejects.toThrow();
@@ -155,17 +170,21 @@ it("updates an accessible group thread and emits its normal update event", async
   const { deps, actor, tx } = fixture([
     { connectorId: "pipedream", slug: "slack", connected: true },
   ]);
-  deps.prisma.thread = {
-    findFirst: vi.fn(async () => ({ id: "group-thread", groupId: "group" })),
-  } as never;
-  deps.prisma.chatGroup = {
-    findFirst: vi.fn(async () => ({
-      id: "group",
-      name: "Team",
-      thread: { id: "group-thread" },
-      members: ["bot", "peer"].map((id) => ({ bot: { id, name: id, runs: [] } })),
-    })),
-  } as never;
+  Object.assign(deps.prisma, {
+    thread: {
+      findFirst: vi.fn(async () => ({ id: "group-thread", groupId: "group" })),
+    },
+  });
+  Object.assign(deps.prisma, {
+    chatGroup: {
+      findFirst: vi.fn(async () => ({
+        id: "group",
+        name: "Team",
+        thread: { id: "group-thread" },
+        members: ["bot", "peer"].map((id) => ({ bot: { id, name: id, runs: [] } })),
+      })),
+    },
+  });
   tx.message.findMany = vi.fn(async () => [
     {
       id: "card",
@@ -177,7 +196,7 @@ it("updates an accessible group thread and emits its normal update event", async
   await markAppConnected(deps, actor, "bot", "slack", "pipedream", "group-thread");
   expect(deps.prisma.chatGroup.findFirst).toHaveBeenCalledWith(
     expect.objectContaining({
-      where: { id: "group", spaceId: actor.spaceId, userId: actor.userId, archivedAt: null },
+      where: { id: "group", spaceId: actor.spaceId, archivedAt: null },
     }),
   );
   expect(tx.message.findMany).toHaveBeenCalledWith(
@@ -198,20 +217,22 @@ it("updates an accessible group thread and emits its normal update event", async
   expect(deps.events.notify).toHaveBeenCalledWith("group-thread", 1);
 });
 
-it("rejects another user's group even in the same space", async () => {
+it("rejects a group the space does not have", async () => {
   const { deps, actor, tx } = fixture([
     { connectorId: "pipedream", slug: "slack", connected: true },
   ]);
-  deps.prisma.thread = {
-    findFirst: vi.fn(async () => ({ id: "other-thread", groupId: "other-group" })),
-  } as never;
-  deps.prisma.chatGroup = { findFirst: vi.fn(async () => null) } as never;
+  Object.assign(deps.prisma, {
+    thread: {
+      findFirst: vi.fn(async () => ({ id: "other-thread", groupId: "other-group" })),
+    },
+  });
+  Object.assign(deps.prisma, { chatGroup: { findFirst: vi.fn(async () => null) } });
   await expect(
     markAppConnected(deps, actor, "bot", "slack", "pipedream", "other-thread"),
   ).rejects.toThrow();
   expect(tx.message.update).not.toHaveBeenCalled();
   expect(deps.prisma.bot.findFirst).toHaveBeenCalledWith(
-    expect.objectContaining({ where: { id: "bot", spaceId: actor.spaceId, userId: actor.userId } }),
+    expect.objectContaining({ where: { id: "bot", spaceId: actor.spaceId } }),
   );
 });
 

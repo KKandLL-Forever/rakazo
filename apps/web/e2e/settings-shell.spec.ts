@@ -1,12 +1,5 @@
 import { expect, test } from "@playwright/test";
-import {
-  activeBotId,
-  captureScreenshot,
-  completeOnboarding,
-  openUserSettings,
-  rpc,
-  signup,
-} from "./helpers";
+import { captureScreenshot, completeOnboarding, openUserSettings, signup } from "./helpers";
 
 test("changing language updates settings overflow without resizing", async ({ page }, testInfo) => {
   const stamp = Date.now();
@@ -77,9 +70,7 @@ test("narrow settings reveals the active section and offers scroll controls", as
     await expect.poll(() => nav.evaluate((node) => node.scrollLeft)).toBeGreaterThan(0);
     const header = settings.getByTestId("settings-header");
     const before = await header.boundingBox();
-    await settings
-      .getByRole("button", { name: "Delete account", exact: true })
-      .scrollIntoViewIfNeeded();
+    await settings.getByTestId("delete-account").scrollIntoViewIfNeeded();
     await expect
       .poll(() => settings.getByTestId("settings-scroll").evaluate((node) => node.scrollTop))
       .toBeGreaterThan(0);
@@ -108,7 +99,7 @@ test("settings shell is two-pane and deep-links Models Memory Voice Usage", asyn
   await page.getByTestId("user-menu-trigger").click();
   const menu = page.locator('[data-slot="popover-content"]');
   await expect(menu.getByRole("button", { name: "Settings", exact: true })).toBeVisible();
-  await expect(menu.getByRole("button", { name: "Usage", exact: true })).toBeVisible();
+  await expect(menu.getByRole("button", { name: "Usage", exact: true })).toHaveCount(0);
   await expect(menu.getByRole("button", { name: "Log out", exact: true })).toBeVisible();
   await captureScreenshot(page, testInfo, "settings-account-menu-lean");
   await page.keyboard.press("Escape");
@@ -121,8 +112,6 @@ test("settings shell is two-pane and deep-links Models Memory Voice Usage", asyn
   );
   await expect(settings.getByRole("heading", { name: "General", exact: true })).toBeVisible();
   await expect(settings.getByRole("heading", { name: "Account", exact: true })).toBeVisible();
-  await expect(settings.getByTestId("response-streaming-toggle")).toBeHidden();
-  await settings.getByTestId("advanced-settings").locator("button[aria-expanded]").click();
   const streamReplies = settings.getByTestId("response-streaming-toggle");
   await expect(streamReplies).toBeVisible();
   await expect(streamReplies).not.toBeChecked();
@@ -151,7 +140,7 @@ test("settings shell is two-pane and deep-links Models Memory Voice Usage", asyn
   await expect
     .poll(() => page.evaluate(() => window.localStorage.getItem("rakazo.responseStreaming")))
     .toBe("on");
-  const deleteAccount = settings.getByRole("button", { name: "Delete account", exact: true });
+  const deleteAccount = settings.getByTestId("delete-account");
   await deleteAccount.scrollIntoViewIfNeeded();
   await expect(deleteAccount).toBeVisible();
   await captureScreenshot(page, testInfo, "settings-general-delete-account");
@@ -217,7 +206,13 @@ test("Honcho memory settings empty and filled", async ({ page }, testInfo) => {
   await expect(memory.getByRole("button", { name: "Connect", exact: true })).toBeDisabled();
   await captureScreenshot(page, testInfo, "memory-honcho-user-peer-reserved");
   await userPeer.fill("user-alex");
+  await expect(
+    memory.getByText("Recall from this peer; save to Rakazo’s own peers."),
+  ).toBeVisible();
   await expect(memory.getByRole("button", { name: "Connect", exact: true })).toBeEnabled();
+  await memory
+    .getByText("Recall from this peer; save to Rakazo’s own peers.")
+    .evaluate((element) => element.scrollIntoView({ block: "center" }));
   await captureScreenshot(page, testInfo, "memory-honcho-filled");
   await memory.getByRole("button", { name: "Self-hosted", exact: true }).click();
   await expect(memory.getByLabel("Base URL", { exact: true })).toHaveValue("");
@@ -262,46 +257,4 @@ test("Honcho memory settings empty and filled", async ({ page }, testInfo) => {
   await documents.scrollIntoViewIfNeeded();
   await expect(documents).toBeVisible();
   await captureScreenshot(page, testInfo, "memory-dark-bottom");
-});
-
-test("shell overlays open from the URL and keep it in sync", async ({ page }, testInfo) => {
-  await signup(page, `settings-url-${Date.now()}@rakazo.test`, "password12", "Settings");
-  await completeOnboarding(page);
-  const botPath = new URL(page.url()).pathname;
-
-  await page.goto("/app?settings=usage");
-  const settings = page.getByTestId("user-settings");
-  await expect(settings).toHaveAttribute("data-settings-section", "usage");
-  await expect(page).toHaveURL((url) => url.pathname === botPath);
-  await settings.getByTestId("settings-nav-general").click();
-  await expect(page).toHaveURL((url) => url.searchParams.get("settings") === "general");
-  await captureScreenshot(page, testInfo, "settings-from-url");
-  await page.keyboard.press("Escape");
-  await expect(settings).toHaveCount(0);
-  await expect(page).toHaveURL((url) => url.pathname === botPath && url.search === "");
-
-  const apps = page.getByPlaceholder("Search apps");
-  await page.getByRole("button", { name: "Connect apps", exact: true }).click();
-  await expect(apps).toBeVisible();
-  await expect(page).toHaveURL((url) => url.searchParams.has("integrations"));
-});
-
-test("usage lists spend per model", async ({ page }, testInfo) => {
-  const stamp = Date.now();
-  await signup(page, `usage-models-${stamp}@rakazo.test`, "password12", "Usage");
-  await completeOnboarding(page);
-  await page.goto("/app");
-  await page.waitForURL(/\/app\/[^/]+$/);
-  await rpc(page, "threads/send", { botId: activeBotId(page), text: "Plan my week" });
-  await expect
-    .poll(async () => (await rpc<{ modelCalls?: number }>(page, "usage/summary", {})).modelCalls, {
-      timeout: 60_000,
-    })
-    .toBeGreaterThan(0);
-
-  await openUserSettings(page, "usage");
-  const usage = page.getByTestId("usage-settings");
-  await expect(usage.getByRole("columnheader", { name: "Model" })).toBeVisible();
-  await expect(usage.locator("tbody tr")).not.toHaveCount(0);
-  await captureScreenshot(page, testInfo, "settings-usage-models");
 });

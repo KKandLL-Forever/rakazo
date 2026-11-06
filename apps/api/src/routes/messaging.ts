@@ -7,6 +7,7 @@ import {
   formatMessagingLinkCode,
   issueMessagingLinkCode,
   runAsSystem,
+  spaceIsShared,
 } from "@rakazo/db";
 import { getLogger } from "@rakazo/logging";
 import type { RouterContext } from "./context.js";
@@ -29,6 +30,15 @@ export function messagingRoutes(ctx: RouterContext) {
         start: authed.messaging.installations.start.handler(async ({ context, input }) => {
           if (!deps.messagingInstallations) throw new ORPCError("BAD_REQUEST");
           return { url: await deps.messagingInstallations.start(context.actor, input.botId) };
+        }),
+        complete: authed.messaging.installations.complete.handler(async ({ context, input }) => {
+          if (!deps.messagingInstallations) throw new ORPCError("BAD_REQUEST");
+          try {
+            await deps.messagingInstallations.complete(context.actor, input.state, input.code);
+          } catch {
+            throw new ORPCError("BAD_REQUEST");
+          }
+          return { ok: true as const };
         }),
         remove: authed.messaging.installations.remove.handler(async ({ context, input }) => {
           if (!deps.messagingInstallations) throw new ORPCError("BAD_REQUEST");
@@ -87,9 +97,11 @@ export function messagingRoutes(ctx: RouterContext) {
             spaceId: bot.spaceId,
             botId: bot.id,
           });
+          const shared = await spaceIsShared(deps.prisma, bot.spaceId);
           return {
             code: formatMessagingLinkCode(issued.code),
             expiresAt: issued.expiresAt.toISOString(),
+            ...(shared ? { shared } : {}),
           };
         }),
       },

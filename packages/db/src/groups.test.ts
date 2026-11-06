@@ -48,14 +48,8 @@ describe("listSpaceGroupsForSpaces", () => {
         },
       ]),
     } as unknown as PrismaClient);
-    const actor = {
-      spaceId: "workspace-1",
-      userId: "user-1",
-      email: "user@example.test",
-      isDeploymentOwner: false,
-    };
 
-    await expect(repos.listSpaceGroupsForSpaces(actor, ["workspace-2"])).resolves.toEqual([
+    await expect(repos.listSpaceGroupsForSpaces(["workspace-2"])).resolves.toEqual([
       {
         id: "group-1",
         spaceId: "workspace-2",
@@ -63,8 +57,14 @@ describe("listSpaceGroupsForSpaces", () => {
         pinned: true,
         sectionId: null,
         members: [
-          { botId: "bot-1", name: "Triage", color: "#111", status: "idle" },
-          { botId: "bot-2", name: "Responder", color: "#222", status: "running" },
+          { botId: "bot-1", name: "Triage", color: "#111", avatarSet: "organic", status: "idle" },
+          {
+            botId: "bot-2",
+            name: "Responder",
+            color: "#222",
+            avatarSet: "organic",
+            status: "running",
+          },
         ],
         preview: "Escalation pending",
         unread: true,
@@ -155,7 +155,9 @@ describe("archiveGroup", () => {
     findManyComputers = vi.fn(async ({ where }: { where: ComputerWhere }) =>
       computerRows.filter((row) => matches(row, where)),
     );
-    runUpdateMany = vi.fn();
+    runUpdateMany = vi.fn(async ({ where }: { where: { id: { in: string[] } } }) =>
+      where.id.in.map((id) => ({ id })),
+    );
     attemptUpdateMany = vi.fn();
     taskUpdateMany = vi.fn();
     // computer-1 is a Team computer: bot-2's lease there belongs to a run outside this group.
@@ -224,10 +226,10 @@ describe("archiveGroup", () => {
       message: { findMany: vi.fn(async () => []) },
       $queryRaw: queryRaw,
       chatGroup: { findFirst, update: groupUpdate },
-      run: { findMany: findManyRuns, updateMany: runUpdateMany },
+      run: { findMany: findManyRuns, updateManyAndReturn: runUpdateMany },
       attempt: { updateMany: attemptUpdateMany },
       task: { updateMany: taskUpdateMany },
-      secret: { deleteMany: vi.fn() },
+      secret: { findMany: vi.fn().mockResolvedValue([]), deleteMany: vi.fn() },
       computerExecutionLease: { findMany: leaseFindMany, updateMany: leaseUpdateMany },
       computer: { findMany: findManyComputers, updateMany: computerUpdateMany },
       event: { deleteMany: eventDeleteMany },
@@ -291,7 +293,6 @@ describe("archiveGroup", () => {
         where: {
           id: "group-1",
           spaceId: actor.spaceId,
-          userId: actor.userId,
         },
         select: { archivedAt: true, thread: { select: { id: true } } },
       }),
@@ -567,7 +568,6 @@ describe("listGroups archived", () => {
     };
     expect(query.where).toEqual({
       spaceId: "space-1",
-      userId: "user-1",
       OR: [
         { archivedAt: { not: null } },
         { members: { some: { bot: { archivedAt: { not: null } } } } },
@@ -585,7 +585,6 @@ describe("listGroups archived", () => {
     expect(listed.map((item) => item.id)).toEqual(["openable"]);
     expect(findMany.mock.calls[0]![0].where).toEqual({
       spaceId: "space-1",
-      userId: "user-1",
       archivedAt: null,
     });
   });

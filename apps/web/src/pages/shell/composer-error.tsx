@@ -38,35 +38,78 @@ export function ComposerError({
   useEffect(() => {
     if (!runError || !runErrorId) return;
     const currentRunErrorId = runErrorId;
-    let frame = 0;
-    function recordIfPresented() {
-      cancelAnimationFrame(frame);
+    if (presentedRunErrorIdRef.current === currentRunErrorId) return;
+    let intersecting = false;
+    let frame: number | undefined;
+    let mutations: MutationObserver | undefined;
+    function stopRechecking() {
+      mutations?.disconnect();
+      mutations = undefined;
+      document.removeEventListener("transitionend", scheduleCheck);
+      if (frame !== undefined) cancelAnimationFrame(frame);
+      frame = undefined;
+    }
+    function cleanup() {
+      stopRechecking();
+      observer?.disconnect();
+      document.removeEventListener("visibilitychange", recordIfPresented);
+    }
+    function scheduleCheck() {
+      if (frame !== undefined) return;
       frame = requestAnimationFrame(() => {
-        const element = runErrorRef.current;
-        if (!element || document.visibilityState !== "visible") return;
-        const rect = element.getBoundingClientRect();
-        const topElement = document.elementFromPoint(
-          rect.left + rect.width / 2,
-          rect.top + rect.height / 2,
-        );
-        if (topElement && (topElement === element || element.contains(topElement))) {
-          if (presentedRunErrorIdRef.current === currentRunErrorId) return;
-          presentedRunErrorIdRef.current = currentRunErrorId;
-          onRunErrorPresented(currentRunErrorId);
-        }
+        frame = undefined;
+        recordIfPresented();
       });
     }
-    recordIfPresented();
-    const observer = new MutationObserver(recordIfPresented);
-    observer.observe(document.body, { childList: true, subtree: true });
-    document.addEventListener("transitionend", recordIfPresented);
+    function recordIfPresented() {
+      const element = runErrorRef.current;
+      if (!intersecting || !element || document.visibilityState !== "visible") return;
+      if (presentedRunErrorIdRef.current === currentRunErrorId) return;
+      const rect = element.getBoundingClientRect();
+      if (rect.width === 0 && rect.height === 0) return;
+      // Without hit testing (older engines, test DOMs) an element with a box is
+      // on screen, which is all this check can know.
+      if (typeof document.elementFromPoint !== "function") {
+        presentedRunErrorIdRef.current = currentRunErrorId;
+        cleanup();
+        onRunErrorPresented(currentRunErrorId);
+        return;
+      }
+      const topElement = document.elementFromPoint(
+        (Math.max(0, rect.left) + Math.min(window.innerWidth, rect.right)) / 2,
+        (Math.max(0, rect.top) + Math.min(window.innerHeight, rect.bottom)) / 2,
+      );
+      if (topElement && (topElement === element || element.contains(topElement))) {
+        presentedRunErrorIdRef.current = currentRunErrorId;
+        cleanup();
+        onRunErrorPresented(currentRunErrorId);
+        return;
+      }
+      // Only watch for an occluder to move while an unseen card is in view.
+      if (!mutations) {
+        mutations = new MutationObserver(scheduleCheck);
+        mutations.observe(document.body, { attributes: true, childList: true, subtree: true });
+        document.addEventListener("transitionend", scheduleCheck);
+      }
+    }
+    const element = runErrorRef.current;
+    const observer =
+      element && typeof IntersectionObserver !== "undefined"
+        ? new IntersectionObserver((entries) => {
+            const entry = entries.filter((entry) => entry.target === element).at(-1);
+            if (!entry) return;
+            intersecting = entry.isIntersecting;
+            if (intersecting) recordIfPresented();
+            else stopRechecking();
+          })
+        : null;
     document.addEventListener("visibilitychange", recordIfPresented);
-    return () => {
-      cancelAnimationFrame(frame);
-      observer.disconnect();
-      document.removeEventListener("transitionend", recordIfPresented);
-      document.removeEventListener("visibilitychange", recordIfPresented);
-    };
+    if (observer && element) observer.observe(element);
+    else {
+      intersecting = true;
+      recordIfPresented();
+    }
+    return cleanup;
   }, [onRunErrorPresented, runError, runErrorId]);
   const normalizedRunError = runError
     ? normalizeRunError(runError, translateRunError, i18n.locale || "en")
@@ -89,7 +132,7 @@ export function ComposerError({
       ref={runErrorRef}
       role="alert"
       data-testid="composer-error"
-      className={`mb-3 flex items-center gap-2 rounded-[14px] border px-4 py-2 text-[13px] animate-in fade-in-0 slide-in-from-bottom-1 duration-150 motion-reduce:animate-none ${warning ? "border-warning/40 bg-warning/10 text-warning" : "border-destructive/40 bg-destructive/10 text-destructive"}`}
+      className={`mb-3 flex items-center gap-2 rounded-[14px] border px-4 py-2 text-body-sm animate-in fade-in-0 slide-in-from-bottom-1 duration-150 motion-reduce:animate-none ${warning ? "border-warning/40 bg-warning/10 text-warning" : "border-destructive/40 bg-destructive/10 text-destructive"}`}
     >
       <div className="min-w-0 flex-1">
         {isModelRequiredSendError(sendError) ? (
@@ -119,7 +162,7 @@ export function ComposerError({
             <Button type="button" variant="outline" size="sm" onClick={onOpenModels}>
               {t`Change model`}
             </Button>
-            <p id={fileNoteId} className="basis-full text-xs text-muted-foreground">
+            <p id={fileNoteId} className="basis-full text-label text-muted-foreground">
               {t`The bot can use the file but won't see the picture.`}
             </p>
           </div>
@@ -140,7 +183,7 @@ export function ComposerError({
         {!sendError && runError ? (
           <details key={runError} className="mt-1">
             <summary className="w-fit cursor-pointer">{t`Details`}</summary>
-            <pre className="mt-2 whitespace-pre-wrap break-words text-xs">
+            <pre className="mt-2 whitespace-pre-wrap break-words text-label">
               {normalizedRunError?.details}
             </pre>
           </details>

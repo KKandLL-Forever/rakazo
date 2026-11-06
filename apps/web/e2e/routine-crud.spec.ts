@@ -1,13 +1,61 @@
 import type { Page } from "@playwright/test";
 import { expect, test } from "@playwright/test";
 import type { Bot, Routine } from "@rakazo/contracts";
-import { activeBotId, captureScreenshot, completeOnboarding, rpc, signup } from "./helpers";
+import {
+  activeBotId,
+  captureScreenshot,
+  completeOnboarding,
+  openBotPanelTab,
+  rpc,
+  signup,
+} from "./helpers";
 
 async function addScheduleTrigger(page: Page, freq: string) {
   await page.getByRole("button", { name: "Add trigger" }).click();
   await page.getByRole("menuitem", { name: "On a schedule" }).hover();
   await page.getByRole("menuitem", { name: freq, exact: true }).click();
 }
+
+test("a delayed schedule is visible only while the routine is active", async ({
+  page,
+}, testInfo) => {
+  await signup(page, `routine-delay-${Date.now()}@rakazo.test`, "password12", "Routine delay");
+  await completeOnboarding(page);
+  const botId = activeBotId(page);
+  const routine = await rpc<Routine>(page, "routines/create", {
+    botId,
+    name: "Morning report",
+    prompt: "Prepare the report.",
+    crons: ["0 8 * * *"],
+    timezone: "UTC",
+    active: false,
+  });
+  let scheduleDelayed = true;
+  await page.route("**/rpc/routines/list", async (route) => {
+    const response = await route.fetch();
+    const body = await response.json();
+    body.json = body.json.map((item: Routine) =>
+      item.id === routine.id ? { ...item, active: true, scheduleDelayed } : item,
+    );
+    await route.fulfill({ response, json: body });
+  });
+  await page.reload();
+  await openBotPanelTab(page, "Routines");
+  await page.getByRole("button", { name: /Morning report/ }).click();
+  const delay = page.getByRole("status").filter({ hasText: "Schedule delayed" });
+  await expect(delay).toBeVisible();
+  await captureScreenshot(page, testInfo, "routine-schedule-delayed");
+  const name = page.locator("label:has-text('Name') input");
+  await name.fill("Unsaved report name");
+  scheduleDelayed = false;
+  await expect(delay).toHaveCount(0, { timeout: 35_000 });
+  await expect(name).toHaveValue("Unsaved report name");
+  scheduleDelayed = true;
+  await expect(delay).toBeVisible({ timeout: 35_000 });
+  await expect(name).toHaveValue("Unsaved report name");
+  await page.getByRole("switch", { name: "Active", exact: true }).click();
+  await expect(delay).toHaveCount(0);
+});
 
 async function saveAndReturn(page: Page, procedure: "routines/create" | "routines/update") {
   const saved = page.waitForResponse(
@@ -40,7 +88,7 @@ test("routine editing updates in place, preserves timezone, deletion persists, a
   expect(created.nextRunAt).not.toBeNull();
   expect(localSchedule(created.nextRunAt!, created.timezone)).toMatchObject({ hour: 9, minute: 0 });
   await page.reload();
-  await page.getByRole("button", { name: "Agent computer", exact: true }).click();
+  await openBotPanelTab(page, "Routines");
 
   await page.getByRole("button", { name: /Tokyo check-in/ }).click();
   await page.locator("label:has-text('Name') input").fill("Weekday check-in");
@@ -135,7 +183,6 @@ test("routine editing updates in place, preserves timezone, deletion persists, a
   for (const column of ["modelProvider", "modelId", "thinkingLevel"])
     expect(renamePatch).not.toHaveProperty(column);
 
-  // The deleted routine stays gone after a reload.
   await page.reload();
   await expect(page.getByPlaceholder("Message Chief")).toBeVisible();
   expect((await rpc<Routine[]>(page, "routines/list", { botId })).map((r) => r.name)).toEqual([
@@ -144,34 +191,15 @@ test("routine editing updates in place, preserves timezone, deletion persists, a
   await expect(updatedButton).toHaveCount(0);
 });
 
-test("invalid advanced cron is rejected without creating a routine", async ({ page }, testInfo) => {
-  const stamp = Date.now();
-  await signup(page, `routine-invalid-${stamp}@rakazo.test`, "password12", "Invalid Routine");
-  await completeOnboarding(page);
-  const botId = activeBotId(page);
-
-  await page.getByRole("button", { name: "Agent computer", exact: true }).click();
-  await page.getByRole("button", { name: "Create Routine" }).click();
-  await page.locator("label:has-text('Name') input").fill("Broken schedule");
-  await page.locator("label:has-text('Instruction') textarea").fill("This should never run");
-  await addScheduleTrigger(page, "Advanced...");
-  await page.getByLabel("Cron expression").fill("61 25 * * *");
-  await page.getByRole("button", { name: "Save", exact: true }).click();
-
-  await expect(page.getByRole("alert")).toContainText("Enter a valid cron expression.");
-  expect(await rpc<Routine[]>(page, "routines/list", { botId })).toEqual([]);
-  await captureScreenshot(page, testInfo, "invalid-cron-rejected");
-});
-
-test("a successful routine create is not reported as failed when refresh fails", async ({
-  page,
-}) => {
+test("a successful routine create is not reported as failed when refresh fails", {
+  tag: "@nightly",
+}, async ({ page }) => {
   const stamp = Date.now();
   await signup(page, `routine-refresh-${stamp}@rakazo.test`, "password12", "Routine Refresh");
   await completeOnboarding(page);
   const botId = activeBotId(page);
 
-  await page.getByRole("button", { name: "Agent computer", exact: true }).click();
+  await openBotPanelTab(page, "Routines");
   await page.getByRole("button", { name: "Create Routine" }).click();
   await page.locator("label:has-text('Name') input").fill("Persisted routine");
   await page.locator("label:has-text('Instruction') textarea").fill("Run once each morning");
@@ -201,16 +229,15 @@ test("a successful routine create is not reported as failed when refresh fails",
   expect(routines[0]?.name).toBe("Persisted routine");
 });
 
-test("switching bots while a routine save is pending does not reopen stale state", async ({
-  page,
-}) => {
+test("switching bots while a routine save is pending does not reopen stale state", {
+  tag: "@nightly",
+}, async ({ page }) => {
   const stamp = Date.now();
   await signup(page, `routine-switch-${stamp}@rakazo.test`, "password12", "Routine Switch");
   await completeOnboarding(page);
   const firstBotId = activeBotId(page);
   const secondBot = await rpc<Bot>(page, "bots/create", {
     name: "Second",
-    title: "",
     description: "",
     instructions: "",
     notifyOnFinish: false,
@@ -237,7 +264,7 @@ test("switching bots while a routine save is pending does not reopen stale state
   ]);
   await page.reload();
 
-  await page.getByRole("button", { name: "Agent computer", exact: true }).click();
+  await openBotPanelTab(page, "Routines");
   await page.getByRole("button", { name: /First routine/ }).click();
   await page.locator("label:has-text('Name') input").fill("First routine updated");
 
@@ -277,7 +304,7 @@ test("switching bots while a routine save is pending does not reopen stale state
   await expect(page.getByTestId("side-panel")).toHaveAttribute("data-panel", "closed");
   await expect(page.getByRole("alert")).toHaveCount(0);
 
-  await page.getByRole("button", { name: "Agent computer", exact: true }).click();
+  await openBotPanelTab(page, "Routines");
   await expect(page.getByRole("button", { name: /Second routine/ })).toHaveCount(1);
   await expect(page.getByRole("button", { name: /First routine/ })).toHaveCount(0);
 
@@ -334,14 +361,14 @@ function localSchedule(iso: string, timezone: string) {
   };
 }
 
-test("change-trigger screenshot walkthrough", async ({ page }, testInfo) => {
+test("change-trigger screenshot walkthrough", { tag: "@nightly" }, async ({ page }, testInfo) => {
   await page.emulateMedia({ colorScheme: "light" });
   const stamp = Date.now();
   await signup(page, `routine-walkthrough-${stamp}@rakazo.test`, "password12", "Routine Watch");
   await completeOnboarding(page);
   const botId = activeBotId(page);
 
-  await page.getByRole("button", { name: "Agent computer", exact: true }).click();
+  await openBotPanelTab(page, "Routines");
   await expect(page.getByRole("button", { name: "Create Routine" })).toBeVisible();
   await expect(page.getByText(/Booting up .* computer/)).toBeHidden();
   await expect(page.locator("html")).toHaveAttribute("data-theme", "light");

@@ -1,20 +1,79 @@
-import type { Readable } from "node:stream";
-import {
-  AbortMultipartUploadCommand,
-  CompleteMultipartUploadCommand,
-  CreateMultipartUploadCommand,
-  DeleteObjectsCommand,
-  GetObjectCommand,
-  ListObjectsV2Command,
-  PutObjectCommand,
-  S3Client,
-  UploadPartCommand,
-} from "@aws-sdk/client-s3";
+import { Agent as HttpAgent } from "node:http";
+import { Agent as HttpsAgent } from "node:https";
+import type { Socket } from "node:net";
+import type { Duplex, Readable } from "node:stream";
+import type * as S3Sdk from "@aws-sdk/client-s3";
 import type { ObjectStorage } from "@rakazo/adapter-kit";
 
 /** Upload part size: large enough that most homes are one request, small enough to hold in memory. */
 const PART_BYTES = 16 * 1024 * 1024;
 const DELETE_BATCH = 1000;
+/**
+ * The SDK waits forever by default, and its own socket limit stops once response headers arrive,
+ * so a store that stops answering, before or during a body, would keep each computer's sleep job,
+ * and the maintenance slot it holds, waiting for good. Sockets therefore fail after this long
+ * without traffic, from connect to the end of the body. It counts inactivity, not duration: a
+ * large transfer keeps its socket busy.
+ */
+const IDLE_SOCKET_TIMEOUT_MS = 60_000;
+/** The SDK's own default per origin. */
+const MAX_SOCKETS = 50;
+
+/**
+ * Makes this the only owner of the socket's inactivity timer. The SDK and Node's agent call
+ * `setTimeout` on sockets to re-arm the timer, turn it off, or attach a callback that destroys the
+ * socket even while its reader has paused it; those calls do nothing here, and the timeout event
+ * reaches only this handler.
+ */
+function failWhenIdle<T extends Duplex | null | undefined>(socket: T, idleMs: number): T {
+  if (!socket) return socket;
+  const tcp = socket as unknown as Socket;
+  const arm = tcp.setTimeout.bind(tcp);
+  let waitedOnReader = false;
+  const onIdle = () => {
+    // A reader that stopped pulling (backpressure) paused the socket; the store is not stalled.
+    // Once it pulls again, the store gets a full period before silence counts, so a stall is
+    // caught within twice the limit.
+    if (tcp.isPaused() || waitedOnReader) {
+      waitedOnReader = tcp.isPaused();
+      arm(idleMs);
+      return;
+    }
+    tcp.destroy(
+      Object.assign(new Error(`Object storage sent nothing for ${idleMs} ms`), {
+        code: "ETIMEDOUT",
+      }),
+    );
+  };
+  arm(idleMs);
+  tcp.setTimeout = () => tcp;
+  const emit = tcp.emit.bind(tcp);
+  tcp.emit = ((event: string | symbol, ...args: unknown[]) => {
+    if (event !== "timeout") return emit(event, ...args);
+    onIdle();
+    return true;
+  }) as typeof tcp.emit;
+  return socket;
+}
+
+/**
+ * Connection options for the S3 client. The idle limit starts when a socket exists, so a request
+ * waiting for one of the pooled sockets is never failed for the wait, and it also bounds connecting.
+ */
+export function objectStorageRequestHandler(idleMs = IDLE_SOCKET_TIMEOUT_MS) {
+  const options = { keepAlive: true, maxSockets: MAX_SOCKETS };
+  class IdleHttpAgent extends HttpAgent {
+    override createConnection(...args: Parameters<HttpAgent["createConnection"]>) {
+      return failWhenIdle(super.createConnection(...args), idleMs);
+    }
+  }
+  class IdleHttpsAgent extends HttpsAgent {
+    override createConnection(...args: Parameters<HttpsAgent["createConnection"]>) {
+      return failWhenIdle(super.createConnection(...args), idleMs);
+    }
+  }
+  return { httpAgent: new IdleHttpAgent(options), httpsAgent: new IdleHttpsAgent(options) };
+}
 
 export interface S3ObjectStorageConfig {
   bucket: string;
@@ -64,27 +123,35 @@ export function objectStorageConfigFromEnv(
 }
 
 export class S3ObjectStorage implements ObjectStorage {
-  private readonly client: S3Client;
+  private s3?: Promise<{ sdk: typeof S3Sdk; client: S3Sdk.S3Client }>;
 
   constructor(
     private readonly config: S3ObjectStorageConfig,
-    client?: S3Client,
-  ) {
-    this.client =
-      client ??
-      new S3Client({
-        region: config.region,
-        endpoint: config.endpoint,
-        forcePathStyle: config.pathStyle,
-        credentials: {
-          accessKeyId: config.accessKeyId,
-          secretAccessKey: config.secretAccessKey,
-        },
-        // Checksums only where the protocol requires them; not every S3-compatible service
-        // accepts the newer optional ones.
-        requestChecksumCalculation: "WHEN_REQUIRED",
-        responseChecksumValidation: "WHEN_REQUIRED",
-      });
+    private readonly client?: S3Sdk.S3Client,
+  ) {}
+
+  /** The SDK loads on first use, so deployments without object storage never load it. */
+  private connect() {
+    this.s3 ??= import("@aws-sdk/client-s3").then((sdk) => ({
+      sdk,
+      client:
+        this.client ??
+        new sdk.S3Client({
+          region: this.config.region,
+          endpoint: this.config.endpoint,
+          forcePathStyle: this.config.pathStyle,
+          credentials: {
+            accessKeyId: this.config.accessKeyId,
+            secretAccessKey: this.config.secretAccessKey,
+          },
+          // Checksums only where the protocol requires them; not every S3-compatible service
+          // accepts the newer optional ones.
+          requestChecksumCalculation: "WHEN_REQUIRED",
+          responseChecksumValidation: "WHEN_REQUIRED",
+          requestHandler: objectStorageRequestHandler(),
+        }),
+    }));
+    return this.s3;
   }
 
   private key(key: string) {
@@ -92,6 +159,7 @@ export class S3ObjectStorage implements ObjectStorage {
   }
 
   async put(key: string, body: AsyncIterable<Uint8Array>): Promise<void> {
+    const { sdk, client } = await this.connect();
     const Bucket = this.config.bucket;
     const Key = this.key(key);
     const source = parts(body, PART_BYTES)[Symbol.asyncIterator]();
@@ -101,20 +169,18 @@ export class S3ObjectStorage implements ObjectStorage {
       const second = first.done ? first : await source.next();
       if (second.done) {
         const bytes = first.done ? Buffer.alloc(0) : first.value;
-        await this.client.send(
-          new PutObjectCommand({ Bucket, Key, Body: bytes, ContentLength: bytes.length }),
+        await client.send(
+          new sdk.PutObjectCommand({ Bucket, Key, Body: bytes, ContentLength: bytes.length }),
         );
         return;
       }
-      const { UploadId } = await this.client.send(
-        new CreateMultipartUploadCommand({ Bucket, Key }),
-      );
+      const { UploadId } = await client.send(new sdk.CreateMultipartUploadCommand({ Bucket, Key }));
       if (!UploadId) throw new Error("Object storage did not start a multipart upload");
       const uploaded: Array<{ ETag: string; PartNumber: number }> = [];
       const upload = async (bytes: Buffer) => {
         const PartNumber = uploaded.length + 1;
-        const { ETag } = await this.client.send(
-          new UploadPartCommand({
+        const { ETag } = await client.send(
+          new sdk.UploadPartCommand({
             Bucket,
             Key,
             UploadId,
@@ -131,8 +197,8 @@ export class S3ObjectStorage implements ObjectStorage {
         await upload(second.value);
         for (let next = await source.next(); !next.done; next = await source.next())
           await upload(next.value);
-        await this.client.send(
-          new CompleteMultipartUploadCommand({
+        await client.send(
+          new sdk.CompleteMultipartUploadCommand({
             Bucket,
             Key,
             UploadId,
@@ -140,8 +206,8 @@ export class S3ObjectStorage implements ObjectStorage {
           }),
         );
       } catch (error) {
-        await this.client
-          .send(new AbortMultipartUploadCommand({ Bucket, Key, UploadId }))
+        await client
+          .send(new sdk.AbortMultipartUploadCommand({ Bucket, Key, UploadId }))
           .catch(() => undefined);
         throw error;
       }
@@ -151,18 +217,20 @@ export class S3ObjectStorage implements ObjectStorage {
   }
 
   async *get(key: string): AsyncGenerator<Uint8Array> {
-    const { Body } = await this.client.send(
-      new GetObjectCommand({ Bucket: this.config.bucket, Key: this.key(key) }),
+    const { sdk, client } = await this.connect();
+    const { Body } = await client.send(
+      new sdk.GetObjectCommand({ Bucket: this.config.bucket, Key: this.key(key) }),
     );
     if (!Body) throw new Error("Object storage returned no body");
     yield* Body as Readable;
   }
 
   async *list(prefix: string): AsyncGenerator<{ key: string; lastModified: Date }> {
+    const { sdk, client } = await this.connect();
     let ContinuationToken: string | undefined;
     do {
-      const page = await this.client.send(
-        new ListObjectsV2Command({
+      const page = await client.send(
+        new sdk.ListObjectsV2Command({
           Bucket: this.config.bucket,
           Prefix: this.key(prefix),
           ContinuationToken,
@@ -180,9 +248,10 @@ export class S3ObjectStorage implements ObjectStorage {
   }
 
   async delete(keys: readonly string[]): Promise<void> {
+    const { sdk, client } = await this.connect();
     for (let start = 0; start < keys.length; start += DELETE_BATCH) {
-      const { Errors } = await this.client.send(
-        new DeleteObjectsCommand({
+      const { Errors } = await client.send(
+        new sdk.DeleteObjectsCommand({
           Bucket: this.config.bucket,
           Delete: {
             Quiet: true,

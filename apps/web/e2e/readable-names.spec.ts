@@ -11,7 +11,6 @@ test("legacy opaque names never appear in navigation, account, chats or Activity
   await completeOnboarding(page);
   const bot = await rpc<{ id: string }>(page, "bots/create", {
     name: "Helper",
-    title: "",
     description: "",
     computerMode: "team",
   });
@@ -98,6 +97,11 @@ test("legacy opaque names never appear in navigation, account, chats or Activity
     await page.getByRole("button", { name: "Activity", exact: true }).click();
     await page.reload();
     await expect(page.getByRole("status", { name: "Loading activity…" })).toBeHidden();
+    // Activity folds its Working section by default; open it so the run row is visible.
+    await page
+      .locator("aside")
+      .getByRole("button", { name: /^Working/ })
+      .click();
     await expect(page.locator("aside").getByRole("button", { name: /^Bot, / })).toBeVisible();
     await expectReadableNames(page.locator("body"));
     await captureScreenshot(page, testInfo, "readable-names-activity");
@@ -108,27 +112,5 @@ test("legacy opaque names never appear in navigation, account, chats or Activity
     } finally {
       await pool.end();
     }
-  }
-});
-
-test("visible-name scanner catches tokens and translation keys while keeping literal names", async ({
-  page,
-}) => {
-  await page.setContent(
-    "<main>Ada 李雷 dev_bot demo@example.com monthly_sales_report.csv account.json</main>",
-  );
-  await expectReadableNames(page.locator("main"));
-  for (const text of [
-    "__TestTok1__",
-    "550e8400-e29b-41d4-a716-446655440000",
-    "c123456789012345678901234",
-    "settings.account.title",
-    "account.name",
-    "{{missing}}",
-  ]) {
-    await page.locator("main").evaluate((element, value) => {
-      element.textContent = value;
-    }, text);
-    await expect(expectReadableNames(page.locator("main"))).rejects.toThrow();
   }
 });

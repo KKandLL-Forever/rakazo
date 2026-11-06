@@ -7,8 +7,13 @@ import {
   isLocalhostOrLoopbackIp,
   isNonPublicAddress,
 } from "@rakazo/contracts";
+import { cancelResponseBody } from "@rakazo/core";
 import { Agent } from "undici";
-import { combineSignals } from "./connector-safety.js";
+import {
+  combineSignals,
+  redactConnectorPayload,
+  sanitizeConnectorError,
+} from "./connector-safety.js";
 import type { ResolvedAddress, ResolveHostname } from "./network-address.js";
 import { createAddressCheckedLookup } from "./network-address.js";
 import type { RemoteTransportDependencies, SafeRemoteFetch } from "./remote-mcp.js";
@@ -197,6 +202,7 @@ function verbErrorMessage(payload: unknown, fallback: string): string {
 /** Surface hosted gateway rate limits plainly instead of as an opaque transport error. */
 function assertNotRateLimited(response: Response): Response {
   if (response.status !== 429) return response;
+  cancelResponseBody(response);
   const retryAfter = response.headers.get("retry-after")?.trim();
   // Retry-After is either delta-seconds or an HTTP date.
   const when = !retryAfter ? null : /^\d+$/.test(retryAfter) ? `${retryAfter}s` : retryAfter;
@@ -267,8 +273,11 @@ export function createSerenityPrivateLanFetch(
         dispatcher,
       } as RequestInit & { dispatcher: Agent });
       if (response.status >= 300 && response.status < 400) {
+        cancelResponseBody(response);
         throw new Error("Serenity MCP redirects are not permitted; configure the final URL.");
       }
+      // The dispatcher must be able to close before the caller can inspect the response.
+      if (response.status === 429) cancelResponseBody(response);
       return response;
     } catch (error) {
       throw new Error(
@@ -314,6 +323,7 @@ async function withSerenityClient<T>(
       if (pinnedFetch) return assertNotRateLimited(await pinnedFetch(input, init));
       const response = await localFetch(input, { ...init, redirect: "manual" });
       if (response.status >= 300 && response.status < 400) {
+        cancelResponseBody(response);
         throw new Error("Serenity MCP redirects are not permitted; configure the final URL.");
       }
       return assertNotRateLimited(response);
@@ -322,7 +332,8 @@ async function withSerenityClient<T>(
   const client = new Client({ name: "rakazo", version: "0.1.0" }, { capabilities: {} });
   try {
     await client.connect(transport, { signal: requestSignal, timeout: SERENITY_TIMEOUT_MS });
-    return await run(client, requestSignal);
+    // A server or proxy may echo the bearer token it received; never hand it to the model.
+    return redactConnectorPayload(await run(client, requestSignal), [config.token]) as T;
   } finally {
     // Each verb opens its own MCP session; end it server-side instead of leaving it to expire.
     // The SDK's DELETE ignores our request signal, so bound it before closing.
@@ -373,7 +384,7 @@ export async function probeSerenity(
   } catch (error) {
     return {
       ok: false,
-      error: `Serenity is unreachable: ${error instanceof Error ? error.message : String(error)}`,
+      error: `Serenity is unreachable: ${sanitizeConnectorError(error, [config.token])}`,
     };
   }
 }
@@ -419,7 +430,7 @@ export async function recallSerenity(
   } catch (error) {
     return {
       ok: false,
-      error: `Serenity recall failed: ${error instanceof Error ? error.message : String(error)}`,
+      error: `Serenity recall failed: ${sanitizeConnectorError(error, [config.token])}`,
     };
   }
 }
@@ -490,7 +501,7 @@ export async function rememberSerenity(
   } catch (error) {
     return {
       ok: false,
-      error: `Serenity remember failed: ${error instanceof Error ? error.message : String(error)}`,
+      error: `Serenity remember failed: ${sanitizeConnectorError(error, [config.token])}`,
     };
   }
 }
@@ -549,7 +560,7 @@ export async function forgetSerenity(
   } catch (error) {
     return {
       ok: false,
-      error: `Serenity forget failed: ${error instanceof Error ? error.message : String(error)}`,
+      error: `Serenity forget failed: ${sanitizeConnectorError(error, [config.token])}`,
     };
   }
 }

@@ -12,6 +12,9 @@ import * as installer from "./mcp-package-installer.js";
 import { mcpPackageDir } from "./mcp-package-installer.js";
 import { McpSession } from "./mcp-transport.js";
 
+// No server is shared with every agent, so only assignments reach a bot.
+const NO_SHARED_SERVERS = { findMany: async () => [], findFirst: async () => null };
+
 /** A dependency-free stdio MCP server: one `hello` tool that echoes its launch arguments. */
 const SERVER_SOURCE = `#!/usr/bin/env node
 if (process.env.SILENT) {
@@ -86,11 +89,17 @@ function contextFor(botId = "bot-1") {
 describe("MCP connector managed stdio launch", () => {
   let root: string;
   let env: Record<string, string>;
-  const updateMany = vi.fn(async (_args: { data: Record<string, unknown> }) => ({ count: 1 }));
+  let args: string[] | undefined;
+  const updateMany = vi.fn(
+    async (_args: { where?: { revision?: number }; data: Record<string, unknown> }) => ({
+      count: 1,
+    }),
+  );
 
   beforeEach(async () => {
     root = await mkdtemp(join(tmpdir(), "rakazo-mcp-launch-"));
     env = {};
+    args = undefined;
     updateMany.mockClear();
   });
 
@@ -130,9 +139,9 @@ describe("MCP connector managed stdio launch", () => {
         ),
       },
       secret: { findFirst: vi.fn(async () => ({ id: "secret-1", ciphertext: "cipher" })) },
-      mcpServer: { updateMany },
+      mcpServer: { ...NO_SHARED_SERVERS, updateMany },
     };
-    const secrets = { load: vi.fn(async () => JSON.stringify({ env })) };
+    const secrets = { load: vi.fn(async () => JSON.stringify({ env, args })) };
     return new McpConnector(prisma as never, secrets as never, {
       stdioEnabled: options.stdioEnabled ?? true,
       allowedCommands: options.allowedCommands ?? ["npx"],
@@ -175,6 +184,20 @@ describe("MCP connector managed stdio launch", () => {
     }
   });
 
+  it("launches with the arguments kept in the encrypted credential", async () => {
+    await publishPackage(root);
+    args = ["-y", SPEC, "--region", "us"];
+    const connector = connectorFor({ server: { ...SERVER, args: [] } });
+    try {
+      const [tool] = await connector.discoverTools(contextFor());
+      expect(await callTool(connector, tool!)).toMatchObject([
+        { type: "result", data: { content: [{ text: "hi --region us" }] } },
+      ]);
+    } finally {
+      await connector.close();
+    }
+  });
+
   it.each([
     [{ allowedCommands: ["node"] }, "This stdio command isn't allowed here"],
     [{ stdioEnabled: false }, "Stdio MCP servers aren't available here"],
@@ -203,6 +226,49 @@ describe("MCP connector managed stdio launch", () => {
     },
   );
 
+  it.each([
+    ["bunx", ["pkg"]],
+    ["pnpm", ["dlx", "pkg"]],
+    ["uvx", ["pkg"]],
+  ])("refuses package runner %s before installing or launching", async (command, args) => {
+    const launches = vi.spyOn(McpSession.prototype, "connectStdio");
+    const installs = vi.spyOn(installer, "ensureMcpPackage");
+    const connector = connectorFor({
+      allowedCommands: [command],
+      server: { ...SERVER, command, args },
+    });
+    try {
+      const tools = await connector.discoverTools(contextFor());
+      expect(tools).toMatchObject([{ name: "mcp__mail__unavailable" }]);
+      expect(tools[0]?.description).toContain("Only npx can launch packages here");
+      expect(launches).not.toHaveBeenCalled();
+      expect(installs).not.toHaveBeenCalled();
+    } finally {
+      await connector.close();
+    }
+  });
+
+  it.each([
+    [["-c", "echo hi"]],
+    [["--call", "echo hi"]],
+    [["--shell", "sh"]],
+    [["-y", "./local-server"]],
+    [["-p", "a", "-p", "b", "bin"]],
+  ])("refuses an npx launch it can't reduce to a registry package: %j", async (args) => {
+    const launches = vi.spyOn(McpSession.prototype, "connectStdio");
+    const installs = vi.spyOn(installer, "ensureMcpPackage");
+    const connector = connectorFor({ server: { ...SERVER, args } });
+    try {
+      const tools = await connector.discoverTools(contextFor());
+      expect(tools).toMatchObject([{ name: "mcp__mail__unavailable" }]);
+      expect(tools[0]?.description).toContain("This npx command isn't supported here");
+      expect(launches).not.toHaveBeenCalled();
+      expect(installs).not.toHaveBeenCalled();
+    } finally {
+      await connector.close();
+    }
+  });
+
   it("tells the model why an assigned server is unavailable, with secrets redacted", async () => {
     await publishPackage(root);
     env = {
@@ -217,12 +283,10 @@ describe("MCP connector managed stdio launch", () => {
       const [placeholder] = tools;
       expect(placeholder?.name).toBe("mcp__mail__unavailable");
       expect(placeholder?.description).toContain('"Mail" is assigned to you but is unavailable');
-      expect(placeholder?.description).toContain(
-        "auth failed for [redacted] as person@example.test",
-      );
+      expect(placeholder?.description).toContain("auth failed for [redacted] as [redacted]");
       const visible = JSON.stringify({ tools, health: healthWrites() });
       expect(visible).not.toContain("sk-live-0123456789abcdef");
-      expect(visible).toContain("person@example.test");
+      expect(visible).not.toContain("person@example.test");
 
       const events = await callTool(connector, placeholder!);
       expect(events).toEqual([
@@ -295,9 +359,10 @@ describe("MCP connector managed stdio launch", () => {
 
     it("is not retried on every turn, but is again after the backoff or once it works", async () => {
       await publishPackage(root);
-      env = { SILENT: "1" };
+      // Fails at once, so the healthy relaunch below keeps the default startup budget.
+      env = { FAIL_LOUDLY: "1" };
       const launches = vi.spyOn(McpSession.prototype, "connectStdio");
-      const connector = connectorFor({ startupTimeoutMs: 300, discoveryTimeoutMs: 5_000 });
+      const connector = connectorFor({ discoveryTimeoutMs: 5_000 });
       try {
         expect(await connector.discoverTools(contextFor())).toMatchObject([
           { name: "mcp__mail__unavailable" },
@@ -325,12 +390,12 @@ describe("MCP connector managed stdio launch", () => {
 
     it("ends the backoff once another process records a successful check", async () => {
       await publishPackage(root);
-      env = { SILENT: "1" };
+      env = { FAIL_LOUDLY: "1" };
       const server: typeof SERVER & { healthStatus?: string; healthCheckedAt?: Date } = {
         ...SERVER,
       };
       const launches = vi.spyOn(McpSession.prototype, "connectStdio");
-      const connector = connectorFor({ server, startupTimeoutMs: 300, discoveryTimeoutMs: 5_000 });
+      const connector = connectorFor({ server, discoveryTimeoutMs: 5_000 });
       try {
         expect(await connector.discoverTools(contextFor())).toMatchObject([
           { name: "mcp__mail__unavailable" },
@@ -370,7 +435,8 @@ describe("MCP connector managed stdio launch", () => {
           expiresAt: Date.now() + 60_000,
         }),
       );
-      const connector = connectorFor({ discoveryTimeoutMs: 300 });
+      // Also bounds the launch once installed, so leave room for a loaded machine.
+      const connector = connectorFor({ discoveryTimeoutMs: 2_000 });
       try {
         const tools = await connector.discoverTools(contextFor());
         expect(tools).toMatchObject([{ name: "mcp__mail__unavailable" }]);
@@ -479,6 +545,52 @@ describe("MCP connector managed stdio launch", () => {
       await finishInstall?.();
       expect(healthWrites().at(-1)).toMatchObject({ healthStatus: "unknown" });
     } finally {
+      await connector.close();
+    }
+  });
+
+  it("keeps a newer revision's health when an older install settles", async () => {
+    const stored = { revision: 1, healthStatus: "unknown" as unknown };
+    updateMany.mockImplementation(async (args) => {
+      const revision = args.where?.revision;
+      if (revision !== undefined && revision !== stored.revision) return { count: 0 };
+      stored.healthStatus = args.data.healthStatus;
+      return { count: 1 };
+    });
+    let finishInstall: (() => Promise<void> | undefined) | undefined;
+    vi.spyOn(installer, "ensureMcpPackage").mockImplementation(async (_spec, options) => {
+      options?.onInstall?.();
+      finishInstall = options?.onSettled;
+      return new Promise((_resolve, reject) => {
+        options?.signal?.addEventListener("abort", () => reject(options.signal?.reason), {
+          once: true,
+        });
+      });
+    });
+    const controller = new AbortController();
+    const connector = connectorFor();
+    try {
+      const discovery = connector.discoverTools({
+        operationId: "test",
+        traceId: "test",
+        spaceId: "w1",
+        userId: "u1",
+        botId: "bot-1",
+        signal: controller.signal,
+      });
+      await vi.waitFor(() => expect(finishInstall).toBeDefined());
+      // An edit elsewhere moved the server on and its check failed.
+      Object.assign(stored, { revision: 2, healthStatus: "error" });
+      controller.abort(new Error("cancelled"));
+      await discovery;
+      await finishInstall?.();
+      expect(stored).toEqual({ revision: 2, healthStatus: "error" });
+      expect(updateMany.mock.calls.map(([args]) => args.where)).toEqual([
+        { id: "server-1", revision: 1 },
+        { id: "server-1", revision: 1 },
+      ]);
+    } finally {
+      updateMany.mockImplementation(async () => ({ count: 1 }));
       await connector.close();
     }
   });

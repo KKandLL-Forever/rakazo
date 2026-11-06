@@ -9,25 +9,43 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import NewGroup from "../app/new-group";
 import type { MobileBot } from "./api";
 
-const { rpc, back, push, replace, announce, hardwareBack, nativeHeader, addToSearchInbox } =
-  vi.hoisted(() => ({
-    rpc: vi.fn(),
-    addToSearchInbox: vi.fn(),
-    back: vi.fn(),
-    push: vi.fn(),
-    replace: vi.fn(),
-    announce: vi.fn(),
-    hardwareBack: { current: undefined as (() => boolean) | undefined },
-    nativeHeader: { current: false },
-  }));
+const {
+  rpc,
+  back,
+  push,
+  replace,
+  announce,
+  hardwareBack,
+  nativeHeader,
+  addToSearchInbox,
+  groupPreview,
+  hapticSuccess,
+  session,
+} = vi.hoisted(() => ({
+  rpc: vi.fn(),
+  hapticSuccess: vi.fn(),
+  session: { generation: 4, apiBase: "http://api.test", focused: true },
+  groupPreview: vi.fn(),
+  addToSearchInbox: vi.fn(),
+  back: vi.fn(),
+  push: vi.fn(),
+  replace: vi.fn(),
+  announce: vi.fn(),
+  hardwareBack: { current: undefined as (() => boolean) | undefined },
+  nativeHeader: { current: false },
+}));
 vi.mock("./side-insets", () => ({ useSideInsets: () => ({}) }));
 vi.mock("./api", () => ({ rpc }));
+vi.mock("./haptics", () => ({ hapticSuccess }));
 vi.mock("./search-inbox", () => ({
   addToSearchInbox,
-  searchInboxSession: () => ({ generation: 4, apiBase: "http://api.test" }),
+  searchInboxSession: () => ({ generation: session.generation, apiBase: session.apiBase }),
+  isSearchInboxSession: (askedIn: typeof session) =>
+    askedIn.generation === session.generation && askedIn.apiBase === session.apiBase,
 }));
 vi.mock("expo-router/react-navigation", () => ({ useHeaderHeight: () => 56 }));
 vi.mock("expo-router", () => ({
+  useNavigation: () => ({ isFocused: () => session.focused }),
   Stack: {
     Screen: ({
       options,
@@ -176,7 +194,12 @@ vi.mock("../components/sheet-close-button", () => ({
     </button>
   ),
 }));
-vi.mock("../components/group-avatar", () => ({ GroupAvatar: () => null }));
+vi.mock("../components/group-avatar", () => ({
+  GroupAvatar: (props: unknown) => {
+    groupPreview(props);
+    return null;
+  },
+}));
 vi.mock("../components/native-symbol", () => ({ NativeSymbol: () => null }));
 vi.mock("../components/bot-avatar", () => ({ BotAvatar: () => null }));
 vi.mock("../components/native-action-button", () => ({
@@ -195,15 +218,16 @@ vi.mock("../components/native-action-button", () => ({
   ),
 }));
 const bots = [
-  { id: "bot-1", name: "Researcher", title: "Reads papers" },
-  { id: "bot-2", name: "Writer", title: "Drafts prose" },
-  { id: "bot-3", name: "Support", title: "Helps out" },
+  { id: "bot-1", name: "Researcher" },
+  { id: "bot-2", name: "Writer" },
+  { id: "bot-3", name: "Support" },
 ] as MobileBot[];
 let root: Root;
 let container: HTMLDivElement;
 beforeEach(() => {
   vi.clearAllMocks();
   nativeHeader.current = false;
+  Object.assign(session, { generation: 4, apiBase: "http://api.test", focused: true });
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   container = document.createElement("div");
   root = createRoot(container);
@@ -241,6 +265,27 @@ async function pickPair() {
   await click("Next");
 }
 
+it("keeps each selected bot's icon set in the name-step group preview", async () => {
+  const looks = bots.map((bot, index) => ({
+    ...bot,
+    color: index === 0 ? "#10B981" : "#8B5CF6",
+    avatarSet: index === 0 ? "rakazo" : "organic",
+  }));
+  rpc.mockImplementation(async (procedure: string) =>
+    procedure === "bots/list" ? looks : { id: "group-1", name: "Created" },
+  );
+  await start();
+  await pickPair();
+  expect(groupPreview).toHaveBeenLastCalledWith(
+    expect.objectContaining({
+      members: [
+        { botId: "bot-2", color: "#8B5CF6", avatarSet: "organic" },
+        { botId: "bot-1", color: "#10B981", avatarSet: "rakazo" },
+      ],
+    }),
+  );
+});
+
 it("adds and removes chips, hides picked and archived bots, and clears filters on pick", async () => {
   rpc.mockResolvedValue([
     ...bots,
@@ -248,7 +293,7 @@ it("adds and removes chips, hides picked and archived bots, and clears filters o
   ]);
   await start();
   expect(button("Archived")).toBeUndefined();
-  await type("  PROSE ");
+  await type("  WRIT ");
   expect(button("Researcher")).toBeUndefined();
   await click("Writer");
   expect(button("Writer")).toBeUndefined();
@@ -331,6 +376,7 @@ it("Skip posts the default name in pick order and routes to the group", async ()
     pathname: "/group-thread",
     params: { groupId: "group-1", name: "Created" },
   });
+  expect(hapticSuccess).toHaveBeenCalledOnce();
 });
 it("Create posts a trimmed name with the keyboard done action", async () => {
   await start();
@@ -347,6 +393,7 @@ it("Create posts a trimmed name with the keyboard done action", async () => {
     name: "Project Falcon",
     botIds: ["bot-2", "bot-1"],
   });
+  expect(hapticSuccess).toHaveBeenCalledOnce();
 });
 it.each([false, true])("back keeps picks (hardware: %s)", async (hardware) => {
   await start();
@@ -375,9 +422,28 @@ it("disables submission while pending and shows errors inline for retry", async 
   await pickPair();
   await click("Skip");
   expect(button("Creating…")?.disabled).toBe(true);
+  expect(hapticSuccess).not.toHaveBeenCalled();
   await act(async () => reject(new Error("Could not create group")));
   expect(container.textContent).toContain("Could not create group");
   expect(button("Skip")?.disabled).toBe(false);
+  expect(hapticSuccess).not.toHaveBeenCalled();
+});
+
+it("does not confirm group creation after the session changes", async () => {
+  let finish!: (group: { id: string; name: string }) => void;
+  rpc.mockImplementation(async (procedure: string) =>
+    procedure === "bots/list"
+      ? bots
+      : new Promise((resolve) => {
+          finish = resolve;
+        }),
+  );
+  await start();
+  await pickPair();
+  await click("Skip");
+  session.generation += 1;
+  await act(async () => finish({ id: "group-1", name: "Created" }));
+  expect(hapticSuccess).not.toHaveBeenCalled();
 });
 it.each(["header", "native header", "hardware"])(
   "blocks %s back while creating and allows it after failure",
@@ -418,4 +484,21 @@ it("closes a standalone deep link to home", async () => {
   await start();
   await click("Close");
   expect(replace).toHaveBeenCalledWith("/");
+});
+
+it("does not confirm group creation after its screen loses focus", async () => {
+  let finish!: (group: { id: string; name: string }) => void;
+  rpc.mockImplementation(async (procedure: string) =>
+    procedure === "bots/list"
+      ? bots
+      : new Promise((resolve) => {
+          finish = resolve;
+        }),
+  );
+  await start();
+  await pickPair();
+  await click("Skip");
+  session.focused = false;
+  await act(async () => finish({ id: "group-1", name: "Created" }));
+  expect(hapticSuccess).not.toHaveBeenCalled();
 });

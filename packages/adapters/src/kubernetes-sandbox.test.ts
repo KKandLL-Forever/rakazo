@@ -4,16 +4,23 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import type { Exec, V1Pod } from "@kubernetes/client-node";
 import type { AdapterContext, ComputerRef, ProcessEvent } from "@rakazo/adapter-kit";
+import { shellQuote } from "@rakazo/core/node/desktop-runtime";
 import { describe, expect, it, vi } from "vitest";
+import { encodeTarEntry, TarReader } from "./exec-computer.js";
 import type { KubernetesSandboxSdk } from "./kubernetes-sandbox.js";
-import { encodeTarEntry, KubernetesSandboxProvider, TarReader } from "./kubernetes-sandbox.js";
+import { KubernetesSandboxProvider } from "./kubernetes-sandbox.js";
 import { assertSandboxWorkspaceContract, provisionPrepared } from "./sandbox-test-support.js";
 
-vi.mock("./computer-workspace.js", () => ({
-  shouldSkipPortableWorkspaceFile: (file: string) => file.includes(".browser-profiles/Cache/"),
-}));
-
 const TAR_END = Buffer.alloc(1024);
+
+/** Native `AbortSignal.timeout` ignores fake timers. */
+function fakeRequestDeadline() {
+  return vi.spyOn(AbortSignal, "timeout").mockImplementation((ms) => {
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(new Error("request deadline")), ms);
+    return controller.signal;
+  });
+}
 
 const context: AdapterContext = {
   operationId: "operation",
@@ -107,8 +114,13 @@ describe("KubernetesSandboxProvider", () => {
           else if (command.includes("stat"))
             stdout?.write(String(files.get(command.at(-1)!)!.content.length));
           else if (command.includes("cat")) stdout?.write(files.get(command.at(-1)!)!.content);
-          else if (command.includes("find")) {
-            const directory = command[command.indexOf("find") + 1]!;
+          else if (
+            command.includes("find") ||
+            command.some((arg) => arg.includes("find . -regextype"))
+          ) {
+            const directory = command.includes("find")
+              ? command[command.indexOf("find") + 1]!
+              : "/home/rakazo";
             for (const [name, file] of files) {
               const relative = name.slice(directory.length + 1);
               if (!name.startsWith(`${directory}/`)) continue;
@@ -224,6 +236,7 @@ describe("KubernetesSandboxProvider", () => {
     await provider.destroy(computer, context);
     expect(deleteNamespacedPod).toHaveBeenCalledWith(
       expect.objectContaining({ name: computer.providerRef, namespace: "sandboxes" }),
+      expect.anything(),
     );
   });
 
@@ -566,7 +579,10 @@ describe("KubernetesSandboxProvider", () => {
         { botId: "bot-a", homePath: "/unused", providerKind: "kubernetes", providerRef: "pod" },
         context,
       );
-      expect(del).toHaveBeenCalledWith(expect.objectContaining({ gracePeriodSeconds: 0 }));
+      expect(del).toHaveBeenCalledWith(
+        expect.objectContaining({ gracePeriodSeconds: 0 }),
+        expect.anything(),
+      );
       expect(create).toHaveBeenCalledOnce();
     },
   );
@@ -607,9 +623,15 @@ describe("KubernetesSandboxProvider", () => {
       .mockResolvedValue(readyPod);
     const provider = providerFor({ createNamespacedPod: create, readNamespacedPod: read });
     await provider.provision({ botId: "bot-a", homePath: "/unused" }, context);
-    expect(create.mock.calls[0]?.[0].body?.spec).toMatchObject({
+    const spec = create.mock.calls[0]?.[0].body?.spec;
+    expect(spec).toMatchObject({
       automountServiceAccountToken: false,
       restartPolicy: "Never",
+    });
+    expect(spec?.containers[0]?.securityContext).toEqual({
+      allowPrivilegeEscalation: false,
+      capabilities: { drop: ["ALL"] },
+      seccompProfile: { type: "RuntimeDefault" },
     });
   });
 
@@ -821,7 +843,10 @@ describe("KubernetesSandboxProvider", () => {
         args[6].on("end", () => args[8]?.({ status: "Success" }));
       } else
         queueMicrotask(() => {
-          if (command.includes("find")) {
+          if (
+            command.includes("find") ||
+            command.some((arg) => arg.includes("find . -regextype"))
+          ) {
             args[4]?.write(["a.txt", ".browser-profiles/Cache/blob", "run.sh", ""].join("\0"));
           } else if (command.includes("tar")) {
             expect(args[6]).toBeNull();
@@ -847,8 +872,10 @@ describe("KubernetesSandboxProvider", () => {
       "10s",
     ]);
     expect(commands.at(-1)).toContain("rm");
+    // Element-wise toEqual on a 2 MiB array takes minutes; compare bytes directly.
+    expect(Buffer.from(files[0]!.content).equals(binary)).toBe(true);
     expect(files).toEqual([
-      { path: "a.txt", content: new Uint8Array(binary) },
+      { path: "a.txt", content: expect.any(Uint8Array) },
       { path: "run.sh", content: new Uint8Array(Buffer.from("#!")), executable: true },
     ]);
   });
@@ -955,6 +982,7 @@ describe("KubernetesSandboxProvider", () => {
       await expect(provider[method](computer, context)).resolves.toBeUndefined();
       expect(del).toHaveBeenCalledWith(
         expect.objectContaining({ gracePeriodSeconds: 0, name: "pod" }),
+        expect.anything(),
       );
     },
   );
@@ -1097,9 +1125,16 @@ describe("KubernetesSandboxProvider", () => {
         await link(path.join(root, long), path.join(root, "linked.txt"));
         const exec = vi.fn(async (...args: Parameters<Exec["exec"]>) => {
           const argv = args[3] as string[];
+          const script = argv[argv.indexOf("bash") + 2];
           queueMicrotask(() => {
-            if (argv.includes("find")) args[4]?.write(`${long}\0linked.txt\0`);
-            else if (args[6]) {
+            if (script?.includes(" workspace-save ")) {
+              args[4]?.write(
+                execFileSync("bash", [
+                  "-c",
+                  script.replace(`cd ${shellQuote("/home/rakazo")}`, `cd ${shellQuote(root)}`),
+                ]),
+              );
+            } else if (args[6]) {
               args[6].resume();
             } else if (argv.includes("tar")) {
               const command = argv.slice(argv.indexOf("tar") + 1);
@@ -1126,11 +1161,7 @@ describe("KubernetesSandboxProvider", () => {
   );
   it.each(["caller", "deadline"])("bounds stalled desktop environment reads (%s)", async (mode) => {
     vi.useFakeTimers();
-    const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation((ms) => {
-      const controller = new AbortController();
-      setTimeout(() => controller.abort(new Error("request deadline")), ms);
-      return controller.signal;
-    });
+    const timeout = fakeRequestDeadline();
     try {
       const controller = new AbortController();
       const read = vi.fn<KubernetesSandboxSdk["core"]["readNamespacedPod"]>(
@@ -1139,6 +1170,7 @@ describe("KubernetesSandboxProvider", () => {
       const provider = providerFor({ readNamespacedPod: read });
       const result = provider.releaseScreen(computer, { ...context, signal: controller.signal });
       const assertion = expect(result).rejects.toThrow();
+      await vi.waitFor(() => expect(read).toHaveBeenCalledOnce());
       if (mode === "caller") controller.abort(new Error("caller cancelled"));
       else await vi.advanceTimersByTimeAsync(10_000);
       await assertion;
@@ -1146,6 +1178,78 @@ describe("KubernetesSandboxProvider", () => {
       const setSignal = vi.fn();
       await options?.middleware?.[0]?.pre({ setSignal } as never).toPromise();
       expect(setSignal).toHaveBeenCalledWith(expect.objectContaining({ aborted: true }));
+    } finally {
+      timeout.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("bounds stalled pod deletion without letting cancellation skip it", async () => {
+    vi.useFakeTimers();
+    const timeout = fakeRequestDeadline();
+    try {
+      const cancelled = AbortSignal.abort(new Error("run cancelled"));
+      const terminalPod = { ...readyPod, status: { phase: "Failed" } };
+      const operations = [
+        (provider: KubernetesSandboxProvider) =>
+          provider.stop(computer, { ...context, signal: cancelled }),
+        (provider: KubernetesSandboxProvider) =>
+          provider.destroy(computer, { ...context, signal: cancelled }),
+        (provider: KubernetesSandboxProvider) =>
+          provider.provision({ botId: "bot-a", homePath: "/unused", providerRef: "pod" }, context),
+      ];
+      for (const operation of operations) {
+        const del = vi.fn<KubernetesSandboxSdk["core"]["deleteNamespacedPod"]>(
+          () => new Promise<V1Pod>(() => {}),
+        );
+        const provider = providerFor({
+          readNamespacedPod: vi.fn().mockResolvedValue(terminalPod),
+          deleteNamespacedPod: del,
+        });
+        let outcome: unknown = "pending";
+        operation(provider).catch((error) => {
+          outcome = error;
+        });
+        await vi.waitFor(() => expect(del).toHaveBeenCalledOnce());
+        expect(outcome).toBe("pending");
+        await vi.advanceTimersByTimeAsync(10_000);
+        expect(outcome).toEqual(new Error("request deadline"));
+        const setSignal = vi.fn();
+        await del.mock.calls[0]?.[1]?.middleware?.[0]?.pre({ setSignal } as never).toPromise();
+        expect(setSignal).toHaveBeenCalledWith(expect.objectContaining({ aborted: true }));
+      }
+    } finally {
+      timeout.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("returns the original start error after cleanup outlasts a cancelled caller", async () => {
+    vi.useFakeTimers();
+    const timeout = fakeRequestDeadline();
+    try {
+      const controller = new AbortController();
+      const read = vi
+        .fn()
+        .mockRejectedValueOnce(Object.assign(new Error("missing"), { code: 404 }))
+        .mockReturnValue(new Promise<V1Pod>(() => {}));
+      const del = vi.fn(() => new Promise<V1Pod>(() => {}));
+      const provider = providerFor({ readNamespacedPod: read, deleteNamespacedPod: del });
+      let outcome: unknown = "pending";
+      provider
+        .provision(
+          { botId: "bot-a", homePath: "/unused" },
+          { ...context, signal: controller.signal },
+        )
+        .catch((error) => {
+          outcome = error;
+        });
+      await vi.waitFor(() => expect(read).toHaveBeenCalledTimes(2));
+      controller.abort(new Error("caller cancelled"));
+      await vi.waitFor(() => expect(del).toHaveBeenCalledOnce());
+      expect(outcome).toBe("pending");
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(outcome).toEqual(new Error("caller cancelled"));
     } finally {
       timeout.mockRestore();
       vi.useRealTimers();

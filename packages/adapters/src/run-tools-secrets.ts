@@ -1,7 +1,7 @@
 import { runContinueJob } from "@rakazo/adapter-kit";
 import { BotSecretName, botSecretSubmissionSchema } from "@rakazo/contracts";
 import { createStreamingRedactor, displayName } from "@rakazo/core";
-import { runSecretKind } from "@rakazo/db";
+import { runCodeKind, runLoginKind, runSecretKind, spaceIsShared } from "@rakazo/db";
 import { getLogger } from "@rakazo/logging";
 import {
   completeExternalEffect,
@@ -13,12 +13,18 @@ import {
 import {
   allowPrivateHttpSecretOrigins,
   botSecretToolView,
+  canReplaceLoginSite,
   findBotSecret,
   findCommandVariableConflict,
+  findRunLogin,
+  findSiteLogin,
   forgetBotSecret,
   generateBotSecret,
   listBotSecrets,
   normalizeSecretDestination,
+  oneTimeCodeRedactions,
+  readRunCode,
+  requestedLoginFields,
   requestWithBotSecret,
   resolveRequestSecretDestination,
   sameSecretDestination,
@@ -40,17 +46,35 @@ import type { ToolHandlers } from "./run-tool-gate.js";
 export const secretTools: ToolHandlers = {
   async list_secrets(ctx) {
     const { deps, run } = ctx;
-    return listBotSecrets(deps.prisma, run);
+    return listBotSecrets(deps.prisma, deps.secretStore, run);
   },
   async forget_secret(ctx, call) {
     const { deps, run } = ctx;
     const { args } = call;
     const parsed = BotSecretName.safeParse(args.name);
     if (!parsed.success) return call.finish({ error: "A valid credential name is required." });
+    // This run's unsaved login comes before a saved one of the name, as it does for fills.
+    const forgotten = await deps.prisma.secret.deleteMany({
+      where: { userId: run.userId, spaceId: run.spaceId, kind: runLoginKind(run.id, parsed.data) },
+    });
+    if (forgotten.count > 0) return call.finish({ removed: true });
     return call.finish(await forgetBotSecret(deps.prisma, run, parsed.data));
   },
   async generate_secret(ctx, call) {
     const { deps, run } = ctx;
+    // Fills would type this run's unsaved login instead of the generated one.
+    const held = await deps.prisma.secret.count({
+      where: {
+        userId: run.userId,
+        spaceId: run.spaceId,
+        kind: runLoginKind(run.id, String(call.args.name ?? "")),
+      },
+    });
+    if (held > 0) {
+      return call.finish({
+        error: "This run holds a login under this name that wasn't saved. Use another name.",
+      });
+    }
     const { result, redactions } = await generateBotSecret({
       prisma: deps.prisma,
       secretStore: deps.secretStore,
@@ -86,12 +110,34 @@ export const secretTools: ToolHandlers = {
     if (resolvedSecret.error) return call.finish({ error: resolvedSecret.error });
     const destination = resolvedSecret.destination;
     const connectionId = resolvedSecret.connectionId;
+    const codeOrigin = resolvedSecret.oneTimeCodeOrigin;
+    const loginFields =
+      destination?.auth.type === "login" ? requestedLoginFields(args.fields) : undefined;
+    if (loginFields?.error) return call.finish({ error: loginFields.error });
+    // A saved login whose site was wrong is replaced only from a card answered for this site.
+    let replaces: { id: string; origin: string } | undefined;
     if (destination) {
-      const existing = await findBotSecret(deps.prisma, run, destination.name);
+      const saved = await findBotSecret(deps.prisma, run, destination.name);
+      const existing = saved?.destination;
+      // A login the person chose not to save stays with this run; the bot is told so it doesn't
+      // say it was saved. Field labels only, never values.
+      const runLogin =
+        destination.auth.type === "login"
+          ? await findRunLogin(deps.prisma, deps.secretStore, run, runId, destination.name)
+          : undefined;
+      const held = runLogin?.origin === destination.origin ? runLogin : undefined;
       if (existing && !sameSecretDestination(existing, destination)) {
-        return call.finish({
-          error: "Remove the existing credential before changing its destination.",
-        });
+        if (!canReplaceLoginSite(existing, destination)) {
+          return call.finish({
+            error: "Remove the existing credential before changing its destination.",
+          });
+        }
+        if (args.replace !== true && !held) {
+          return call.finish({
+            error: `A login named ${existing.name} is saved for ${existing.origin}. For a different site or account, use another name; ask again with replace true only if ${existing.origin} was the wrong site for this same account, which replaces the saved login.`,
+          });
+        }
+        if (saved) replaces = { id: saved.id, origin: existing.origin };
       }
       const conflict = await findCommandVariableConflict(deps.prisma, run, destination);
       if (conflict) {
@@ -99,6 +145,15 @@ export const secretTools: ToolHandlers = {
           error: `Invalid credential destination — name: ${conflict} is already exported as the same variable. Choose another name.`,
         });
       }
+      const known = held
+        ? {
+            saved: false,
+            ...destination,
+            fields: held.fields.map(({ label, hidden }) => ({ label, hidden })),
+          }
+        : existing && sameSecretDestination(existing, destination)
+          ? { saved: true, ...botSecretToolView(existing) }
+          : undefined;
       const submitted = botSecretSubmissionSchema({
         allowPrivateHttpOrigin: allowPrivateHttpSecretOrigins(),
       }).safeParse(applied?.effect.result).data;
@@ -106,15 +161,15 @@ export const secretTools: ToolHandlers = {
         submitted &&
         sameSecretDestination(normalizeSecretDestination(submitted.credentialSaved), destination)
       ) {
-        return call.finish(
-          existing
-            ? { saved: true, ...botSecretToolView(existing) }
-            : { error: "The saved credential is no longer available." },
-        );
+        return call.finish(known ?? { error: "The saved credential is no longer available." });
       }
-      if (existing && args.replace !== true) {
-        return call.finish({ saved: true, ...botSecretToolView(existing) });
-      }
+      if (known && args.replace !== true) return call.finish(known);
+      // A login saved for this exact site under another name is the one to fill.
+      const siteLogin =
+        !known && destination.auth.type === "login" && args.replace !== true
+          ? await findSiteLogin(deps.prisma, run, destination.origin)
+          : null;
+      if (siteLogin) return call.finish({ saved: true, ...botSecretToolView(siteLogin) });
       // Action approval authorizes showing the card; it is not a credential submission.
       // Return the claim to intended so the answer transaction can approve the saved value.
       if (call.claimedEffect) {
@@ -126,17 +181,32 @@ export const secretTools: ToolHandlers = {
         call.claimedEffect = false;
       }
     }
-    const secretKind = runSecretKind(runId);
-    const storedSecret = await deps.prisma.secret.findFirst({
+    const secretKind = codeOrigin ? runCodeKind(runId) : runSecretKind(runId);
+    let storedSecret = await deps.prisma.secret.findFirst({
       where: {
         spaceId: run.spaceId,
         userId: run.userId,
         kind: secretKind,
       },
     });
+    // A card not yet answered means a code left from an earlier one is stale, and one that cannot
+    // be read is no code: ask again.
+    const heldCode =
+      storedSecret && codeOrigin ? await readRunCode(deps.secretStore, storedSecret) : undefined;
+    if (storedSecret && codeOrigin && (!heldCode || applied?.effect.status === "intended")) {
+      await deps.prisma.secret.deleteMany({ where: { id: storedSecret.id } });
+      if (!heldCode && applied?.effect.status !== "intended") {
+        return call.finish({
+          error: "The code could not be read. Ask for it again with request_secret oneTimeCode.",
+        });
+      }
+      storedSecret = null;
+    }
     if (storedSecret) {
-      const plaintext = await deps.secretStore.load(storedSecret.ciphertext, storedSecret.id);
-      ctx.secrets.push(plaintext);
+      const plaintext = heldCode
+        ? heldCode.code
+        : await deps.secretStore.load(storedSecret.ciphertext, storedSecret.id);
+      ctx.secrets.push(...(heldCode ? oneTimeCodeRedactions(plaintext) : [plaintext]));
       // Keep the tail the old redactor still holds; a fresh instance drops it.
       reply.pendingProgress += reply.redactor.finish();
       reply.redactor = createStreamingRedactor(ctx.secrets);
@@ -157,6 +227,14 @@ export const secretTools: ToolHandlers = {
           const early = await call.claimOrReturn("approved");
           if (early !== undefined) return early;
         }
+      }
+      // The code waits for browser_act fill_code, which deletes it once the page took it.
+      if (codeOrigin) {
+        return call.finish({
+          ok: true,
+          submitted: true,
+          note: "The user entered the code. Type it with browser_act fill_code {ref}; you never see it.",
+        });
       }
       // Claim executing (above), take the secret, then connector complete().
       // Retries without a secret reconcile via connectionReady / settle_attempt.
@@ -256,6 +334,10 @@ export const secretTools: ToolHandlers = {
       }
       return settleUncertainEffect(deps.prisma, recordedForAsk.effect.id, "request_secret");
     }
+    // A code card names the site itself, so a label cannot pose as another one.
+    const askText = codeOrigin
+      ? `Code for ${new URL(codeOrigin).host}`
+      : String(args.label ?? "Code");
     if (!(await renewRunLease(deps, runId, ctx.workerId, ctx.fence))) {
       return pauseForSecret(ctx);
     }
@@ -273,10 +355,20 @@ export const secretTools: ToolHandlers = {
       blocks: [
         {
           kind: "ask",
-          text: String(args.label ?? "Code"),
+          text: askText,
+          // The site is the server's words in the title; the bot's own label is plain detail.
+          ...(codeOrigin && args.label ? { detail: String(args.label).slice(0, 200) } : {}),
           input: "secret",
           ...(destination ? { credential: destination } : {}),
-          purpose: normalizeSecretAskPurpose(args.purpose ? String(args.purpose) : undefined),
+          ...(codeOrigin ? { oneTimeCode: { origin: codeOrigin } } : {}),
+          ...(replaces ? { replaces } : {}),
+          ...(loginFields?.labels ? { loginFields: loginFields.labels } : {}),
+          ...(loginFields && (await spaceIsShared(deps.prisma, run.spaceId))
+            ? { sharedBrowser: true as const }
+            : {}),
+          purpose: codeOrigin
+            ? "otp"
+            : normalizeSecretAskPurpose(args.purpose ? String(args.purpose) : undefined),
           status: "pending",
         },
       ],
@@ -291,11 +383,7 @@ export const secretTools: ToolHandlers = {
     }
     await notifyRun(deps, run, {
       kind: "help",
-      ...secretAskNotification(
-        displayName(bot.name, "Bot"),
-        String(args.label ?? "Code"),
-        ctx.secrets,
-      ),
+      ...secretAskNotification(displayName(bot.name, "Bot"), askText, ctx.secrets),
       botId: bot.id,
       threadId: thread.id,
     });

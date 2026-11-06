@@ -1,5 +1,5 @@
 import { BillingCheckoutCompletedError, BillingCustomerNotFoundError } from "@rakazo/adapter-kit";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   encodeStripeForm,
   mapStripeSubscriptionStatus,
@@ -269,6 +269,32 @@ describe("Stripe billing HTTP boundary", () => {
       expect(mapStripeSubscriptionStatus(status)).toBe("canceled");
   });
 
+  it("reads the subscription's card fingerprint and credits the customer balance", async () => {
+    const { wire, provider } = setup();
+    const { customerId } = await provider.createCustomer(owner);
+    await provider.createCheckout({ customerId, seats: 1, trialDays: 7, ...urls });
+    wire.completeCheckout(customerId, undefined, "fp_card_1");
+    await expect(provider.getCustomerSubscription(customerId)).resolves.toMatchObject({
+      status: "trialing",
+      cardFingerprint: "fp_card_1",
+    });
+    await provider.grantBalanceCredit(customerId, 1000, "referral_1");
+    await provider.grantBalanceCredit(customerId, 1000, "referral_1");
+    expect(wire.balances.get(customerId)).toBe(-1000);
+    // A credit Stripe made whose response was lost, retried after the idempotency key expired.
+    wire.balanceTransactions.push({
+      id: "cbtxn_lost",
+      customer: customerId,
+      amount: -1000,
+      metadata: { rakazo_reference: "referral_2" },
+    });
+    await provider.grantBalanceCredit(customerId, 1000, "referral_2");
+    expect(wire.balances.get(customerId)).toBe(-1000);
+    await expect(provider.grantBalanceCredit(customerId, 0, "referral_3")).rejects.toThrow(
+      /Invalid/,
+    );
+  });
+
   it("treats a scheduled cancellation as cancel at period end", async () => {
     const { wire, provider } = setup();
     const { customerId } = await provider.createCustomer(owner);
@@ -280,6 +306,26 @@ describe("Stripe billing HTTP boundary", () => {
       status: "unpaid",
       cancelAtPeriodEnd: true,
     });
+  });
+
+  it("reads the cancellation survey answer", async () => {
+    const { wire, provider } = setup();
+    const { customerId } = await provider.createCustomer(owner);
+    await provider.createCheckout({ customerId, seats: 1, ...urls });
+    wire.completeCheckout(customerId);
+    wire.subscriptions[0]!.cancel_at_period_end = true;
+    wire.subscriptions[0]!.cancellation_details = {
+      feedback: "too_expensive",
+      comment: " Pricey ",
+    };
+    expect(await provider.getCustomerSubscription(customerId)).toMatchObject({
+      cancellationReason: "too_expensive",
+      cancellationComment: "Pricey",
+    });
+    wire.subscriptions[0]!.cancellation_details = { feedback: "a_new_reason", comment: "  " };
+    const snapshot = await provider.getCustomerSubscription(customerId);
+    expect(snapshot?.cancellationReason).toBe("other");
+    expect(snapshot).not.toHaveProperty("cancellationComment");
   });
 
   it("classifies a deleted customer without wedging", async () => {
@@ -419,6 +465,21 @@ describe("Stripe billing HTTP boundary", () => {
     );
     expect(error.message).toBe("Stripe request failed (400): Bad key [redacted] rejected");
     expect(error.message).not.toContain(wire.secretKey);
+  });
+
+  it("does not read an oversized Stripe response", async () => {
+    let cancel: unknown;
+    const { provider } = setup((wire) => async (input, init) => {
+      const response = await wire.fetch(input, init);
+      const oversized = new Response(response.body, {
+        status: response.status,
+        headers: { "content-length": String(1024 * 1024 * 1024) },
+      });
+      cancel = vi.spyOn(oversized.body!, "cancel");
+      return oversized;
+    });
+    await expect(provider.getPrice()).rejects.toThrow("Invalid Stripe response");
+    expect(cancel).toHaveBeenCalledOnce();
   });
 
   it("re-syncs the customer when Stripe reports it deleted", () => {

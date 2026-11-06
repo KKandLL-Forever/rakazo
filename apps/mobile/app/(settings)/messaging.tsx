@@ -21,8 +21,6 @@ import { useI18n } from "../../lib/i18n";
 import { native, useThemedStyles } from "../../lib/native";
 import { errorText } from "../../lib/user-error";
 
-// MenuView choice keys; provider ids never contain a colon.
-
 export default function MessagingSettings() {
   const { t } = useI18n();
   const router = useRouter();
@@ -40,6 +38,7 @@ export default function MessagingSettings() {
   const [link, setLink] = useState<{
     code: string;
     expiresAt: string;
+    shared?: boolean;
     botId: string;
     provider: string;
     knownIdentityBots: Record<string, string>;
@@ -378,6 +377,11 @@ export default function MessagingSettings() {
                 code: link.code,
                 app: messagingProviderName(link.provider),
               })}
+          {link.shared
+            ? `\n${t("Everyone in this bot's space can read the chats it gets from {app}.", {
+                app: messagingProviderName(link.provider),
+              })}`
+            : ""}
         </Text>
       ) : null}
       <SettingsGroup label={t("Conversations")}>

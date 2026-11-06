@@ -3,8 +3,8 @@ import type { BillingStatus } from "@rakazo/contracts";
 import { Button, Skeleton } from "@rakazo/ui-web";
 import { useEffect, useState } from "react";
 import { ModelCreditsSettings } from "../components/ModelCredits";
-import { formatBillingDate, formatBillingPrice } from "../lib/billing";
-import { rpc } from "../lib/rpc";
+import { billingDateLabel, formatBillingPrice } from "../lib/billing";
+import { createSpaceRpc, selectedSpaceId } from "../lib/rpc";
 
 export function BillingSettingsPanel() {
   const { t, i18n } = useLingui();
@@ -12,10 +12,13 @@ export function BillingSettingsPanel() {
   const [status, setStatus] = useState<BillingStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
+  // Another tab can select another organization while this panel shows this one's
+  // prices, so every billing request stays on the space the panel opened for.
+  const [client] = useState(() => createSpaceRpc(selectedSpaceId()));
 
   useEffect(() => {
     let active = true;
-    rpc.billing
+    client.billing
       .status()
       .then((next) => {
         if (active) setStatus(next);
@@ -33,7 +36,7 @@ export function BillingSettingsPanel() {
     setPending(true);
     setError(null);
     try {
-      const { url } = await rpc.billing.portal();
+      const { url } = await client.billing.portal();
       window.location.assign(url);
     } catch {
       setError(t`Could not open billing`);
@@ -55,15 +58,7 @@ export function BillingSettingsPanel() {
             : t`Inactive`
     : null;
 
-  const date = status ? billingDate(status) : null;
-  const day = date ? formatBillingDate(date.at, locale) : "";
-  const dateLabel = date
-    ? date.kind === "trial"
-      ? t`Trial ends ${day}`
-      : date.kind === "ends"
-        ? t`Ends ${day}`
-        : t`Renews ${day}`
-    : null;
+  const dateLabel = status ? billingDateLabel(status, locale) : null;
 
   const price = status?.price ? formatBillingPrice(status.price, locale) : null;
   const seats = status?.seats ?? 0;
@@ -72,7 +67,8 @@ export function BillingSettingsPanel() {
     return (
       <ModelCreditsSettings
         status={status}
-        refresh={async () => setStatus(await rpc.billing.status())}
+        refresh={async () => setStatus(await client.billing.status())}
+        client={client}
       />
     );
 
@@ -86,7 +82,7 @@ export function BillingSettingsPanel() {
             <Skeleton className="h-5 w-24" />
           )}
           {price ? (
-            <p className="mt-3 flex flex-wrap gap-x-2 text-[14px] text-foreground/75">
+            <p className="mt-3 flex flex-wrap gap-x-2 text-body text-foreground/75">
               <span>{price}</span>
               {seats > 1 ? (
                 <span className="text-muted-foreground">
@@ -96,7 +92,7 @@ export function BillingSettingsPanel() {
             </p>
           ) : null}
           {dateLabel ? (
-            <p className="mt-2 text-[12.5px] text-muted-foreground/80">{dateLabel}</p>
+            <p className="mt-2 text-body-sm text-muted-foreground/80">{dateLabel}</p>
           ) : null}
         </div>
         {status?.canManage && status.hasCustomer ? (
@@ -111,26 +107,10 @@ export function BillingSettingsPanel() {
         ) : null}
       </div>
       {error ? (
-        <p role="alert" className="mt-3 text-sm text-destructive">
+        <p role="alert" className="mt-3 text-body text-destructive">
           {error}
         </p>
       ) : null}
     </div>
   );
-}
-
-function billingDate(
-  status: BillingStatus,
-): { kind: "trial" | "ends" | "renews"; at: string } | null {
-  if (status.state === "trialing" && status.trialEndsAt) {
-    return { kind: "trial", at: status.trialEndsAt };
-  }
-  // Unpaid and paused subscriptions do not renew until the owner resumes them.
-  if (!status.currentPeriodEndsAt || status.state === "unpaid" || status.state === "paused") {
-    return null;
-  }
-  if (status.cancelAtPeriodEnd || status.state === "canceled") {
-    return { kind: "ends", at: status.currentPeriodEndsAt };
-  }
-  return { kind: "renews", at: status.currentPeriodEndsAt };
 }

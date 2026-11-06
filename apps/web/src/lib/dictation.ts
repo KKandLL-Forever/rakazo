@@ -1,4 +1,13 @@
-import { cancelResponseBody, readJsonObjectWithin, speechLocaleTag, withAbort } from "@rakazo/core";
+import { t } from "@lingui/core/macro";
+import {
+  cancelResponseBody,
+  readJsonObjectWithin,
+  recognitionLocaleTag,
+  speechLocaleTag,
+  withAbort,
+} from "@rakazo/core";
+import { desktopBridge } from "./desktop.js";
+import { DesktopSpeechRecognition } from "./desktop-speech.js";
 import { getActiveUiLocale } from "./i18n.js";
 import { selectedSpaceId, withSpaceHeaders } from "./rpc.js";
 import { errorText, voiceAccountErrorText } from "./user-error.js";
@@ -36,13 +45,11 @@ const ENDPOINT_TICK_MS = 80;
 const SILENCE_RMS = 0.035;
 export const TRANSCRIPTION_RESPONSE_TIMEOUT_MS = 70_000;
 export const MAX_TRANSCRIPTION_RESPONSE_BYTES = 64 * 1024;
-const ENDPOINT_UNSUPPORTED =
-  "This browser can't detect when you stop talking. Use Chrome, the desktop app, or hold-to-talk in the composer.";
 /** Web Speech codes that mean the cloud recognizer cannot be used. */
 const WEB_SPEECH_SERVICE_ERRORS = new Set(["network", "service-not-allowed"]);
 
 export function webSpeechAvailable(): boolean {
-  return Boolean(speechRecognitionCtor()) && !electronSpeechHost();
+  return Boolean(speechRecognitionCtor());
 }
 
 /**
@@ -92,21 +99,10 @@ const RESTART_SHORT_SESSION_MS = 400;
 const RESTART_BACKOFF_AFTER = 2;
 const RESTART_BACKOFF_MS = 900;
 const RESTART_GIVE_UP_AFTER = 4;
-const RESTART_GIVE_UP_ERROR =
-  "The browser keeps dropping the microphone. Start dictation again to retry.";
 
-/**
- * The language the recognizer listens in: the app's own language when the UI is
- * in another one, and the browser's otherwise.
- *
- * English is also the app's fallback for a browser language it ships no catalog
- * for, so an Italian browser would lose its Italian recognition by following the
- * app. The browser's language stays in that case.
- */
+/** English UI follows the browser; other UI languages keep matching regional variants. */
 export function recognitionLanguage(): string {
-  const browser = navigator.language || "en-US";
-  const tag = speechLocaleTag(getActiveUiLocale());
-  return tag && tag !== "en-US" ? tag : browser;
+  return recognitionLocaleTag(getActiveUiLocale(), navigator.language);
 }
 
 /**
@@ -154,6 +150,9 @@ export function combineTranscript(prefix: string, speechText: string): string {
 
 function speechRecognitionCtor(): SpeechRecognitionCtor | undefined {
   if (typeof window === "undefined") return undefined;
+  // The desktop app listens through the operating system's recognizer instead.
+  if (desktopBridge()?.speech) return DesktopSpeechRecognition;
+  if (electronSpeechHost()) return undefined;
   const host = window as Window & {
     SpeechRecognition?: SpeechRecognitionCtor;
     webkitSpeechRecognition?: SpeechRecognitionCtor;
@@ -181,6 +180,8 @@ export class Dictation {
   private audioContext: AudioContext | null = null;
   private vadTimer: ReturnType<typeof setInterval> | undefined;
   private onFinal: ((text: string) => void) | null = null;
+  /** Mode of the running session: an endpoint turn reports back even without words. */
+  private mode: DictationMode | null = null;
 
   subscribe(fn: (s: DictationSnapshot) => void): () => void {
     this.watchers.add(fn);
@@ -232,6 +233,7 @@ export class Dictation {
     }
     this.chunks = [];
     this.onFinal = null;
+    this.mode = null;
     if (this.snapshot.status !== "idle" || this.snapshot.error) this.set(IDLE);
   }
 
@@ -245,11 +247,16 @@ export class Dictation {
     const mine = this.token;
     const spaceId = selectedSpaceId();
     this.onFinal = opts.onFinal;
+    this.mode = opts.mode;
     this.set({ status: "listening", transcript: "" });
     const transcribe = Boolean(opts.transcribe);
+    // Desktop system speech is a fallback for an unconfigured transcription provider.
     // An unknown capability is not a refusal: a device whose browser cannot hold the
     // microphone open goes to the server even before the voice status has loaded.
-    if (prefersServerDictation() && opts.transcribe !== false) {
+    if (
+      (prefersServerDictation() && opts.transcribe !== false) ||
+      (desktopBridge()?.speech && transcribe)
+    ) {
       await this.listenRecorder(mine, opts.mode, opts.endpointMs ?? ENDPOINT_SILENCE_MS, spaceId);
       return;
     }
@@ -269,8 +276,7 @@ export class Dictation {
     }
     this.set({
       ...IDLE,
-      error:
-        "This browser has no on-device dictation. Connect a voice provider with transcription, or use Chrome / the desktop app.",
+      error: t`This browser has no on-device dictation. Connect a voice provider with transcription, or use Chrome / the desktop app.`,
     });
   }
 
@@ -327,9 +333,16 @@ export class Dictation {
         return;
       }
       live = false;
+      const code = event.error;
       this.set({
         ...IDLE,
-        error: event.error ? `Dictation failed: ${event.error}` : "Dictation failed.",
+        error:
+          // macOS asks only once; after a refusal, only System Settings can allow it again.
+          code === "not-allowed" && desktopBridge()?.speech
+            ? t`Allow Rakazo to use Speech Recognition and the microphone in System Settings.`
+            : code
+              ? t`Dictation failed: ${code}`
+              : t`Dictation failed.`,
       });
     };
     rec.onend = () => {
@@ -355,7 +368,11 @@ export class Dictation {
           return;
         }
         this.releaseRecognition(rec);
-        this.failListening(mine, RESTART_GIVE_UP_ERROR, true);
+        this.failListening(
+          mine,
+          t`The browser keeps dropping the microphone. Start dictation again to retry.`,
+          true,
+        );
         return;
       }
       const restart = () => {
@@ -365,7 +382,7 @@ export class Dictation {
           sessionHeardSpeech = false;
           rec.start();
         } catch {
-          this.set({ ...IDLE, error: "Dictation ended unexpectedly." });
+          this.set({ ...IDLE, error: t`Dictation ended unexpectedly.` });
         }
       };
       if (shortSessions >= RESTART_BACKOFF_AFTER) {
@@ -387,7 +404,7 @@ export class Dictation {
       }
       live = false;
       this.releaseRecognition(rec);
-      this.set({ ...IDLE, error: "Dictation failed." });
+      this.set({ ...IDLE, error: t`Dictation failed.` });
     }
   }
 
@@ -431,7 +448,7 @@ export class Dictation {
         audio: { echoCancellation: true, noiseSuppression: true },
       });
     } catch (error) {
-      this.failListening(mine, errorText(error, "Microphone failed"));
+      this.failListening(mine, errorText(error, t`Microphone failed`));
       return;
     }
     if (this.token !== mine) {
@@ -441,7 +458,10 @@ export class Dictation {
     const keptSpeech = this.snapshot.transcript.trim().length > 0;
     if (mode === "endpoint" && !this.armSilence(stream, mine, endpointMs, keptSpeech)) {
       for (const track of stream.getTracks()) track.stop();
-      this.failListening(mine, ENDPOINT_UNSUPPORTED);
+      this.failListening(
+        mine,
+        t`This browser can't detect when you stop talking. Use Chrome, the desktop app, or hold-to-talk in the composer.`,
+      );
       return;
     }
     let media: MediaRecorder | undefined;
@@ -469,7 +489,7 @@ export class Dictation {
       if (this.media === media) this.media = null;
       if (this.token !== mine) return;
       this.stopVad();
-      this.failListening(mine, errorText(error, "Dictation failed."));
+      this.failListening(mine, errorText(error, t`Dictation failed.`));
     }
   }
 
@@ -537,19 +557,16 @@ export class Dictation {
     const blob = new Blob(this.chunks, { type: this.chunks[0]?.type || "audio/webm" });
     this.chunks = [];
     if (!blob.size) {
-      const prefix = normalizedTranscript(this.snapshot.transcript);
-      if (!prefix) {
-        this.set(IDLE);
-        return;
-      }
-      this.finish(prefix, mine);
+      this.finish(normalizedTranscript(this.snapshot.transcript), mine);
       return;
     }
     this.set({ status: "transcribing", transcript: this.snapshot.transcript });
     const abort = new AbortController();
     this.transcribeAbort = abort;
+    const timedOutMessage = t`Transcription request timed out.`;
+    const couldNotTranscribe = t`Could not transcribe that recording.`;
     const timer = setTimeout(
-      () => abort.abort(new Error("Transcription request timed out.")),
+      () => abort.abort(new Error(timedOutMessage)),
       TRANSCRIPTION_RESPONSE_TIMEOUT_MS,
     );
     try {
@@ -576,10 +593,7 @@ export class Dictation {
       const body = await readTranscriptionBody(res, abort.signal);
       if (this.token !== mine) return;
       if (!res.ok) {
-        this.failListening(
-          mine,
-          voiceAccountErrorText(body) ?? body.error ?? "Could not transcribe that recording.",
-        );
+        this.failListening(mine, voiceAccountErrorText(body) ?? body.error ?? couldNotTranscribe);
         return;
       }
       // The recorder captures fresh audio, so matching words are intentional repetitions.
@@ -594,15 +608,11 @@ export class Dictation {
       // means the deadline timer fired. Browsers may reject fetch as AbortError
       // instead of signal.reason; surface the timeout either way.
       if (this.token !== mine) return;
-      const timedOut =
-        (abort.signal.reason instanceof Error &&
-          abort.signal.reason.message === "Transcription request timed out.") ||
-        (error instanceof Error && error.message === "Transcription request timed out.");
-      if (timedOut || (error instanceof Error && error.name === "AbortError")) {
-        this.failListening(mine, "Transcription request timed out.");
+      if (abort.signal.aborted || (error instanceof Error && error.name === "AbortError")) {
+        this.failListening(mine, timedOutMessage);
         return;
       }
-      this.failListening(mine, errorText(error, "Could not transcribe that recording."));
+      this.failListening(mine, errorText(error, couldNotTranscribe));
     } finally {
       clearTimeout(timer);
       if (this.transcribeAbort === abort) this.transcribeAbort = null;
@@ -631,9 +641,14 @@ export class Dictation {
     if (this.token !== mine) return;
     const trimmed = text.trim();
     const onFinal = this.onFinal;
+    const mode = this.mode;
     this.stop("submit");
     if (error) this.set({ ...IDLE, error });
     if (trimmed) onFinal?.(trimmed);
+    // An endpoint session ends with the attempt, words or not. Report the empty turn
+    // too, so a caller holding the microphone open starts the next attempt; hold mode
+    // watches for idle itself.
+    else if (mode === "endpoint") onFinal?.("");
   }
 }
 
@@ -648,7 +663,7 @@ async function blobToBase64(blob: Blob): Promise<string> {
 function readTranscriptionBody(response: Response, signal: AbortSignal) {
   return readJsonObjectWithin<{ text?: string; error?: string; code?: string }>(response, {
     maxBytes: MAX_TRANSCRIPTION_RESPONSE_BYTES,
-    tooLargeMessage: "Transcription response is too large.",
+    tooLargeMessage: t`Transcription response is too large.`,
     signal,
   });
 }

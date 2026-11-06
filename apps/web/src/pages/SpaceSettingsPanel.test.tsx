@@ -45,6 +45,9 @@ vi.mock("@rakazo/ui-web", () => {
 vi.mock("./SpaceSettingOverrides", () => ({
   SpaceSettingOverrides: () => <div data-testid="space-setting-overrides" />,
 }));
+vi.mock("../components/SpaceMembersSettings", () => ({
+  SpaceMembersSettings: () => <div data-testid="space-members-settings" />,
+}));
 
 import { SpaceSettingsPanel } from "./SpaceSettingsPanel";
 
@@ -60,6 +63,7 @@ async function render(props: Partial<Props>) {
         space={{ id: "space-a", name: "Support", canRename: true, canDelete: true, botCount: 0 }}
         onRename={async () => undefined}
         onDelete={async () => undefined}
+        onLeft={() => undefined}
         onClose={() => undefined}
         {...props}
       />,
@@ -161,19 +165,33 @@ describe("SpaceSettingsPanel", () => {
     expect(onBusyChange).toHaveBeenLastCalledWith(false);
   });
 
-  it("does not save on the Enter that confirms an IME composition", async () => {
-    const onRename = vi.fn(async () => undefined);
-    await render({ onRename });
-    await type("Help desk");
-    const input = container.querySelector("input");
-    const blur = vi.spyOn(input as HTMLInputElement, "blur");
-    await act(async () => {
-      input?.dispatchEvent(
-        new KeyboardEvent("keydown", { key: "Enter", bubbles: true, isComposing: true }),
-      );
-    });
-    expect(blur).not.toHaveBeenCalled();
-  });
+  it.each([{ isComposing: true }, { keyCode: 229 }])(
+    "neither saves nor reverts on the Enter or Escape that ends an IME composition (%o)",
+    async (composition) => {
+      const onRename = vi.fn(async () => undefined);
+      await render({ onRename });
+      await type("Help desk");
+      const input = container.querySelector("input") as HTMLInputElement;
+      const blur = vi.spyOn(input, "blur");
+      const windowKeys: string[] = [];
+      const onWindowKey = (event: KeyboardEvent) => windowKeys.push(event.key);
+      window.addEventListener("keydown", onWindowKey);
+      for (const key of ["Enter", "Escape"]) {
+        await act(async () => {
+          input.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, ...composition }));
+        });
+      }
+      window.removeEventListener("keydown", onWindowKey);
+      expect(blur).not.toHaveBeenCalled();
+      expect(input.value).toBe("Help desk");
+      // The dialog's field keeps Escape from chat listeners behind it, as a plain Escape does.
+      expect(windowKeys).not.toContain("Escape");
+      await act(async () => {
+        input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+      });
+      expect(blur).toHaveBeenCalledOnce();
+    },
+  );
 
   it("falls back to the generic error when the failure message is blank", async () => {
     await render({

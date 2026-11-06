@@ -64,6 +64,36 @@ describe("optional Keenable web provider", () => {
     }
   });
 
+  it("reads the structured copy when the server repeats the text as JSON", async () => {
+    const data = {
+      query: "current question",
+      results: [
+        {
+          url: "https://example.test/page",
+          title: "Source",
+          description: "",
+          snippet: "Useful evidence",
+          published_at: "2026-07-28T00:00:00Z",
+        },
+      ],
+    };
+    const peer = keenableMcpFixture({
+      result: {
+        content: [{ type: "text", text: JSON.stringify(data) }],
+        structuredContent: data,
+        isError: false,
+      },
+    });
+    expect(
+      await webSearchFromTool(new KeenableWebProvider(peer.network), context, {
+        query: "current question",
+        maxResults: 1,
+      }),
+    ).toEqual({
+      results: [{ title: "Source", url: "https://example.test/page", snippet: "Useful evidence" }],
+    });
+  });
+
   it("maps page markdown and caps content at the requested size", async () => {
     const peer = keenableMcpFixture();
     expect(
@@ -74,7 +104,7 @@ describe("optional Keenable web provider", () => {
     ).toEqual({
       title: "Source",
       url: "https://example.test/page",
-      text: `${"Page text ".repeat(10)}\n\n[Content truncated]`,
+      text: `${"Page text ".repeat(10)}\n\n[Content truncated; continue with offset 100]`,
       truncated: true,
     });
     expect(peer.calls[0]).toEqual({
@@ -83,14 +113,64 @@ describe("optional Keenable web provider", () => {
     });
   });
 
+  it("refuses an offset past what Keenable can return", async () => {
+    const peer = keenableMcpFixture();
+    expect(
+      await webFetchFromTool(new KeenableWebProvider(peer.network), context, {
+        url: "https://example.test/page",
+        maxChars: 8_000,
+        offset: 100_000,
+      }),
+    ).toEqual({ error: "Keenable can read the first 100000 characters of a page." });
+    expect(peer.calls).toEqual([]);
+  });
+
+  it("returns the remainder when a window crosses Keenable's read limit", async () => {
+    const content = `head${"a".repeat(100_000)}`;
+    const peer = keenableMcpFixture({
+      result: textResult({ url: "https://example.test/page", title: "Source", content }),
+    });
+    expect(
+      await webFetchFromTool(new KeenableWebProvider(peer.network), context, {
+        url: "https://example.test/page",
+        maxChars: 8_000,
+        offset: 96_000,
+      }),
+    ).toEqual({
+      title: "Source",
+      url: "https://example.test/page",
+      text: `${content.slice(96_000, 100_000)}\n\n[Content truncated; stopped at the read limit]`,
+      truncated: true,
+    });
+    expect(peer.calls[0]?.arguments).toMatchObject({ max_chars: 100_001 });
+  });
+
+  it("asks for the text up to the requested window when reading on", async () => {
+    const peer = keenableMcpFixture();
+    const page = await webFetchFromTool(new KeenableWebProvider(peer.network), context, {
+      url: "https://example.test/page",
+      maxChars: 100,
+      offset: 50,
+    });
+    expect(page).toMatchObject({
+      text: `${"Page text ".repeat(10)}\n\n[Content truncated; continue with offset 150]`,
+      truncated: true,
+    });
+    expect(peer.calls[0]?.arguments).toMatchObject({ max_chars: 151 });
+  });
+
   it.each([
     ["x".repeat(100), "x".repeat(100), false],
     [
       `${"x".repeat(101)}\n\n..._This content has been truncated to stay below 101 characters_...`,
-      `${"x".repeat(100)}\n\n[Content truncated]`,
+      `${"x".repeat(100)}\n\n[Content truncated; continue with offset 100]`,
       true,
     ],
-    [`${" ".repeat(101)}body`, `${" ".repeat(100)}\n\n[Content truncated]`, true],
+    [
+      `${" ".repeat(101)}body`,
+      `${" ".repeat(100)}\n\n[Content truncated; continue with offset 100]`,
+      true,
+    ],
   ])(
     "keeps exact-length pages and drops provider truncation notes (%#)",
     async (content, text, truncated) => {

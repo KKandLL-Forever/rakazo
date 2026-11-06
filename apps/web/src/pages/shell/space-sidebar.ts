@@ -3,7 +3,6 @@ import { groupBotsForSidebar } from "@rakazo/core";
 type SidebarChat = {
   id: string;
   name: string;
-  title?: string | null;
   preview?: string | null;
   pinned: boolean;
   sectionId: string | null;
@@ -14,6 +13,7 @@ type SidebarSpace<TBot extends SidebarChat, TGroup extends SidebarChat> = {
   name: string;
   canRename?: boolean;
   canDelete?: boolean;
+  shared?: boolean;
   bots: readonly TBot[];
   groups: readonly TGroup[];
   botSections: readonly { id: string; name: string }[];
@@ -47,7 +47,7 @@ export function sidebarGroupsForSpaces<TBot extends SidebarChat, TGroup extends 
   const showSpaceNames = spaces.length > 1;
   return spaces.flatMap((space) => {
     const visibleBots = space.bots.filter((bot) =>
-      `${bot.name} ${bot.title ?? ""} ${bot.preview ?? ""}`.toLowerCase().includes(needle),
+      `${bot.name} ${bot.preview ?? ""}`.toLowerCase().includes(needle),
     );
     const visibleGroups = space.groups.filter((group) =>
       `${group.name} ${group.preview ?? ""}`.toLowerCase().includes(needle),
@@ -92,6 +92,7 @@ export function sidebarGroupsForSpaces<TBot extends SidebarChat, TGroup extends 
       title: showSpaceNames ? space.name : index === 0 && !group.title ? space.name : group.title,
       subtitle: showSpaceNames && group.title ? group.title : undefined,
       showLock: showSpaceNames,
+      shared: space.shared === true,
       emptySpaceId: undefined as string | undefined,
       spaceId: space.id,
       spaceName: space.name,
@@ -111,6 +112,7 @@ export function sidebarGroupsForSpaces<TBot extends SidebarChat, TGroup extends 
           bots: [] as (typeof sections)[number]["bots"],
           sectionId: section.id as string | null,
           showLock: showSpaceNames,
+          shared: space.shared === true,
           emptySpaceId: undefined as string | undefined,
           spaceId: space.id,
           spaceName: space.name,
@@ -129,6 +131,7 @@ export function sidebarGroupsForSpaces<TBot extends SidebarChat, TGroup extends 
         bots: [],
         sectionId: null,
         showLock: showSpaceNames,
+        shared: space.shared === true,
         emptySpaceId: showSpaceNames ? space.id : undefined,
         spaceId: space.id,
         spaceName: space.name,

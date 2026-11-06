@@ -14,14 +14,18 @@ import {
   createThreadMessageInTransaction,
   crossSpaceCommunicationAllowed,
   runAsSystem,
+  THREAD_LOCK_TRANSACTION_OPTIONS,
 } from "@rakazo/db";
 import { getLogger } from "@rakazo/logging";
 import { currentBotMessageHop } from "./bot-messages.js";
+import type { ExecutorDeps } from "./executor-deps.js";
+import { runLeaseFor } from "./run-messages.js";
 
 export interface AgentConnectionDeps {
   prisma: PrismaClient;
   events: Pick<ThreadEvents, "sendUserMessage" | "notify">;
   jobs: Pick<JobPublisher, "enqueue">;
+  runLease?: ExecutorDeps["runLease"];
 }
 
 type ConnectionRun = {
@@ -397,6 +401,7 @@ async function deliverToConnectedAgent(
         blocks: [outboundBlock],
         botId: run.botId,
         runId: run.id,
+        lease: runLeaseFor(deps, run.id),
       });
       const task = await tx.task.create({
         data: {
@@ -436,6 +441,7 @@ async function deliverToConnectedAgent(
         botId: run.botId,
         type: "thread.message.created",
         runId: run.id,
+        lease: runLeaseFor(deps, run.id),
         payload: { messageId: outbound.id, role: "bot", blocks: [outboundBlock] },
       });
       return {
@@ -443,7 +449,7 @@ async function deliverToConnectedAgent(
         targetEventSeq: inboundEvent.seq,
         senderEventSeq: outboundEvent.seq,
       };
-    });
+    }, THREAD_LOCK_TRANSACTION_OPTIONS);
   try {
     committed = await deliverTx();
   } catch (error) {

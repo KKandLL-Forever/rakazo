@@ -197,6 +197,17 @@ describe("built-in provider output limits", () => {
     ).toBe("oauth");
   });
 
+  it("keeps an output limit saved while the connection needs sign-in again", () => {
+    const previous = serializeModelSecret({
+      kind: "oauth",
+      reconnectRequired: true,
+      maxTokens: 4096,
+    });
+    expect(
+      parseModelSecret(connectAsOwner({ provider: "openai-codex", maxTokens: 8192 }, previous)),
+    ).toEqual({ kind: "oauth", reconnectRequired: true, maxTokens: 8192 });
+  });
+
   it("rejects a limit update when no credential exists", () => {
     expect(() => connectAsOwner({ provider: "anthropic", maxTokens: 8192 })).toThrow(/API key/);
   });
@@ -390,6 +401,7 @@ describe("modelCredentialDto", () => {
       modelId: "qwen3-4b",
       reasoning: false,
       thinkingLevels: ["off"],
+      visionModelIds: [],
     });
   });
 
@@ -549,6 +561,21 @@ describe("modelCredentialDto", () => {
     });
     expect(modelCredentialDto({ ...row, provider: "openai-codex" }, oauth).hasKey).toBe(false);
     expect(modelCredentialDto(row).hasKey).toBe(false);
+
+    const rejected = serializeModelSecret({
+      kind: "oauth",
+      reconnectRequired: true,
+      maxTokens: 4096,
+    });
+    const rejectedDto = modelCredentialDto({ ...row, provider: "openai-codex" }, rejected);
+    expect(rejectedDto).toMatchObject({
+      authKind: "oauth",
+      reconnectRequired: true,
+      maxTokens: 4096,
+      hasKey: false,
+    });
+    expect(JSON.stringify(rejectedDto)).not.toContain("access");
+    expect(JSON.stringify(rejectedDto)).not.toContain("refresh");
   });
 
   it("exposes defaultModel as modelId for provider credentials", () => {

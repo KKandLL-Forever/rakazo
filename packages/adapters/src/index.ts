@@ -2,8 +2,11 @@ export * from "./agent-connections.js";
 export * from "./agent-environment.js";
 export * from "./agent-import-settings.js";
 export * from "./ai-consent.js";
+export type { ApnsVoipConfig } from "./apns-voip.js";
+export { apnsVoipConfig, createApnsVoipProvider } from "./apns-voip-config.js";
 export * from "./artifact-store-factory.js";
 export * from "./artifacts.js";
+export * from "./audit-forwarding.js";
 export * from "./auto-review.js";
 export * from "./auto-review-factory.js";
 export * from "./aws-kms-key-provider.js";
@@ -13,21 +16,28 @@ export * from "./boat-sandbox.js";
 export * from "./bot-avatar.js";
 export * from "./bot-messages.js";
 export {
+  defaultVaultItemTitle,
   forgetBotSecret,
   getBotSecretMetadata,
+  isSecretAlreadySaved,
   listBotSecretMetadata,
+  listVaultItems,
+  newVaultItemName,
   normalizeSecretDestination,
   pageUrlOrigin,
+  relabelVaultItem,
   revealBotSecret,
   SPACE_VAULT_NOT_IN_USE,
   storeBotSecret,
 } from "./bot-secrets.js";
+export * from "./boxd-sandbox.js";
 export * from "./browser-emulator.js";
 export * from "./browser-provider-factory.js";
 export * from "./browser-tools.js";
 export * from "./builtin-skills.js";
+export * from "./builtin-tool-bridge.js";
 export * from "./builtin-tools.js";
-export { settleCallRequest } from "./call-request.js";
+export { loadUserIncomingCalls, settleCallRequest } from "./call-request.js";
 export * from "./cartesia-voice.js";
 export * from "./chat-sdk-surface.js";
 export * from "./child-bots.js";
@@ -43,13 +53,17 @@ export * from "./composio-connector.js";
 export * from "./composio-fake.js";
 export * from "./computer-browser.js";
 export * from "./computer-control.js";
+export * from "./computer-disk.js";
 export * from "./computer-idle.js";
 export * from "./computer-lifecycle.js";
+export * from "./computer-provider-descriptor.js";
+export * from "./computer-provider-registry.js";
 export * from "./computer-screens.js";
 export * from "./computer-support.js";
 export * from "./computer-tools.js";
 export * from "./computer-update.js";
 export * from "./computer-workspace.js";
+export * from "./configured-sandbox.js";
 export * from "./createos-sandbox.js";
 export * from "./current-time.js";
 export * from "./cursor-cloud-agent.js";
@@ -78,6 +92,7 @@ export * from "./home-object-store.js";
 export { HonchoMemoryProvider } from "./honcho-memory-provider.js";
 export * from "./host-aware-sandbox.js";
 export * from "./http-decisions.js";
+export * from "./incus-sandbox.js";
 export * from "./infisical-secret-store.js";
 export * from "./installed-connectors.js";
 export * from "./installed-messaging-surface.js";
@@ -88,6 +103,7 @@ export * from "./keenable-web.js";
 export * from "./key-provider-factory.js";
 export * from "./keyless-http-web.js";
 export * from "./kubernetes-sandbox.js";
+export * from "./macos-voice.js";
 export * from "./mcp-connector.js";
 export * from "./mcp-emulator.js";
 export * from "./mcp-oauth.js";
@@ -96,6 +112,12 @@ export * from "./mcp-server-tool.js";
 export * from "./mcp-transport.js";
 export * from "./media-generation-factory.js";
 export * from "./media-generation-provider.js";
+export * from "./media-video-poll.js";
+export {
+  AGENT_MEMORY_MAX_BYTES,
+  buildAgentMemoryPrompt,
+  readAgentMemory,
+} from "./memory-context.js";
 export * from "./memory-provider-factory.js";
 export * from "./messaging-composition.js";
 export * from "./messaging-context.js";
@@ -111,12 +133,17 @@ export * from "./model-roles.js";
 export * from "./model-selection.js";
 export * from "./model-vision.js";
 export * from "./none-sandbox.js";
+export * from "./novita-sandbox.js";
+export * from "./novita-template.js";
 export * from "./openai-compatible-url.js";
 export * from "./openai-compatible-voice.js";
 export * from "./openai-voice.js";
 export * from "./openrouter-usage.js";
 export * from "./page-browser-session.js";
+export * from "./page-share-secrets.js";
 export * from "./parallel-web.js";
+export * from "./payment-wallet-factory.js";
+export * from "./payment-wallets.js";
 export * from "./pi-catalog-availability.js";
 export * from "./pi-codex-catalog.js";
 export * from "./pi-credentials.js";
@@ -126,19 +153,27 @@ export * from "./pi-models.js";
 export * from "./pi-oauth.js";
 export * from "./pi-openai-compatible-provider.js";
 export * from "./pi-runtime.js";
+export { TOOL_RESULT_TEXT_LIMIT } from "./pi-runtime-limits.js";
+export { serializeToolResult } from "./pi-runtime-tools.js";
 export * from "./pi-session.js";
 export { shutdownPiTelemetry } from "./pi-telemetry.js";
 export * from "./pipedream-connector.js";
+export * from "./plugin-connectors.js";
+export * from "./plugin-marketplace.js";
 export * from "./product-analytics.js";
+export * from "./purchase-poll.js";
+export * from "./purchase-service.js";
 export * from "./push-token-store.js";
 export * from "./railway-sandbox.js";
 export * from "./realtime.js";
 export * from "./release-watch.js";
 export * from "./remote-mcp.js";
 export * from "./resend-email.js";
+export { finishRoutineHandover } from "./routine-handover.js";
 export * from "./routine-watch.js";
 export * from "./run-secret.js";
 export * from "./run-wakeup.js";
+export * from "./sandbox-allowance.js";
 export * from "./sandbox-errors.js";
 export * from "./sandbox-factory.js";
 export * from "./sandbox-provider-env.js";
@@ -158,6 +193,7 @@ export * from "./skill-tools.js";
 export * from "./slack-install-provider.js";
 export * from "./smtp-email.js";
 export * from "./storage-migration.js";
+export * from "./strategic-initiative.js";
 export * from "./stripe-billing.js";
 export { SupermemoryMemoryProvider } from "./supermemory-memory-provider.js";
 export * from "./task-catalog.js";
@@ -176,3 +212,4 @@ export * from "./web-limits.js";
 export * from "./web-provider-factory.js";
 export * from "./web-ssrf.js";
 export * from "./web-tools.js";
+export * from "./wrapped-env.js";

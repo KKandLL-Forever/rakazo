@@ -1,5 +1,8 @@
 import { useNavigation, useRouter } from "expo-router";
+import type { ReactNode } from "react";
 import { useLayoutEffect } from "react";
+import type { CreateAction } from "./create-chooser";
+import { createMenuItems } from "./create-chooser";
 import { useI18n } from "./i18n";
 
 /** Liquid Glass home header: account on the left; activity, search and create on the right. */
@@ -11,6 +14,7 @@ export function useHomeHeader({
   activityMode,
   toggleActivityMode,
   runCreateAction,
+  headerTitle,
 }: {
   nativeHeader: boolean;
   ready: boolean;
@@ -18,7 +22,8 @@ export function useHomeHeader({
   initials: string;
   activityMode: boolean;
   toggleActivityMode: () => void;
-  runCreateAction: (action: "bot" | "group" | "space") => void;
+  runCreateAction: (action: CreateAction) => void;
+  headerTitle?: () => ReactNode;
 }) {
   const navigation = useNavigation();
   const router = useRouter();
@@ -31,6 +36,7 @@ export function useHomeHeader({
       headerTransparent: true,
       headerStyle: { backgroundColor: "transparent" },
       title: "",
+      headerTitle,
       unstable_headerLeftItems: () => [
         {
           type: "button" as const,
@@ -63,26 +69,12 @@ export function useHomeHeader({
           accessibilityLabel: t("Create"),
           icon: { type: "sfSymbol" as const, name: "plus" },
           menu: {
-            items: [
-              {
-                type: "action" as const,
-                label: t("New bot"),
-                icon: { type: "sfSymbol" as const, name: "person.crop.circle.badge.plus" },
-                onPress: () => runCreateAction("bot"),
-              },
-              {
-                type: "action" as const,
-                label: t("New group chat"),
-                icon: { type: "sfSymbol" as const, name: "person.2" },
-                onPress: () => runCreateAction("group"),
-              },
-              {
-                type: "action" as const,
-                label: t("New private space"),
-                icon: { type: "sfSymbol" as const, name: "square.grid.2x2" },
-                onPress: () => runCreateAction("space"),
-              },
-            ],
+            items: createMenuItems.map(({ id, label, sfSymbol }) => ({
+              type: "action" as const,
+              label: t(label),
+              icon: { type: "sfSymbol" as const, name: sfSymbol },
+              onPress: () => runCreateAction(id),
+            })),
           },
         },
       ],
@@ -96,6 +88,7 @@ export function useHomeHeader({
     activityMode,
     toggleActivityMode,
     runCreateAction,
+    headerTitle,
     router,
     t,
     locale,

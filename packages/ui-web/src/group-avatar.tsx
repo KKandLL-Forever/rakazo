@@ -1,3 +1,4 @@
+import type { BotAvatarSet } from "@rakazo/contracts";
 import type { CSSProperties } from "react";
 import { memo } from "react";
 import { BotAvatar } from "./bot-avatar.js";
@@ -7,6 +8,7 @@ export interface GroupAvatarMember {
   botId?: string;
   name?: string;
   color: string;
+  avatarSet?: BotAvatarSet;
   status?: string;
 }
 
@@ -54,6 +56,7 @@ export const GroupAvatar = memo(function GroupAvatar({
     return (
       <BotAvatar
         color={firstMember.color}
+        avatarSet={firstMember.avatarSet}
         identity={firstMember.botId ?? firstMember.name}
         size={size}
         status={firstMember.status}
@@ -93,6 +96,7 @@ export const GroupAvatar = memo(function GroupAvatar({
         >
           <BotAvatar
             color={member.color}
+            avatarSet={member.avatarSet}
             identity={member.botId ?? member.name}
             size={miniSize}
             status={member.status}
@@ -101,6 +105,7 @@ export const GroupAvatar = memo(function GroupAvatar({
       ))}
       {members.length > 3 ? (
         <div
+          // off-scale: count must fit the mini avatar dot
           className="absolute right-0 bottom-0 z-[3] flex items-center justify-center rounded-full bg-secondary border border-border text-[10px] font-semibold text-secondary-foreground shadow-md"
           style={{
             width: miniSize,

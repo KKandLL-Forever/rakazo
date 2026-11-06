@@ -11,9 +11,10 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { rpc } from "../lib/api";
 import { startCallBackground, stopCallBackground } from "../lib/call-background";
 import type { CallPhase } from "../lib/call-session";
-import { endCall, toggleMute, toggleTranscript, useCallSession } from "../lib/call-session";
+import { hangUp, toggleMute, toggleTranscript, useCallSession } from "../lib/call-session";
 import { useI18n } from "../lib/i18n";
 import { useMobileTokens } from "../lib/native";
+import { currentSessionGeneration, subscribeSessionGeneration } from "../lib/session";
 import { setVoiceBackgroundPlayback } from "../lib/voice";
 import { BotAvatar } from "./bot-avatar";
 import { GlassIconButton } from "./glass-icon-button";
@@ -57,13 +58,26 @@ export function CallCard() {
 
   useEffect(() => {
     if (!onCall || cachedInitial !== null) return;
+    const generation = currentSessionGeneration();
     void rpc("me")
       .then((me) => {
+        // A sign-out while the request is in flight must not restore the old account's initial.
+        if (generation !== currentSessionGeneration()) return;
         cachedInitial = accountDisplay(me, t("You")).initial ?? "";
         setInitial(cachedInitial);
       })
       .catch(() => undefined);
   }, [onCall]);
+
+  // The card stays mounted across account switches; the next account re-reads its own initial.
+  useEffect(
+    () =>
+      subscribeSessionGeneration(() => {
+        cachedInitial = null;
+        setInitial("");
+      }),
+    [],
+  );
 
   // A call keeps its replies playing while the screen is off.
   useEffect(() => {
@@ -133,7 +147,13 @@ export function CallCard() {
     >
       {Platform.OS !== "android" || !serviceStarted ? <KeepCallAwake /> : null}
       <View style={styles.row}>
-        <BotAvatar color={call.botColor} identity={call.botId} size={28} motion="live" />
+        <BotAvatar
+          color={call.botColor}
+          avatarSet={call.botAvatarSet}
+          identity={call.botId}
+          size={28}
+          motion="live"
+        />
         <Pressable
           accessibilityRole="button"
           accessibilityLabel={t("On a call with {name}", { name: call.botName })}
@@ -184,7 +204,7 @@ export function CallCard() {
           color={tokens.destructiveForeground}
           border={tokens.destructiveFill}
           background={tokens.destructiveFill}
-          onPress={endCall}
+          onPress={hangUp}
         />
       </View>
       {call.transcriptOpen ? (

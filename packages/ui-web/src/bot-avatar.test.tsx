@@ -12,7 +12,7 @@ import {
 } from "./bot-avatar.js";
 
 describe("BotAvatar", () => {
-  it("renders distinct SVG gradient IDs for concurrent working avatars", () => {
+  it("renders distinct ring gradient IDs for concurrent working avatars", () => {
     const html = renderToString(
       <div>
         <BotAvatar color="#8B5CF6::shape_0" status="running" />
@@ -21,8 +21,8 @@ describe("BotAvatar", () => {
     );
 
     const gradMatches = [...html.matchAll(/id="([^"]+)"/g)].map((m) => m[1]);
-    expect(gradMatches).toHaveLength(4);
-    expect(new Set(gradMatches).size).toBe(4);
+    expect(gradMatches).toHaveLength(2);
+    expect(new Set(gradMatches).size).toBe(2);
     for (const id of gradMatches) {
       expect(id).toBeTruthy();
       expect(html).toContain(`url(#${id})`);
@@ -67,7 +67,7 @@ describe("BotAvatar", () => {
   });
 
   it("resolves explicit colors and shapes", () => {
-    expect(resolvePersonaColorDef("bot", "#10B981").hex.toLowerCase()).toBe("#10b981");
+    expect(resolvePersonaColorDef("bot", "#10B981").hex).toBe("#00C972");
     expect(resolvePersonaColorDef("bot", "#fff").hex).toBe("#fff");
     expect(BOT_AVATAR_COLORS.length).toBeGreaterThan(0);
   });
@@ -169,6 +169,19 @@ describe("BotAvatar", () => {
     );
     expect(html).toContain('aria-label="Shape 1"');
     expect(html).toContain("rakazo-organic-avatar");
+  });
+
+  it("morphs the organic body only while working", () => {
+    const morphing = (status: string) =>
+      [
+        ...renderToString(<BotAvatar color="#8B5CF6" status={status} />).matchAll(
+          /rakazo-organic-avatar-body-(idle|working)"[^>]*>(<animate)?/g,
+        ),
+      ]
+        .filter((match) => match[2])
+        .map((match) => match[1]);
+    expect(morphing("idle")).toEqual([]);
+    expect(morphing("running")).toEqual(["working"]);
   });
 
   it("draws every plain-colour bot with the organic body", () => {

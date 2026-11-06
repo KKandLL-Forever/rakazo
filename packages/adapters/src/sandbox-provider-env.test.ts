@@ -13,9 +13,36 @@ describe("resolveSandboxProvider", () => {
 
   it("falls back to none when a remote provider key is missing", () => {
     expect(resolveSandboxProvider({ SANDBOX_PROVIDER: "e2b" })).toBe("none");
+    expect(
+      resolveSandboxProvider({ SANDBOX_PROVIDER: "novita", E2B_API_KEY: "test-e2b-key" }),
+    ).toBe("none");
     expect(resolveSandboxProvider({ SANDBOX_PROVIDER: "daytona" })).toBe("none");
     expect(resolveSandboxProvider({ SANDBOX_PROVIDER: "createos" })).toBe("none");
     expect(resolveSandboxProvider({ SANDBOX_PROVIDER: "boat" })).toBe("none");
+    const wuying = {
+      SANDBOX_PROVIDER: "wuying",
+      WUYING_ACCESS_KEY_ID: "test-id",
+      WUYING_ACCESS_KEY_SECRET: "test-secret",
+      WUYING_DESKTOP_ID: "ecd-test",
+      WUYING_END_USER_ID: "test-user",
+      WUYING_MCP_URL: "https://gateway.example.com/mcp",
+      WUYING_MCP_TOKEN: "test-token",
+    };
+    expect(resolveSandboxProvider(wuying)).toBe("wuying");
+    expect(resolveSandboxProvider({ ...wuying, WUYING_MCP_TOKEN: " " })).toBe("none");
+  });
+
+  it("loads Novita credentials and the shared template setting", () => {
+    const env = {
+      SANDBOX_PROVIDER: "novita",
+      NOVITA_API_KEY: " test-novita-key ",
+      SANDBOX_TEMPLATE: " custom-desktop ",
+    };
+    expect(resolveSandboxProvider(env)).toBe("novita");
+    expect(sandboxProviderOptionsFromEnv(env)).toMatchObject({
+      novitaApiKey: "test-novita-key",
+      sandboxTemplate: "custom-desktop",
+    });
   });
 
   it("requires both Railway credentials and an environment", () => {
@@ -37,6 +64,16 @@ describe("resolveSandboxProvider", () => {
     });
   });
 
+  it("keeps boxd when its API key is set, with an optional organization", () => {
+    expect(resolveSandboxProvider({ SANDBOX_PROVIDER: "boxd" })).toBe("none");
+    const env = { SANDBOX_PROVIDER: "boxd", BOXD_API_KEY: "test-boxd-key", BOXD_ORG: "team" };
+    expect(resolveSandboxProvider(env)).toBe("boxd");
+    expect(sandboxProviderOptionsFromEnv(env)).toMatchObject({
+      boxdApiKey: "test-boxd-key",
+      boxdOrg: "team",
+    });
+  });
+
   it("keeps CreateOS when its API key is set", () => {
     expect(
       resolveSandboxProvider({
@@ -51,6 +88,22 @@ describe("resolveSandboxProvider", () => {
     expect(resolveSandboxProvider({ SANDBOX_PROVIDER: "kubernetes", NODE_ENV: "production" })).toBe(
       "kubernetes",
     );
+  });
+
+  it("keeps Incus only when its address and client certificate are set", () => {
+    const configured = {
+      SANDBOX_PROVIDER: "incus",
+      INCUS_SANDBOX_URL: "https://incus.example.test:8443",
+      INCUS_SANDBOX_CLIENT_CERT: "test-cert",
+      INCUS_SANDBOX_CLIENT_KEY: "test-key",
+    };
+    expect(resolveSandboxProvider(configured)).toBe("incus");
+    for (const key of [
+      "INCUS_SANDBOX_URL",
+      "INCUS_SANDBOX_CLIENT_CERT",
+      "INCUS_SANDBOX_CLIENT_KEY",
+    ])
+      expect(resolveSandboxProvider({ ...configured, [key]: " " })).toBe("none");
   });
 
   it("falls back to none in production when Docker has no supervisor token", () => {
@@ -125,6 +178,33 @@ describe("sandboxProviderOptionsFromEnv", () => {
       kubernetesReadyTimeoutMs: 90_000,
     });
     expect(sandboxProviderOptionsFromEnv({}).kubernetesNamespace).toBeUndefined();
+  });
+
+  it("loads Incus settings and accepts certificates with escaped newlines", () => {
+    expect(
+      sandboxProviderOptionsFromEnv({
+        INCUS_SANDBOX_URL: " https://incus.example.test:8443 ",
+        INCUS_SANDBOX_CLIENT_CERT: "client-cert-line-1\\nclient-cert-line-2",
+        INCUS_SANDBOX_CLIENT_KEY: "client-key-line-1\nclient-key-line-2",
+        INCUS_SANDBOX_SERVER_CERT: "server-cert-line-1\\nserver-cert-line-2",
+        INCUS_SANDBOX_PROJECT: "rakazo",
+        INCUS_SANDBOX_COMPUTER_IMAGE: "ghcr.io/elie222/rakazo/computer:v1.2.3",
+        INCUS_SANDBOX_CPU_LIMIT: "1",
+        INCUS_SANDBOX_MEMORY_LIMIT: "1536MiB",
+        INCUS_SANDBOX_PROCESS_LIMIT: "1024",
+      }),
+    ).toMatchObject({
+      incusUrl: "https://incus.example.test:8443",
+      incusClientCert: "client-cert-line-1\nclient-cert-line-2",
+      incusClientKey: "client-key-line-1\nclient-key-line-2",
+      incusServerCert: "server-cert-line-1\nserver-cert-line-2",
+      incusProject: "rakazo",
+      incusComputerImage: "ghcr.io/elie222/rakazo/computer:v1.2.3",
+      incusCpuLimit: "1",
+      incusMemoryLimit: "1536MiB",
+      incusProcessLimit: "1024",
+    });
+    expect(sandboxProviderOptionsFromEnv({}).incusServerCert).toBeUndefined();
   });
 
   it("loads the Kubernetes home claim and its pod-affinity target", () => {

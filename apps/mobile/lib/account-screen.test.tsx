@@ -5,10 +5,12 @@ import type { ReactNode } from "react";
 import { act, createElement, useEffect } from "react";
 import type { Root } from "react-dom/client";
 import { createRoot } from "react-dom/client";
+import { Alert } from "react-native";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import Account from "../app/(settings)/account";
-import { deleteAccount, fetchAccountSecurity, requestAccountDeletionCode } from "./api";
+import { deleteAccount, fetchAccountSecurity, requestAccountDeletionCode, signOut } from "./api";
 import { replaceWithSignIn } from "./auth-routing";
+import { endCallBeforeSessionEnd } from "./call-session";
 import { promptAccountDeletion } from "./delete-account-prompt";
 import { registerSettingsSheet } from "./settings-sheet";
 
@@ -34,6 +36,9 @@ const { element, account } = vi.hoisted(() => ({
       unknown
     >,
     push: vi.fn(),
+    approvals: { mode: "ask", enabled: false, skipApprovals: false, checkerAvailable: true },
+    rules: [] as { id: string }[],
+    messaging: { enabled: true },
   },
 }));
 
@@ -75,7 +80,34 @@ vi.mock("react-native", () => ({
     }),
   View: element("div"),
 }));
-vi.mock("@expo/ui/community/menu", () => ({ MenuView: element("div") }));
+vi.mock("@expo/ui/community/menu", () => ({
+  MenuView: ({
+    children,
+    actions,
+    onPressAction,
+  }: {
+    children?: ReactNode;
+    actions: Array<{ id: string; title: string }>;
+    onPressAction: (event: { nativeEvent: { event: string } }) => void;
+  }) =>
+    createElement(
+      "div",
+      null,
+      children,
+      actions.map((action) =>
+        createElement(
+          "button",
+          {
+            key: action.id,
+            type: "button",
+            "data-menu-action": action.id,
+            onClick: () => onPressAction({ nativeEvent: { event: action.id } }),
+          },
+          action.title,
+        ),
+      ),
+    ),
+}));
 vi.mock("expo-router", () => {
   const router = { push: account.push, back: () => undefined };
   return {
@@ -84,8 +116,12 @@ vi.mock("expo-router", () => {
     useRouter: () => router,
   };
 });
-vi.mock("react-native-safe-area-context", () => ({ SafeAreaView: element("div") }));
+vi.mock("react-native-safe-area-context", () => ({
+  SafeAreaView: element("div"),
+  useSafeAreaInsets: () => ({ top: 0, bottom: 0, left: 0, right: 0 }),
+}));
 vi.mock("../components/app-mark", () => ({ AppMark: () => null }));
+vi.mock("../components/native-symbol", () => ({ NativeSymbol: () => null }));
 vi.mock("../components/native-action-button", () => ({
   NativeActionButton: ({
     label,
@@ -106,12 +142,14 @@ vi.mock("../components/settings-group", () => ({
   SettingsLabel: element("span"),
   SettingsRow: ({
     title,
+    value,
     accessibilityRole,
     chevron,
     disabled,
     onPress,
   }: {
     title: string;
+    value?: string;
     accessibilityRole?: string;
     chevron?: string;
     disabled?: boolean;
@@ -123,14 +161,36 @@ vi.mock("../components/settings-group", () => ({
         type: "button",
         role: accessibilityRole,
         "data-chevron": chevron,
+        "data-value": value,
         "data-row": "",
         disabled,
         onClick: onPress,
       },
       title,
     ),
-  SettingsSwitch: ({ title }: { title: string }) =>
-    createElement("button", { type: "button" }, title),
+  SettingsSwitch: ({
+    label,
+    value,
+    disabled,
+    onChange,
+  }: {
+    label: string;
+    value: boolean;
+    disabled?: boolean;
+    onChange: (value: boolean) => void;
+  }) =>
+    createElement(
+      "button",
+      {
+        type: "button",
+        role: "switch",
+        "aria-label": label,
+        "aria-checked": value,
+        disabled,
+        onClick: () => onChange(!value),
+      },
+      label,
+    ),
   useStackedSettings: () => false,
 }));
 vi.mock("./api", () => ({
@@ -140,7 +200,17 @@ vi.mock("./api", () => ({
   loadSessionToken: vi.fn(async () => "token"),
   passwordResetCapabilities: vi.fn(async () => ({})),
   requestAccountDeletionCode: vi.fn(),
-  rpc: vi.fn(async (method: string) => (method === "me" ? account.me : {})),
+  rpc: vi.fn(async (method: string) =>
+    method === "me"
+      ? account.me
+      : method === "autoReview/get"
+        ? account.approvals
+        : method === "approvalRules/list"
+          ? account.rules
+          : method === "messaging/status"
+            ? account.messaging
+            : {},
+  ),
   selectedSpaceId: () => "space-1",
   signOut: vi.fn(),
   updateAccountName: vi.fn(),
@@ -159,7 +229,27 @@ vi.mock("./archived-chats", () => ({
   loadArchivedChats: vi.fn(async () => ({ bots: [], groups: [] })),
 }));
 vi.mock("./auth-routing", () => ({ replaceWithSignIn: vi.fn() }));
+vi.mock("./call-session", () => ({ endCallBeforeSessionEnd: vi.fn(async () => undefined) }));
 vi.mock("./delete-account-prompt", () => ({ promptAccountDeletion: vi.fn() }));
+const haptics = vi.hoisted(() => ({
+  enabled: true,
+  listeners: new Set<() => void>(),
+  load: vi.fn(async () => undefined),
+  save: vi.fn(async (_value: boolean) => undefined),
+}));
+vi.mock("./haptics", () => ({
+  getHapticsEnabled: () => haptics.enabled,
+  loadHapticsPreference: haptics.load,
+  setHapticsEnabled: (value: boolean) => {
+    haptics.enabled = value;
+    for (const listener of haptics.listeners) listener();
+    return haptics.save(value);
+  },
+  subscribeHaptics: (listener: () => void) => {
+    haptics.listeners.add(listener);
+    return () => haptics.listeners.delete(listener);
+  },
+}));
 vi.mock("./i18n", () => {
   // Stable across renders, as the real hook's is.
   const i18n = { t: (text: string) => text, locale: "en" };
@@ -187,7 +277,12 @@ vi.mock("./passkey", () => ({
   passkeysAvailable: vi.fn(async () => false),
   renamePasskey: vi.fn(),
 }));
+vi.mock("./organizations", () => ({
+  activeOrganization: () => undefined,
+  useOrganizations: () => ({ data: undefined }),
+}));
 vi.mock("./push", () => ({ registerPushToken: vi.fn() }));
+vi.mock("./returning-user", () => ({ forgetSignedIn: vi.fn() }));
 vi.mock("./queued-save", () => ({ createQueuedSave: () => ({ save: vi.fn() }) }));
 vi.mock("./remote-images-preference", () => ({
   getCachedRemoteImagesEnabled: () => true,
@@ -201,6 +296,15 @@ vi.mock("./response-streaming", () => ({
 }));
 vi.mock("./section-name-prompt", () => ({ promptSectionName: vi.fn() }));
 vi.mock("./sso", () => ({ continueWithSso: vi.fn() }));
+const trusted = vi.hoisted(() => ({
+  sites: [] as string[],
+  remove: vi.fn(async (_site: string) => undefined),
+}));
+vi.mock("./trusted-link-sites", () => ({
+  loadTrustedLinkSites: vi.fn(async () => undefined),
+  removeTrustedLinkSite: trusted.remove,
+  useTrustedLinkSites: () => trusted.sites,
+}));
 vi.mock("./ui-locale", () => ({ UI_LOCALE_LABELS: { en: "English" } }));
 vi.mock("./user-error", () => ({ errorText: (_: unknown, fallback: string) => fallback }));
 
@@ -221,6 +325,12 @@ let container: HTMLDivElement | undefined;
 beforeEach(() => {
   vi.clearAllMocks();
   account.me = { userId: "user-1", name: "Tester", email: "tester@example.test" };
+  account.rules = [];
+  account.messaging = { enabled: true };
+  haptics.enabled = true;
+  haptics.listeners.clear();
+  haptics.save.mockReset().mockResolvedValue(undefined);
+  haptics.load.mockReset().mockResolvedValue(undefined);
   vi.mocked(fetchAccountSecurity).mockResolvedValue(security());
 });
 
@@ -239,7 +349,6 @@ it("offers no avatar style choice in account settings", async () => {
   root = createRoot(container);
   await act(async () => root?.render(<Account />));
 
-  // The screen rendered its neighbouring settings.
   expect(container.querySelector('[aria-label="Appearance"]')).not.toBeNull();
   expect(container.textContent).toContain("Language");
   expect(container.querySelector('[aria-label="Avatar style"]')).toBeNull();
@@ -276,6 +385,138 @@ async function renderAccount() {
     alert: () => screen.querySelector('[role="alert"]')?.textContent ?? null,
   };
 }
+
+it("shows a device haptics switch that follows and saves the local preference", async () => {
+  haptics.enabled = false;
+  const view = await renderAccount();
+  const toggle = view.screen.querySelector<HTMLButtonElement>(
+    '[role="switch"][aria-label="Haptics"]',
+  );
+  expect(toggle?.getAttribute("aria-checked")).toBe("false");
+  await view.press("Haptics");
+  expect(haptics.save).toHaveBeenLastCalledWith(true);
+  expect(toggle?.getAttribute("aria-checked")).toBe("true");
+  await view.press("Haptics");
+  expect(haptics.save).toHaveBeenLastCalledWith(false);
+  expect(toggle?.getAttribute("aria-checked")).toBe("false");
+});
+
+it("requests the cached haptics loader on each settings visit without repeating it on rerenders", async () => {
+  const first = await renderAccount();
+  expect(haptics.load).toHaveBeenCalledOnce();
+  await first.press("Haptics");
+  expect(haptics.load).toHaveBeenCalledOnce();
+  await act(async () => root?.unmount());
+  root = undefined;
+  first.screen.remove();
+  await renderAccount();
+  expect(haptics.load).toHaveBeenCalledTimes(2);
+});
+
+it("reflects a saved off choice recovered by the settings focus loader", async () => {
+  haptics.load.mockImplementationOnce(async () => {
+    haptics.enabled = false;
+    for (const listener of haptics.listeners) listener();
+  });
+  const view = await renderAccount();
+  expect(
+    view.screen
+      .querySelector('[role="switch"][aria-label="Haptics"]')
+      ?.getAttribute("aria-checked"),
+  ).toBe("false");
+  expect(haptics.load).toHaveBeenCalledOnce();
+  expect(haptics.save).not.toHaveBeenCalled();
+});
+
+it("keeps a failed off choice in memory and offers a native retry of that same choice", async () => {
+  haptics.save.mockRejectedValueOnce(new Error("private device storage failure"));
+  const view = await renderAccount();
+  await view.press("Haptics");
+  const toggle = view.screen.querySelector('[role="switch"][aria-label="Haptics"]');
+  expect(toggle?.getAttribute("aria-checked")).toBe("false");
+  expect(Alert.alert).toHaveBeenCalledWith("Haptics", "Could not save", expect.any(Array));
+  const buttons = vi.mocked(Alert.alert).mock.lastCall?.[2];
+  expect(buttons?.find((button) => button.style === "cancel")?.text).toBe("Cancel");
+  const retry = buttons?.find((button) => button.text === "Retry");
+  expect(retry).toBeDefined();
+  await act(async () => retry?.onPress?.());
+  expect(haptics.save.mock.calls).toEqual([[false], [false]]);
+  expect(toggle?.getAttribute("aria-checked")).toBe("false");
+  expect(Alert.alert).toHaveBeenCalledOnce();
+});
+
+it("ignores a failed older toggle even when the latest choice has the same value", async () => {
+  let fail!: (error: Error) => void;
+  haptics.save.mockReturnValueOnce(
+    new Promise<never>((_resolve, reject) => {
+      fail = reject;
+    }),
+  );
+  const view = await renderAccount();
+  await view.press("Haptics");
+  await view.press("Haptics");
+  await view.press("Haptics");
+  await act(async () => fail(new Error("old failure")));
+  expect(haptics.save.mock.calls).toEqual([[false], [true], [false]]);
+  expect(haptics.enabled).toBe(false);
+  expect(Alert.alert).not.toHaveBeenCalled();
+});
+
+it("does not let an old retry overwrite a newer preference", async () => {
+  haptics.save.mockRejectedValueOnce(new Error("save failed"));
+  const view = await renderAccount();
+  await view.press("Haptics");
+  const retry = vi
+    .mocked(Alert.alert)
+    .mock.lastCall?.[2]?.find((button) => button.text === "Retry");
+  await view.press("Haptics");
+  expect(haptics.enabled).toBe(true);
+  await act(async () => retry?.onPress?.());
+  expect(haptics.save.mock.calls).toEqual([[false], [true]]);
+  expect(haptics.enabled).toBe(true);
+});
+
+it("reports a current failed save and can retry after the account screen closes", async () => {
+  let fail!: (error: Error) => void;
+  haptics.save.mockReturnValueOnce(
+    new Promise<never>((_resolve, reject) => {
+      fail = reject;
+    }),
+  );
+  const view = await renderAccount();
+  await view.press("Haptics");
+  await act(async () => root?.unmount());
+  root = undefined;
+  await act(async () => fail(new Error("late failure")));
+  expect(haptics.enabled).toBe(false);
+  expect(Alert.alert).toHaveBeenCalledWith("Haptics", "Could not save", expect.any(Array));
+  const retry = vi
+    .mocked(Alert.alert)
+    .mock.lastCall?.[2]?.find((button) => button.text === "Retry");
+  await act(async () => retry?.onPress?.());
+  expect(haptics.save.mock.calls).toEqual([[false], [false]]);
+});
+
+it("keeps a late failure from an earlier settings visit silent after a newer same-value choice", async () => {
+  let fail!: (error: Error) => void;
+  haptics.save.mockReturnValueOnce(
+    new Promise<never>((_resolve, reject) => {
+      fail = reject;
+    }),
+  );
+  const first = await renderAccount();
+  await first.press("Haptics");
+  await act(async () => root?.unmount());
+  root = undefined;
+  first.screen.remove();
+  const second = await renderAccount();
+  await second.press("Haptics");
+  await second.press("Haptics");
+  expect(haptics.enabled).toBe(false);
+  await act(async () => fail(new Error("old visit failure")));
+  expect(haptics.save.mock.calls).toEqual([[false], [true], [false]]);
+  expect(Alert.alert).not.toHaveBeenCalled();
+});
 
 it("asks for the current password, shows a failed delete, and signs out after a successful one", async () => {
   const view = await renderAccount();
@@ -402,6 +643,8 @@ it.each([false, true])(
         "Approvals",
         "Vault",
         "Integrations",
+        "Skills",
+        "Memory",
         "Messaging",
         "AI data sharing",
       ];
@@ -417,8 +660,8 @@ it.each([false, true])(
       expect(events).toEqual(["close", "/artifacts"]);
       for (const [title, href] of [
         ["Models", "/models"],
-        ["Approvals", "/approvals"],
         ["Vault", "/vault"],
+        ["Memory", "/memory"],
         ["Messaging", "/messaging"],
       ]) {
         events.length = 0;
@@ -437,3 +680,69 @@ it.each([false, true])(
     }
   },
 );
+
+it("lists trusted link sites only when there is one, each with a remove action", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  container = document.createElement("div");
+  document.body.append(container);
+  root = createRoot(container);
+  await act(async () => root?.render(<Account />));
+  expect(container.querySelector('[aria-label="Trusted sites"]')).toBeNull();
+
+  trusted.sites = ["alice.github.io", "example.com"];
+  await act(async () => root?.render(<Account />));
+  const group = container.querySelector('[aria-label="Trusted sites"]');
+  expect(group?.textContent).toContain("alice.github.io");
+  expect(group?.textContent).toContain("example.com");
+  const removes = group?.querySelectorAll<HTMLButtonElement>('[data-menu-action="remove"]');
+  expect(removes).toHaveLength(2);
+  await act(async () => removes?.[1]?.click());
+  expect(trusted.remove).toHaveBeenCalledWith("example.com");
+  trusted.sites = [];
+});
+
+it("shows the approval mode as the Approvals row's value, with Rules only once there are some", async () => {
+  let view = await renderAccount();
+  const approvals = view.button("Approvals")!;
+  expect(approvals.dataset.value).toBe("Ask");
+  expect(approvals.dataset.chevron).toBeUndefined();
+  // The mode opens a menu in place; there is no screen for it.
+  await act(async () => approvals.click());
+  expect(account.push).not.toHaveBeenCalled();
+  expect(view.button("Rules")).toBeUndefined();
+
+  act(() => root?.unmount());
+  container?.remove();
+  account.rules = [{ id: "rule-1" }, { id: "rule-2" }];
+  view = await renderAccount();
+  const titles = Array.from(view.screen.querySelectorAll("[data-row]"), (row) => row.textContent);
+  expect(titles.slice(titles.indexOf("Approvals"), titles.indexOf("Approvals") + 3)).toEqual([
+    "Approvals",
+    "Rules",
+    "Vault",
+  ]);
+  expect(view.button("Rules")!.dataset.value).toBe("2");
+  await view.press("Rules");
+  expect(account.push).toHaveBeenCalledWith("/approvals");
+});
+
+it("hides Messaging when no chat app is connected to the server", async () => {
+  account.messaging = { enabled: false };
+  const view = await renderAccount();
+  const titles = Array.from(view.screen.querySelectorAll("[data-row]"), (row) => row.textContent);
+  expect(titles).toContain("Skills");
+  expect(titles).not.toContain("Messaging");
+});
+
+it("hangs up the active call before signing out", async () => {
+  const view = await renderAccount();
+  const order: string[] = [];
+  vi.mocked(endCallBeforeSessionEnd).mockImplementationOnce(async () => {
+    order.push("hang-up");
+  });
+  vi.mocked(signOut).mockImplementationOnce(async () => {
+    order.push("sign-out");
+  });
+  await view.press("Sign out");
+  expect(order).toEqual(["hang-up", "sign-out"]);
+});

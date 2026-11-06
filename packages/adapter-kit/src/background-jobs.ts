@@ -22,13 +22,19 @@ const payloadSchemas = {
   }),
   "skill.teaching-expire": z.object({ skillId: z.string().min(1) }),
   "call.expire": z.object({ threadId: z.string().min(1), callId: z.string().min(1) }),
-  "history.compact": z.object({ threadId: z.string().min(1) }),
+  // The member whose turn asked for it, who pays; older jobs name only the thread.
+  "history.compact": z.object({
+    threadId: z.string().min(1),
+    userId: z.string().min(1).optional(),
+  }),
   "messaging.deliver": z.object({ runId: z.string().min(1).optional() }),
   "messaging.credential-cleanup": z.object({
     installationId: z.string().min(1),
     ref: z.string().min(1),
   }),
   "cloud_agent.poll": z.object({ agentId: z.string().min(1) }),
+  "purchase.poll": z.object({ purchaseId: z.string().min(1) }),
+  "media.poll": z.object({ jobId: z.string().min(1) }),
   "push.receipt": z.object({
     userId: z.string().min(1),
     ticketId: z.string().min(1),
@@ -168,10 +174,10 @@ export function messagingDeliverJob(runId?: string, availableAt?: Date): Backgro
   };
 }
 
-export function historyCompactJob(threadId: string): BackgroundJob {
+export function historyCompactJob(threadId: string, userId?: string): BackgroundJob {
   return {
     name: "history.compact",
-    payload: { threadId },
+    payload: userId ? { threadId, userId } : { threadId },
     replaceKey: historyCompactJobKey(threadId),
     maxAttempts: HISTORY_COMPACT_MAX_ATTEMPTS,
   };
@@ -197,6 +203,24 @@ export function cloudAgentPollJob(
     name: "cloud_agent.poll",
     payload,
     replaceKey: cloudAgentPollJobKey(payload.agentId),
+    ...(availableAt ? { availableAt } : {}),
+  };
+}
+
+export function purchasePollJob(purchaseId: string, availableAt?: Date): BackgroundJob {
+  return {
+    name: "purchase.poll",
+    payload: { purchaseId },
+    replaceKey: `purchase.poll:${purchaseId}`,
+    ...(availableAt ? { availableAt } : {}),
+  };
+}
+
+export function mediaPollJob(jobId: string, availableAt?: Date): BackgroundJob {
+  return {
+    name: "media.poll",
+    payload: { jobId },
+    replaceKey: `media.poll:${jobId}`,
     ...(availableAt ? { availableAt } : {}),
   };
 }

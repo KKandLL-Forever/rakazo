@@ -1,5 +1,6 @@
 import { Plural, Trans } from "@lingui/react/macro";
 import type { Bot } from "@rakazo/contracts";
+import { botsWithOwnModel } from "@rakazo/core";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -13,13 +14,6 @@ import {
 } from "@rakazo/ui-web";
 import { useCallback, useEffect, useState } from "react";
 import { useSpaceRpc } from "../../lib/space-rpc";
-
-/** Bots that pick their own model ignore the space default and its changes. */
-export function botsWithOwnModel<T extends Pick<Bot, "modelProvider" | "modelId">>(
-  bots: readonly T[],
-): T[] {
-  return bots.filter((bot) => Boolean(bot.modelProvider && bot.modelId));
-}
 
 /**
  * Lists the bots that ignore the space default and, after a confirm, moves them all onto
@@ -74,12 +68,12 @@ export function SpaceBotsModelNotice({ refreshKey }: { refreshKey?: unknown }) {
       aria-labelledby="space-bots-model-title"
       className="mt-6 border-t border-border pt-5"
     >
-      <h3 id="space-bots-model-title" className="text-[13.5px] text-muted-foreground">
+      <h3 id="space-bots-model-title" className="text-body text-muted-foreground">
         <Trans>Bot models</Trans>
       </h3>
       {pinned.length ? (
         <>
-          <p className="mt-1 text-[13px] leading-[1.5] text-muted-foreground">
+          <p className="mt-1 text-body-sm leading-[1.5] text-muted-foreground">
             <Plural
               value={pinned.length}
               one="# bot has its own model:"
@@ -100,7 +94,7 @@ export function SpaceBotsModelNotice({ refreshKey }: { refreshKey?: unknown }) {
         </>
       ) : null}
       {moved ? (
-        <p className="mt-2 text-[13px] leading-[1.5] text-success" role="status">
+        <p className="mt-2 text-body-sm leading-[1.5] text-success" role="status">
           <Plural
             value={moved}
             one="# bot now uses the space default."
@@ -109,7 +103,7 @@ export function SpaceBotsModelNotice({ refreshKey }: { refreshKey?: unknown }) {
         </p>
       ) : null}
       {failed.length ? (
-        <p className="mt-2 text-[13px] leading-[1.5] text-destructive" role="alert">
+        <p className="mt-2 text-body-sm leading-[1.5] text-destructive" role="alert">
           <Trans>Could not switch {failedNames}. Try again.</Trans>
         </p>
       ) : null}

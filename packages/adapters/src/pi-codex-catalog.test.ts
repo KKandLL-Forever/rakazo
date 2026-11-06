@@ -10,12 +10,15 @@ import {
   codexLiveListsModel,
   fetchCodexCatalog,
   parseCodexCatalog,
+  resolveCodexOAuthDefaultModel,
 } from "./pi-codex-catalog.js";
+import { liveCatalogEntry } from "./pi-live-catalog.js";
 import { listPiCatalog } from "./pi-models.js";
 import { CHATGPT_OAUTH_PROVIDER, parseModelSecret } from "./pi-oauth.js";
 
 const SPARK = "gpt-5.3-codex-spark";
 const LUNA = "gpt-6-luna";
+const SOL = "gpt-6-sol";
 const ACCESS_TOKEN = "fake-access-token-for-tests";
 const ACCOUNT_ID = "acct-test-1";
 
@@ -64,6 +67,57 @@ function authPrisma(options: { secrets?: Array<{ id: string; ciphertext: string 
     },
   } as unknown as PrismaClient;
 }
+
+describe("resolveCodexOAuthDefaultModel", () => {
+  const oauthSecret = () => parseModelSecret(oauthPlaintext());
+  const catalog = (models: CodexCatalogModel[]) => ({
+    read: vi.fn(async () => models),
+  });
+
+  it("keeps the requested model when the connected account lists it", async () => {
+    const result = await resolveCodexOAuthDefaultModel(
+      catalog([liveModel(LUNA)]),
+      "user-test",
+      oauthSecret(),
+      LUNA,
+    );
+
+    expect(result).toBe(LUNA);
+  });
+
+  it("uses an account model when the requested model is unavailable", async () => {
+    const result = await resolveCodexOAuthDefaultModel(
+      catalog([liveModel(LUNA)]),
+      "user-test",
+      oauthSecret(),
+      SPARK,
+    );
+
+    expect(result).toBe(LUNA);
+  });
+
+  it("uses an account model when no model was requested", async () => {
+    const result = await resolveCodexOAuthDefaultModel(
+      catalog([liveModel(SOL)]),
+      "user-test",
+      oauthSecret(),
+      undefined,
+    );
+
+    expect(result).toBe(SOL);
+  });
+
+  it("keeps the normal fallback when the account catalog cannot be trusted", async () => {
+    const result = await resolveCodexOAuthDefaultModel(
+      catalog([liveModel("unrelated-model")]),
+      "user-test",
+      oauthSecret(),
+      LUNA,
+    );
+
+    expect(result).toBe(LUNA);
+  });
+});
 
 describe("fetchCodexCatalog", () => {
   it("requests the backend catalog with OAuth headers and the pinned client version", async () => {
@@ -205,6 +259,24 @@ describe("parseCodexCatalog", () => {
     expect(parsed?.[0]?.supportsFastTier).toBe(true);
     expect(parsed?.[0]?.supportsImages).toBe(false);
   });
+
+  it.each([undefined, null])(
+    "leaves image support unset when input modalities are %s",
+    (inputModalities) => {
+      const parsed = parseCodexCatalog(
+        catalogPayload([
+          {
+            slug: "gpt-6.1-sol",
+            visibility: "list",
+            supported_in_api: true,
+            ...(inputModalities === null ? { input_modalities: null } : {}),
+          },
+        ]),
+      );
+      expect(parsed?.[0]?.supportsImages).toBeUndefined();
+      expect(parsed?.[0]?.supportsFastTier).toBe(false);
+    },
+  );
 
   it.each([
     ["non-object payload", "nope"],
@@ -988,7 +1060,7 @@ describe("applyCodexLiveCatalog", () => {
   const liveFor = (entries: Record<string, CodexCatalogModel[]>) =>
     new Map(Object.entries(entries));
 
-  it("restores statically excluded models the account can call", () => {
+  it("adds Spark, which the bundled catalog lacks, when the account can call it", () => {
     expect(
       base.some((entry) => entry.provider === CHATGPT_OAUTH_PROVIDER && entry.id === SPARK),
     ).toBe(false);
@@ -1001,7 +1073,7 @@ describe("applyCodexLiveCatalog", () => {
     const ids = merged
       .filter((entry) => entry.provider === CHATGPT_OAUTH_PROVIDER)
       .map((entry) => entry.id);
-    expect(ids).toEqual([SPARK, LUNA]);
+    expect(ids).toEqual([LUNA, SPARK]);
 
     const spark = merged.find(
       (entry) => entry.provider === CHATGPT_OAUTH_PROVIDER && entry.id === SPARK,
@@ -1094,9 +1166,9 @@ describe("applyCodexLiveCatalog", () => {
   it("keeps API-key-governed codex models outside the live gate", () => {
     const mixedAuth: CodexCatalogSpaceAuth = {
       byProvider: { [CHATGPT_OAUTH_PROVIDER]: "oauth" },
-      byModel: { [CHATGPT_OAUTH_PROVIDER]: { [SPARK]: "api_key" } },
+      byModel: { [CHATGPT_OAUTH_PROVIDER]: { [SOL]: "api_key" } },
       secretIdByProvider: { [CHATGPT_OAUTH_PROVIDER]: "secret-a" },
-      secretIdByModel: { [CHATGPT_OAUTH_PROVIDER]: { [SPARK]: "secret-api" } },
+      secretIdByModel: { [CHATGPT_OAUTH_PROVIDER]: { [SOL]: "secret-api" } },
     };
     const mixedBase = listAvailablePiCatalog(mixedAuth.byProvider, mixedAuth.byModel);
     const merged = applyCodexLiveCatalog(
@@ -1108,7 +1180,7 @@ describe("applyCodexLiveCatalog", () => {
     const codexIds = merged
       .filter((entry) => entry.provider === CHATGPT_OAUTH_PROVIDER)
       .map((entry) => entry.id);
-    expect(codexIds).toEqual([SPARK, LUNA]);
+    expect(codexIds).toEqual([LUNA, SOL]);
   });
 
   it("governs each model by the account that owns its credential", () => {
@@ -1124,12 +1196,13 @@ describe("applyCodexLiveCatalog", () => {
     const merged = applyCodexLiveCatalog(
       splitBase,
       splitAuth,
-      liveFor({ "secret-a": [liveModel(LUNA)], "secret-b": [liveModel(SPARK)] }),
+      // A catalog is trusted only when it shares a bundled slug, so B lists Luna too.
+      liveFor({ "secret-a": [liveModel(LUNA)], "secret-b": [liveModel(SPARK), liveModel(LUNA)] }),
     );
     const codexIds = merged
       .filter((entry) => entry.provider === CHATGPT_OAUTH_PROVIDER)
       .map((entry) => entry.id);
-    expect(codexIds).toEqual([SPARK, LUNA]);
+    expect(codexIds).toEqual([LUNA, SPARK]);
 
     // Account A listing Spark must not unlock it — B's slot has no catalog read.
     const wrongAccount = applyCodexLiveCatalog(
@@ -1170,6 +1243,77 @@ describe("applyCodexLiveCatalog", () => {
       "secret-a": [liveModel("some-unrelated-model"), liveModel("another-foreign")],
     });
     expect(applyCodexLiveCatalog(base, oauthAuth, foreign)).toEqual(base);
+  });
+
+  it("keeps image support from the account list when a live slug is outside its sibling family", () => {
+    const terra = "gpt-6.2-terra";
+    const sol = "gpt-6.1-sol";
+    const bundled = base.find(
+      (entry) => entry.provider === CHATGPT_OAUTH_PROVIDER && entry.id === sol,
+    );
+    expect(bundled?.images).toBe(true);
+    expect(liveCatalogEntry(CHATGPT_OAUTH_PROVIDER, terra)?.images).toBe(false);
+
+    const modalities = (image: boolean) =>
+      parseCodexCatalog(
+        catalogPayload([
+          {
+            slug: sol,
+            visibility: "list",
+            supported_in_api: true,
+            input_modalities: image ? ["text", "image"] : ["text"],
+          },
+          {
+            slug: terra,
+            visibility: "list",
+            supported_in_api: true,
+            input_modalities: image ? ["text", "image"] : ["text"],
+          },
+        ]),
+      )!;
+    const imagesOf = (models: CodexCatalogModel[], id: string) =>
+      applyCodexLiveCatalog(base, oauthAuth, liveFor({ "secret-a": models })).find(
+        (entry) => entry.provider === CHATGPT_OAUTH_PROVIDER && entry.id === id,
+      )?.images;
+
+    expect(imagesOf(modalities(true), terra)).toBe(true);
+    expect(imagesOf(modalities(true), sol)).toBe(true);
+    expect(imagesOf(modalities(false), terra)).toBe(false);
+    expect(imagesOf(modalities(false), sol)).toBe(false);
+  });
+
+  it("keeps bundled image support when the account omits input modalities", () => {
+    const sol = "gpt-6.1-sol";
+    const terra = "gpt-6.2-terra";
+    const parsed = (inputModalities: null | undefined | string[]) =>
+      parseCodexCatalog(
+        catalogPayload([
+          {
+            slug: sol,
+            visibility: "list",
+            supported_in_api: true,
+            ...(inputModalities !== undefined ? { input_modalities: inputModalities } : {}),
+          },
+          {
+            slug: terra,
+            visibility: "list",
+            supported_in_api: true,
+            ...(inputModalities !== undefined ? { input_modalities: inputModalities } : {}),
+          },
+        ]),
+      )!;
+    const imagesOf = (models: CodexCatalogModel[], id: string) =>
+      applyCodexLiveCatalog(base, oauthAuth, liveFor({ "secret-a": models })).find(
+        (entry) => entry.provider === CHATGPT_OAUTH_PROVIDER && entry.id === id,
+      )?.images;
+
+    expect(parsed(undefined)[0]?.supportsImages).toBeUndefined();
+    expect(parsed(null)[0]?.supportsImages).toBeUndefined();
+    expect(imagesOf(parsed(undefined), sol)).toBe(true);
+    expect(imagesOf(parsed(null), sol)).toBe(true);
+    expect(imagesOf(parsed(undefined), terra)).toBe(false);
+    expect(imagesOf(parsed(["text"]), sol)).toBe(false);
+    expect(imagesOf(parsed(["text"]), terra)).toBe(false);
   });
 
   it("leaves other providers untouched", () => {

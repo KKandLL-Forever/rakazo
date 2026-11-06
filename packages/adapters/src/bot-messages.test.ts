@@ -1,4 +1,5 @@
 import type { PrismaClient } from "@rakazo/db";
+import { RunHistoryWriteError } from "@rakazo/db";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   currentBotMessageHop,
@@ -25,6 +26,7 @@ function deps(
     senderRunning?: boolean;
     alreadyDelivered?: unknown;
     targetArchived?: boolean;
+    requesterArchived?: boolean;
     /** Simulate a unique (threadId, clientNonce) race after both retries miss. */
     uniqueConflictOnCommit?: boolean;
     transactionConflictOnce?: boolean;
@@ -47,6 +49,7 @@ function deps(
         .mockResolvedValue(options.senderRunning === false ? null : { id: "run-1" }),
       findUnique: vi.fn().mockResolvedValue({ status: "running" }),
       create: vi.fn().mockResolvedValue({ id: "run-2" }),
+      updateMany: vi.fn().mockResolvedValue({ count: 1 }),
     },
     bot: {
       findFirst: vi.fn().mockResolvedValue(options.targetArchived ? null : { id: "bot-target" }),
@@ -63,6 +66,7 @@ function deps(
   let transactionAttempts = 0;
   const prisma = {
     bot: {
+      findFirst: vi.fn().mockResolvedValue(options.requesterArchived ? null : { id: "bot-target" }),
       findMany: vi
         .fn()
         .mockResolvedValue(
@@ -135,6 +139,34 @@ describe("messaging another bot", () => {
       ),
     ).toHaveLength(0);
     expect(harness.enqueue).toHaveBeenCalledTimes(1);
+  });
+
+  it("puts sent files on the recipient's message, and only the text in the sender's echo", async () => {
+    const harness = deps();
+    const file = {
+      kind: "file" as const,
+      artifactId: "artifact-zip",
+      name: "project.zip",
+      mimeType: "application/zip",
+      size: 19_000,
+    };
+    const sent = await messageBot(harness.deps, run, sender, {
+      bot_id: "bot-target",
+      message: "deploy this",
+      files: [file],
+    });
+
+    expect(sent).toMatchObject({ ok: true });
+    const created = harness.tx.message.create.mock.calls.map(
+      ([call]) => (call as { data: { threadId: string; blocks: Array<{ kind: string }> } }).data,
+    );
+    expect(created.find((m) => m.threadId === "thread-sender")?.blocks).toEqual([
+      expect.objectContaining({ kind: "bot_message_sent" }),
+    ]);
+    expect(created.find((m) => m.threadId === "thread-target")?.blocks).toEqual([
+      expect.objectContaining({ kind: "bot_message_received" }),
+      file,
+    ]);
   });
 
   it("marks a forced failure return unread on both sides", async () => {
@@ -224,6 +256,26 @@ describe("messaging another bot", () => {
       message: "hello",
     });
     expect(sent).toMatchObject({ ok: false });
+    expect(harness.enqueue).not.toHaveBeenCalled();
+  });
+
+  it("does not deliver from an attempt a newer claim superseded", async () => {
+    const harness = deps();
+    harness.tx.run.findUnique.mockResolvedValue({
+      status: "running",
+      leaseOwner: "worker-2",
+      leaseFence: 2,
+    });
+    await expect(
+      messageBot(
+        { ...harness.deps, runLease: { runId: run.id, owner: "worker-1", fence: 1 } },
+        run,
+        sender,
+        { bot_id: "bot-target", message: "hello" },
+      ),
+    ).rejects.toBeInstanceOf(RunHistoryWriteError);
+    expect(harness.tx.message.create).not.toHaveBeenCalled();
+    expect(harness.tx.run.create).not.toHaveBeenCalled();
     expect(harness.enqueue).not.toHaveBeenCalled();
   });
 
@@ -615,6 +667,10 @@ describe("hardening", () => {
     });
     expect(sent.ok).toBe(true);
     expect(harness.deps.prisma.$transaction).toHaveBeenCalledTimes(2);
+    // The retried delivery keeps the thread-lock budget.
+    expect(harness.deps.prisma.$transaction).toHaveBeenLastCalledWith(expect.any(Function), {
+      timeout: 20_000,
+    });
     expect(harness.enqueue).toHaveBeenCalledOnce();
   });
 });
@@ -741,5 +797,44 @@ describe("automatic outcome return", () => {
     expect(returned).toBe(true);
     expect(harness.enqueue).not.toHaveBeenCalled();
     expect(harness.deps.prisma.run.updateMany).toHaveBeenCalled();
+  });
+
+  it("counts the outcome as returned once the requesting bot is archived", async () => {
+    const harness = deps({
+      requesterArchived: true,
+      hopBlocks: [
+        {
+          kind: "bot_message_received",
+          fromBotId: "bot-target",
+          fromBotName: "Coordinator",
+          text: "research this",
+          hop: 1,
+          intent: "request",
+          returnToMessageId: "message-request",
+        },
+      ],
+    });
+
+    const returned = await returnBotMessageOutcome(
+      harness.deps,
+      { ...run, sourceMessageId: "message-source" },
+      sender,
+      "The answer is 42.",
+    );
+
+    expect(returned).toBe(true);
+    expect(harness.deps.prisma.bot.findFirst).toHaveBeenCalledWith({
+      where: { id: "bot-target", spaceId: run.spaceId, archivedAt: null },
+      select: { id: true },
+    });
+    expect(harness.enqueue).not.toHaveBeenCalled();
+    expect(harness.deps.prisma.run.updateMany).toHaveBeenCalledWith({
+      where: {
+        id: run.id,
+        status: { in: ["completed", "failed", "cancelled"] },
+        botOutcomeReturnedAt: null,
+      },
+      data: { botOutcomeReturnedAt: expect.any(Date) },
+    });
   });
 });

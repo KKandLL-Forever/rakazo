@@ -30,6 +30,17 @@ describe("ResendEmailProvider", () => {
     }
   });
 
+  it("sends the configured reply-to address", async () => {
+    const request = vi.fn<typeof fetch>().mockResolvedValue(Response.json({ id: "email-1" }));
+    await new ResendEmailProvider(
+      { ...config, replyTo: "founder@example.test" },
+      { fetch: request },
+    ).send(message);
+    expect(JSON.parse(request.mock.calls[0]![1]!.body as string)).toMatchObject({
+      reply_to: "founder@example.test",
+    });
+  });
+
   it("gives separate deliveries different keys", async () => {
     const request = vi
       .fn<typeof fetch>()
@@ -54,6 +65,33 @@ describe("ResendEmailProvider", () => {
     },
   );
 
+  it("names Resend's validation error without the recipient", async () => {
+    const request = vi.fn<typeof fetch>().mockResolvedValue(
+      Response.json(
+        {
+          statusCode: 422,
+          name: "validation_error",
+          message: "Invalid `to` field: user@example.test",
+        },
+        { status: 422 },
+      ),
+    );
+    await expect(provider(request).send(message)).rejects.toThrow(
+      /^Resend email request failed \(HTTP 422: validation_error: Invalid `to` field: <address>\)$/,
+    );
+  });
+
+  it("does not read an oversized error body", async () => {
+    const request = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(
+        Response.json({ name: "validation_error", message: "x".repeat(10_000) }, { status: 422 }),
+      );
+    await expect(provider(request).send(message)).rejects.toThrow(
+      /^Resend email request failed \(HTTP 422\)$/,
+    );
+  });
+
   it("bounds retries and strips network errors", async () => {
     const request = vi.fn<typeof fetch>().mockRejectedValue(new Error("private credentials"));
     await expect(provider(request).send(message)).rejects.toThrow(/^Resend email request failed$/);
@@ -65,6 +103,17 @@ describe("ResendEmailProvider", () => {
       .fn<typeof fetch>()
       .mockImplementation(async () => Response.json({ error: "private" }));
     await expect(provider(request).send(message)).rejects.toThrow("invalid email response");
+  });
+
+  it("does not read an oversized success body", async () => {
+    const response = () =>
+      Response.json({ id: "email_1" }, { headers: { "content-length": String(1024 * 1024) } });
+    const responses = [response(), response(), response()];
+    const request = vi.fn<typeof fetch>();
+    for (const sent of responses) request.mockResolvedValueOnce(sent);
+    const cancels = responses.map((sent) => vi.spyOn(sent.body!, "cancel"));
+    await expect(provider(request).send(message)).rejects.toThrow(/^Resend email request failed$/);
+    for (const cancel of cancels) expect(cancel).toHaveBeenCalledOnce();
   });
 
   it("bounds a stalled response body and drains without accepting new sends", async () => {

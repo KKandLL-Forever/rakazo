@@ -1,4 +1,5 @@
 import type { AgentUsage, ModelUsageLookup } from "@rakazo/adapter-kit";
+import { readBoundedJsonResponse } from "@rakazo/core";
 import { z } from "zod";
 
 /** Attribution is restricted to OpenRouter inference endpoints, never compatible/custom hosts. */
@@ -27,11 +28,14 @@ export function openRouterInferenceFetch(fetcher: typeof fetch, userId?: string)
   };
 }
 
+const MAX_USAGE_RESPONSE_BYTES = 64 * 1024;
 const tokens = z.number().int().nonnegative().nullable().optional();
 const generationSchema = z.object({
   data: z.object({
     id: z.string(),
     total_cost: z.number().finite().nonnegative().nullable(),
+    is_byok: z.boolean().nullable().optional(),
+    upstream_inference_cost: z.number().finite().nonnegative().nullable().optional(),
     native_tokens_prompt: tokens,
     native_tokens_completion: tokens,
     native_tokens_cached: tokens,
@@ -56,9 +60,13 @@ export class OpenRouterUsageLookup implements ModelUsageLookup {
     );
     if (response.status === 404) return null;
     if (!response.ok) throw new Error(`OpenRouter usage lookup failed (${response.status})`);
-    const { data } = generationSchema.parse(await response.json());
+    const { data } = generationSchema.parse(
+      await readBoundedJsonResponse(response, MAX_USAGE_RESPONSE_BYTES),
+    );
     if (data.id !== providerRequestId) throw new Error("Provider returned a different generation");
-    if (data.total_cost === null) return null;
+    // A bring-your-own-key generation's total is only OpenRouter's fee.
+    const upstreamCost = data.is_byok ? data.upstream_inference_cost : 0;
+    if (data.total_cost === null || upstreamCost == null) return null;
     return {
       providerRequestId: data.id,
       inputTokens:
@@ -72,7 +80,7 @@ export class OpenRouterUsageLookup implements ModelUsageLookup {
       outputTokens: data.native_tokens_completion ?? null,
       cacheReadTokens: data.native_tokens_cached ?? null,
       reasoningTokens: data.native_tokens_reasoning ?? null,
-      costUsd: data.total_cost,
+      costUsd: data.total_cost + upstreamCost,
       costSource: "provider-reported",
       usageSource: "provider-reconciled",
     };

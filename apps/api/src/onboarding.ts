@@ -11,6 +11,7 @@ import {
   appendEventInTransaction,
   createThreadMessageInTransaction,
   IsolationError,
+  THREAD_LOCK_TRANSACTION_OPTIONS,
 } from "@rakazo/db";
 import { requireBotThread } from "./bot-thread.js";
 import { resolveThreadTarget } from "./thread-target.js";
@@ -103,9 +104,8 @@ export async function startOnboarding(
   const { thread } = await requireBotThread(deps, actor, botId);
   const existing = await deps.prisma.message.count({ where: { threadId: thread.id } });
   if (existing > 0) return;
-  // Fresh chats start empty (same as web). The focus card is posted later via
-  // promptFocus so non-first bots can wait ~10s for free typing, or skip if the
-  // user already engaged.
+  // The focus card is posted later via promptFocus so non-first bots can wait ~10s for
+  // free typing, or skip if the user already engaged.
 }
 
 /** A focus card, or a question the bot asked itself; either way the thread already asks. */
@@ -134,7 +134,6 @@ export async function promptFocus(
   // Check + insert + event in one transaction so concurrent promptFocus calls
   // cannot duplicate cards, and a concurrent user send cannot publish first.
   const committed = await deps.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
-    // Serialize concurrent promptFocus callers on this thread before the gate check.
     await tx.$executeRaw`SELECT id FROM threads WHERE id = ${thread.id} FOR UPDATE`;
     const recent = await tx.message.findMany({
       where: { threadId: thread.id },
@@ -154,12 +153,6 @@ export async function promptFocus(
       select: { id: true },
     });
     if (intro) return null;
-    // An imported agent already has a role.
-    const imported = await tx.agentImport.findFirst({
-      where: { botId: bot.id },
-      select: { id: true },
-    });
-    if (imported) return null;
     const message = await createThreadMessageInTransaction(tx, {
       threadId: target.threadId,
       role: "bot",
@@ -174,7 +167,7 @@ export async function promptFocus(
       payload: { messageId: message.id, role: "bot", blocks },
     });
     return { message, event };
-  });
+  }, THREAD_LOCK_TRANSACTION_OPTIONS);
   if (!committed) return;
   await deps.events.notify(target.threadId, committed.event.seq);
 }
@@ -210,7 +203,7 @@ export async function dismissFocus(
       payload: { messageId: pending.id, role: "bot", blocks },
     });
     return { messageId: pending.id, blocks, event };
-  });
+  }, THREAD_LOCK_TRANSACTION_OPTIONS);
   if (!claimed) return;
   await deps.events.notify(target.threadId, claimed.event.seq);
 }
@@ -248,7 +241,7 @@ export async function chooseFocus(
       payload: { messageId: pending.id, role: "bot", blocks },
     });
     return { messageId: pending.id, blocks, event };
-  });
+  }, THREAD_LOCK_TRANSACTION_OPTIONS);
   if (!claimed) return;
   await deps.events.notify(target.threadId, claimed.event.seq);
 
@@ -392,7 +385,7 @@ export async function markAppConnected(
       );
     }
     return events;
-  });
+  }, THREAD_LOCK_TRANSACTION_OPTIONS);
   for (const event of updates) await deps.events.notify(thread.id, event.seq);
 }
 

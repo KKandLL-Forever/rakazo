@@ -9,6 +9,7 @@ import { sendThreadMessage } from "./thread-target.js";
 function fixture(group = false) {
   const model = { modelProvider: "openrouter", modelId: "deepseek/deepseek-v4-pro" };
   const tx = {
+    user: { findMany: vi.fn().mockResolvedValue([]) },
     secret: { findFirst: vi.fn().mockResolvedValue({ id: "secret-1", ciphertext: "synthetic" }) },
     $queryRaw: vi.fn().mockResolvedValue([{ id: "group-1" }]),
     chatGroup: {
@@ -81,7 +82,13 @@ function fixture(group = false) {
     imageHandling: "confirm" | "file" | null = "confirm",
   ) =>
     sendThreadMessage(
-      { prisma, events: { notify } as never, jobs: { enqueue } as never, imageAdmission },
+      {
+        prisma,
+        sandbox: {} as never,
+        events: { notify } as never,
+        jobs: { enqueue } as never,
+        imageAdmission,
+      },
       { userId: "user-1", spaceId: "space-1" } as Actor,
       (group
         ? { kind: "group", groupId: "group-1", threadId: "thread-1" }
@@ -172,6 +179,105 @@ describe("current image send admission", () => {
       });
   });
 
+  it.each([true, false])(
+    "uses the Codex account catalog for a live-only model's image input (%s)",
+    async (supportsImages) => {
+      const { tx, send } = fixture();
+      tx.bot.findFirst.mockResolvedValue({
+        id: "bot-1",
+        modelProvider: "openai-codex",
+        modelId: "gpt-6.1-terra",
+      });
+      tx.userModelCredential.findFirst.mockResolvedValue({
+        id: "credential-1",
+        provider: "openai-codex",
+        secretId: "secret-1",
+        defaultModel: "gpt-6.1-terra",
+      });
+      const configuration = {
+        deployment: null,
+        secrets: {
+          load: vi.fn(async () =>
+            JSON.stringify({
+              type: "oauth",
+              access: "access-token",
+              refresh: "refresh-token",
+              expires: Date.now() + 3_600_000,
+              accountId: "acct-live",
+            }),
+          ),
+        },
+        codexCatalog: {
+          read: vi.fn(async () => [
+            {
+              slug: "gpt-6.1-terra",
+              reasoningEfforts: [],
+              supportsImages,
+              supportsFastTier: false,
+            },
+          ]),
+        },
+      };
+      if (supportsImages) {
+        await expect(send(configuration)).resolves.toMatchObject({ runId: "run-1" });
+      } else {
+        await expect(send(configuration)).rejects.toMatchObject({
+          code: "CONFLICT",
+          message: "This model cannot read images. Choose a model that supports images.",
+        });
+      }
+      expect(configuration.codexCatalog.read).toHaveBeenCalledWith(
+        "user-1",
+        expect.objectContaining({ accountId: "acct-live" }),
+        { waitMs: 0 },
+      );
+    },
+  );
+
+  it("keeps a bundled Codex model's images when the account omits input modalities", async () => {
+    const { tx, send } = fixture();
+    tx.bot.findFirst.mockResolvedValue({
+      id: "bot-1",
+      modelProvider: "openai-codex",
+      modelId: "gpt-6.1-sol",
+    });
+    tx.userModelCredential.findFirst.mockResolvedValue({
+      id: "credential-1",
+      provider: "openai-codex",
+      secretId: "secret-1",
+      defaultModel: "gpt-6.1-sol",
+    });
+    const read = vi.fn(async () => [
+      {
+        slug: "gpt-6.1-sol",
+        reasoningEfforts: [],
+        supportsFastTier: false,
+      },
+    ]);
+    await expect(
+      send({
+        deployment: null,
+        secrets: {
+          load: vi.fn(async () =>
+            JSON.stringify({
+              type: "oauth",
+              access: "access-token",
+              refresh: "refresh-token",
+              expires: Date.now() + 3_600_000,
+              accountId: "acct-live",
+            }),
+          ),
+        },
+        codexCatalog: { read },
+      }),
+    ).resolves.toMatchObject({ runId: "run-1" });
+    expect(read).toHaveBeenCalledWith(
+      "user-1",
+      expect.objectContaining({ accountId: "acct-live" }),
+      { waitMs: 0 },
+    );
+  });
+
   it("asks to configure image input for a legacy custom connection that never set it", async () => {
     const { tx, send } = fixture();
     tx.bot.findFirst.mockResolvedValue({
@@ -252,6 +358,7 @@ describe("current image send admission", () => {
         taskId: "task-active",
         status: "running",
         trigger: "user",
+        userId: "user-1",
         modelProvider: "openrouter",
         modelId: "deepseek/deepseek-v4-pro",
         modelPinned: false,
@@ -338,6 +445,7 @@ describe("current image send admission", () => {
         taskId: "task-waiting",
         status: "waiting_input",
         trigger: "routine",
+        userId: "user-1",
         modelProvider: "openrouter",
         modelId: "deepseek/deepseek-v4-pro",
         modelPinned: true,
@@ -360,6 +468,7 @@ describe("current image send admission", () => {
           id: "obsolete",
           taskId: "obsolete-task",
           status: "waiting_input",
+          userId: "user-1",
           trigger: "routine",
           modelProvider: "openrouter",
           modelId: "deepseek/deepseek-v4-pro",

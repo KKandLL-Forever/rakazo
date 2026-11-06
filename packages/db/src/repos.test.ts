@@ -48,6 +48,26 @@ function reposFor(memoryScope: string | null) {
 }
 
 describe("createRepos.listBots", () => {
+  it.each([undefined, "organic", "rakazo"])(
+    "preserves appearance metadata on reload (set=%s)",
+    async (avatarSet) => {
+      const rows = ["#8B5CF6", "#8B5CF6::shape_3", "data:image/png;base64,aGVsbG8="].map(
+        (color, index) => ({ ...baseBot, id: `bot-${index}`, color, avatarSet }),
+      );
+      const prisma = {
+        bot: { findMany: vi.fn(async () => rows) },
+        run: { findMany: vi.fn(async () => []) },
+        $queryRaw: vi.fn(async () => []),
+      };
+      const bots = await createRepos(prisma as unknown as PrismaClient).listBots(actor);
+      expect(
+        bots.map((bot) => ({ id: bot.id, color: bot.color, avatarSet: bot.avatarSet })),
+      ).toEqual(
+        rows.map((row) => ({ id: row.id, color: row.color, avatarSet: avatarSet ?? "organic" })),
+      );
+    },
+  );
+
   it("surfaces a failed foreground run and clears the signal after recovery", async () => {
     const findMany = vi.fn(async () => [baseBot]);
     const queryRaw = vi.fn(async () => [] as unknown[]);
@@ -421,8 +441,8 @@ describe("createRepos.listSpaceBotsForSpaces", () => {
         id: "bot-2",
         spaceId: "ws-2",
         name: "Support",
-        title: "Customer support",
         color: "#123456",
+        avatarSet: "organic",
         notifyOnFinish: false,
         pinned: true,
         sectionId: null,
@@ -433,7 +453,7 @@ describe("createRepos.listSpaceBotsForSpaces", () => {
           unread: true,
           runs: [{ id: "run-failed", status: "failed" }],
         },
-        runs: [{ status: "running" }],
+        runs: [{ status: "running", threadId: "group-thread" }],
       },
     ]);
     const repos = createRepos({
@@ -458,13 +478,14 @@ describe("createRepos.listSpaceBotsForSpaces", () => {
         ]),
     } as unknown as PrismaClient);
 
-    await expect(repos.listSpaceBotsForSpaces(actor, ["ws-2"])).resolves.toEqual([
+    await expect(repos.listSpaceBotsForSpaces(["ws-2"])).resolves.toEqual([
       {
         id: "bot-2",
         spaceId: "ws-2",
         name: "Support",
-        title: "Customer support",
+        title: "",
         color: "#123456",
+        avatarSet: "organic",
         notifyOnFinish: false,
         pinned: true,
         sectionId: null,
@@ -472,6 +493,7 @@ describe("createRepos.listSpaceBotsForSpaces", () => {
         parentBotId: null,
         preview: "Waiting for a reply",
         status: "running",
+        threadStatus: "idle",
         runErrorId: "run-failed",
         updatedAt: "2026-08-19T12:00:00.000Z",
       },
@@ -484,9 +506,7 @@ describe("createRepos.listSpaceBotsForSpaces", () => {
         }),
       }),
     );
-    expect(query.where).toEqual(
-      expect.objectContaining({ spaceId: { in: ["ws-2"] }, userId: actor.userId }),
-    );
+    expect(query.where).toEqual(expect.objectContaining({ spaceId: { in: ["ws-2"] } }));
     expect(query.select).not.toHaveProperty("description");
     expect(query.select).not.toHaveProperty("instructions");
     expect(query.select).not.toHaveProperty("computer");

@@ -87,6 +87,16 @@ describe("OpenRouter attribution and usage recovery", () => {
       totalTokens: 120,
     });
   });
+  it("adds the upstream cost of a bring-your-own-key generation and waits when it is missing", async () => {
+    const generation = (upstream_inference_cost: number | null) =>
+      new OpenRouterUsageLookup("fixture", async () =>
+        Response.json({
+          data: { id: "gen-fixture", total_cost: 0.0001, is_byok: true, upstream_inference_cost },
+        }),
+      ).lookupUsage("gen-fixture");
+    expect((await generation(0.002))?.costUsd).toBeCloseTo(0.0021);
+    await expect(generation(null)).resolves.toBeNull();
+  });
   it("never treats missing usage as free and rejects mismatched generation ids", async () => {
     await expect(
       new OpenRouterUsageLookup(
@@ -99,5 +109,16 @@ describe("OpenRouter attribution and usage recovery", () => {
         Response.json({ data: { id: "other", total_cost: 0 } }),
       ).lookupUsage("gen_fixture"),
     ).rejects.toThrow("different generation");
+  });
+  it("refuses an oversized usage response without reading it", async () => {
+    const response = Response.json(
+      { data: { id: "gen_fixture", total_cost: 0.01, is_byok: false } },
+      { headers: { "content-length": String(1024 * 1024 * 1024) } },
+    );
+    const cancel = vi.spyOn(response.body!, "cancel");
+    await expect(
+      new OpenRouterUsageLookup("fixture", async () => response).lookupUsage("gen_fixture"),
+    ).rejects.toThrow();
+    expect(cancel).toHaveBeenCalledOnce();
   });
 });

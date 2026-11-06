@@ -57,7 +57,12 @@ async function runAfterFill(
     origin: "https://login.example.test",
     auth: { type: "login" },
     ...(await secretStore.put(
-      encodeLoginSecret({ username: USERNAME, password: PASSWORD }),
+      encodeLoginSecret({
+        fields: [
+          { label: "Username", value: USERNAME, hidden: false },
+          { label: "Password", value: PASSWORD, hidden: true },
+        ],
+      }),
       { ...scope, operationId: "test", traceId: "test", signal: new AbortController().signal },
       { recordId: "login-1" },
     )),
@@ -90,6 +95,9 @@ async function runAfterFill(
     yield { type: "done" as const, text: reply };
   });
   const prisma = {
+    spaceMember: { findUnique: async () => ({ id: "member-1" }) },
+    $transaction: vi.fn(async (write: (tx: unknown) => unknown) => write(prisma)),
+    $queryRaw: vi.fn(async () => []),
     run: {
       findUnique: vi.fn(async () => run),
       findUniqueOrThrow: vi.fn(async () => run),
@@ -140,7 +148,14 @@ async function runAfterFill(
       count: vi.fn(async () => 0),
     },
     task: { findUniqueOrThrow: vi.fn(async () => ({ id: run.taskId, prompt: "Check the site" })) },
-    computer: { updateMany: vi.fn(async () => ({ count: 1 })) },
+    computer: {
+      updateMany: vi.fn(async () => ({ count: 1 })),
+      findFirst: vi.fn(async () => ({
+        state: "running",
+        restorePending: false,
+        screenGeneration: 0,
+      })),
+    },
     deploymentSettings: {
       findUnique: vi.fn(async () => ({
         defaultModelProvider: "openrouter",

@@ -23,7 +23,6 @@ type FakeBot = {
   modelProvider?: string | null;
   modelId?: string | null;
   thinkingLevel?: string | null;
-  title?: string;
   description?: string;
   pinned?: boolean;
   section?: { name: string } | null;
@@ -34,6 +33,7 @@ type FakeGroup = {
   id: string;
   name: string;
   memberIds: string[];
+  spaceId?: string;
   userId?: string;
   archivedAt?: Date | null;
   pinned?: boolean;
@@ -73,7 +73,6 @@ function fakeFleet(input: {
     archivedAt: null,
     modelProvider: null,
     modelId: null,
-    title: "",
     description: "",
     pinned: false,
     section: null,
@@ -147,6 +146,7 @@ function fakeFleet(input: {
     },
     userModelPreference: { findMany: vi.fn(async () => input.credentials ?? []) },
     userModelCredential: { findMany: vi.fn(async () => []) },
+    secret: { findMany: vi.fn(async () => []) },
   };
   const deps: FleetPrepareDeps = {
     prisma: prisma as unknown as PrismaClient,
@@ -187,7 +187,7 @@ const fleet = {
     { id: "bot-twin-1", name: "Twin" },
     { id: "bot-twin-2", name: "Twin" },
     { id: "bot-ghost", name: "Ghost", parentBotId: "bot-self", archivedAt: new Date(0) },
-    { id: "bot-foreign", name: "Stranger", userId: "user-2" },
+    { id: "bot-foreign", name: "Stranger", spaceId: "space-2" },
   ],
   groups: [
     { id: "group-launch", name: "Launch", memberIds: ["bot-self", "bot-scout", "bot-ops"] },
@@ -247,7 +247,22 @@ describe("prepareFleetRequest create_group", () => {
     ).toEqual({ ok: false, error: 'More than one bot is named "Twin". Pass bot_id instead.' });
   });
 
-  it("never resolves archived bots or bots of another user", async () => {
+  it("resolves a bot another member of the space created", async () => {
+    const { deps } = fakeFleet({
+      bots: [
+        { id: "bot-scout", name: "Scout" },
+        { id: "bot-shared", name: "Partner", userId: "user-2" },
+      ],
+    });
+    expect(
+      await prepareFleetRequest(deps, run, "create_group", {
+        name: "Crew",
+        bot_names: ["Scout", "Partner"],
+      }),
+    ).toMatchObject({ ok: true, canonical: { botIds: ["bot-scout", "bot-shared"] } });
+  });
+
+  it("never resolves archived bots or bots of another space", async () => {
     const { deps } = fakeFleet(fleet);
     expect(
       await prepareFleetRequest(deps, run, "create_group", {
@@ -425,6 +440,18 @@ describe("prepareFleetRequest set_child_bot_model", () => {
     });
   });
 
+  it("names the provider to connect when no connected model matches a loose name", async () => {
+    const { deps } = fakeFleet(fleet);
+    const prepared = await prepareFleetRequest(deps, run, "set_child_bot_model", {
+      bot_id: "bot-scout",
+      model: "Claude Sonnet",
+    });
+    expect(prepared).toMatchObject({
+      ok: false,
+      error: expect.stringMatching(/^No connected model matches "Claude Sonnet"\. .*Anthropic/),
+    });
+  });
+
   it("uses catalog display names on the card", async () => {
     const { deps } = fakeFleet({
       bots: fleet.bots.map((bot) =>
@@ -552,6 +579,8 @@ describe("prepareFleetRequest create_child_routine", () => {
         name: "Morning brief",
         prompt: "Summarize the news",
         timezone: "UTC",
+        // The account's zone is re-read when the approved routine is created.
+        timezoneFromAccount: true,
         schedule: { runAt: "2026-10-18T09:30:00.000Z" },
       },
       summary: {
@@ -574,6 +603,12 @@ describe("prepareFleetRequest create_child_routine", () => {
     expect(prepared).toMatchObject({
       ok: true,
       canonical: { timezone: "Europe/Bucharest", schedule: { cron: expect.any(String) } },
+      // A named zone is pinned: it replays as approved, not re-read from the account.
+    });
+    expect((prepared as { canonical: Record<string, unknown> }).canonical).not.toHaveProperty(
+      "timezoneFromAccount",
+    );
+    expect(prepared).toMatchObject({
       summary: {
         lines: [
           expect.stringMatching(/^Repeats .+, next at .+ Europe\/Bucharest$/),
@@ -593,7 +628,11 @@ describe("prepareFleetRequest create_child_routine", () => {
     });
     expect(prepared).toMatchObject({
       ok: true,
-      canonical: { timezone: "Europe/Paris", schedule: { cron: "0 9 * * *" } },
+      canonical: {
+        timezone: "Europe/Paris",
+        timezoneFromAccount: true,
+        schedule: { cron: "0 9 * * *" },
+      },
       summary: {
         lines: ["Repeats 0 9 * * *, next at 19 Oct 2026, 09:00 Europe/Paris", expect.any(String)],
       },
@@ -918,12 +957,12 @@ describe("listFleet", () => {
     });
   });
 
-  it("lists only the user's active bots and groups and flags the bots the caller created", async () => {
+  it("lists only the space's active bots and groups and flags the bots the caller created", async () => {
     const { deps } = fakeFleet({
       ...fleet,
       bots: fleet.bots.map((bot) =>
         bot.id === "bot-scout"
-          ? { ...bot, title: "Scout\nlead", pinned: true, section: { name: "Research" } }
+          ? { ...bot, description: "Finds\nleads", pinned: true, section: { name: "Research" } }
           : bot,
       ),
       groups: [
@@ -949,7 +988,6 @@ describe("listFleet", () => {
         {
           id: "bot-self",
           name: "Designer",
-          title: "",
           description: "",
           section: null,
           pinned: false,
@@ -958,8 +996,7 @@ describe("listFleet", () => {
         {
           id: "bot-scout",
           name: "Scout",
-          title: "Scout lead",
-          description: "",
+          description: "Finds\nleads",
           section: "Research",
           pinned: true,
           createdByMe: true,
@@ -1098,7 +1135,7 @@ describe("organizeBot refusals", () => {
       ...fleet,
       groups: [
         ...fleet.groups,
-        { id: "group-foreign", name: "Theirs", memberIds: ["bot-foreign"], userId: "user-2" },
+        { id: "group-foreign", name: "Theirs", memberIds: ["bot-foreign"], spaceId: "space-2" },
       ],
     });
     const fleetDeps = {
@@ -1143,7 +1180,7 @@ describe("organizeBot refusals", () => {
     });
   });
 
-  it("cannot target a bot or group of another user in the same space", async () => {
+  it("cannot target a bot or group of another space", async () => {
     expect(await organize({ bot_name: "Stranger", pinned: true })).toEqual({
       error: 'No bot named "Stranger". Call list_fleet and pass bot_id.',
     });
@@ -1183,12 +1220,12 @@ describe("updateChildBot", () => {
         expected_version: "version-2",
       }),
     ).toEqual({
-      error: "Provide at least one of name, title, description, notify_on_finish, or color.",
+      error: "Change another bot's instructions with set_child_instructions.",
     });
     expect(prisma.$transaction).not.toHaveBeenCalled();
   });
 
-  it.each(["name", "title", "description"])(
+  it.each(["name", "description"])(
     "refuses a %s that contains a credential of this run",
     async (field) => {
       const { prisma } = fakeFleet({ bots });
@@ -1202,7 +1239,7 @@ describe("updateChildBot", () => {
     },
   );
 
-  it.each(["name", "title", "description", "artifact_id", "color"])(
+  it.each(["name", "description", "artifact_id", "color", "dailyCheckIns"])(
     "omits blank %s while preserving a real update",
     async (field) => {
       const { prisma } = fakeFleet({ bots });
@@ -1212,7 +1249,6 @@ describe("updateChildBot", () => {
           update: vi.fn().mockResolvedValue({
             id: "bot-child",
             name: "Child",
-            title: "Original",
             description: "Original",
           }),
         },
@@ -1233,12 +1269,44 @@ describe("updateChildBot", () => {
     },
   );
 
+  it.each([true, false])("writes boolean dailyCheckIns: %j", async (dailyCheckIns) => {
+    const { prisma } = fakeFleet({ bots });
+    const update = vi.fn().mockRejectedValue(new Error("write reached"));
+    prisma.$transaction.mockImplementation(async (write) =>
+      write({
+        $queryRaw: vi.fn(),
+        bot: { update },
+      }),
+    );
+    await expect(
+      updateChildBot(writeDeps(prisma), run, {
+        bot_id: "bot-child",
+        dailyCheckIns,
+      }),
+    ).rejects.toThrow("write reached");
+    expect(update).toHaveBeenCalledWith(expect.objectContaining({ data: { dailyCheckIns } }));
+  });
+
+  it.each(["true", "false", 0, 1, {}, []])(
+    "rejects non-boolean dailyCheckIns: %j",
+    async (value) => {
+      const { prisma } = fakeFleet({ bots });
+      expect(
+        await updateChildBot(writeDeps(prisma), run, {
+          bot_id: "bot-child",
+          dailyCheckIns: value,
+        }),
+      ).toEqual({ error: "dailyCheckIns must be true or false." });
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    },
+  );
+
   it("reuses the profile validation of update_bot", async () => {
     const { prisma } = fakeFleet({ bots });
     expect(
       await updateChildBot(writeDeps(prisma), run, { bot_id: "bot-child", name: "   " }),
     ).toEqual({
-      error: "Provide at least one of name, title, description, notify_on_finish, or color.",
+      error: "Provide at least one of name, description, notify_on_finish, or color.",
     });
     expect(
       await updateChildBot(writeDeps(prisma), run, { bot_id: "bot-child", color: "red" }),
@@ -1553,6 +1621,106 @@ describe("createChildRoutine", () => {
     expect(prisma.routine.create).not.toHaveBeenCalled();
   });
 
+  it("does not replay an account-derived request onto an unrelated pinned routine", async () => {
+    // Same bot, thread, prompt and cron, but pinned to another zone: the replay of an
+    // account-derived request must look at the account's current zone, not match any
+    // zone, or it would silently return the pinned routine's id and schedule.
+    const { prisma } = fakeFleet({ ...fleet, timezone: "Europe/London" });
+    const created: Array<Record<string, unknown>> = [
+      {
+        id: "routine-pinned",
+        spaceId: "space-1",
+        userId: "user-1",
+        botId: "bot-writer",
+        threadId: "thread-bot-writer",
+        name: "Daily",
+        prompt: "Check in",
+        crons: ["0 9 * * *"],
+        timezone: "America/New_York",
+        active: true,
+        nextRunAt: new Date("2026-10-18T13:00:00Z"),
+      },
+    ];
+    prisma.$transaction.mockImplementation(async (work: (client: unknown) => Promise<unknown>) =>
+      work(prisma),
+    );
+    (prisma as { $queryRaw?: unknown }).$queryRaw = vi.fn(async (strings: TemplateStringsArray) =>
+      strings.join("?").includes("FOR SHARE") ? [{ timezone: "Europe/London" }] : [],
+    );
+    const sameAs = (row: Record<string, unknown>, where: Record<string, unknown>) =>
+      Object.entries(where).every(([key, value]) =>
+        value && typeof value === "object" && "equals" in value
+          ? JSON.stringify(row[key]) === JSON.stringify(value.equals)
+          : row[key] === value,
+      );
+    (prisma.routine as { findFirst: unknown }).findFirst = vi.fn(
+      async ({ where }: { where: Record<string, unknown> }) =>
+        created.find((row) => sameAs(row, where)) ?? null,
+    );
+    prisma.routine.create.mockImplementation(
+      async ({ data }: { data: Record<string, unknown> }) => {
+        const row = { id: `routine-${created.length + 1}`, active: true, ...data };
+        created.push(row);
+        return row;
+      },
+    );
+
+    const approved = { ...canonical, timezone: "Africa/Cairo", timezoneFromAccount: true };
+    const result = await createChildRoutine(writeDeps(prisma), run, approved);
+    expect(result).toMatchObject({ ok: true, routineId: "routine-2" });
+    expect(created[1]).toMatchObject({ timezone: "Europe/London" });
+    expect(created[0]).toMatchObject({ id: "routine-pinned", timezone: "America/New_York" });
+  });
+
+  it("replays to the same routine after the account zone changed", async () => {
+    // Approved while the account sat in one zone, created in a later one: the replay
+    // lookup must not match on the approval's zone, or it would create a duplicate.
+    const { prisma } = fakeFleet({ ...fleet, timezone: "Europe/London" });
+    const created: Array<Record<string, unknown>> = [];
+    prisma.$transaction.mockImplementation(async (work: (client: unknown) => Promise<unknown>) =>
+      work(prisma),
+    );
+    (prisma as { $queryRaw?: unknown }).$queryRaw = vi.fn(async (strings: TemplateStringsArray) =>
+      strings.join("?").includes("FOR SHARE") ? [{ timezone: "Europe/London" }] : [],
+    );
+    const sameAs = (row: Record<string, unknown>, where: Record<string, unknown>) =>
+      Object.entries(where).every(([key, value]) =>
+        value && typeof value === "object" && "equals" in value
+          ? JSON.stringify(row[key]) === JSON.stringify(value.equals)
+          : row[key] === value,
+      );
+    (prisma.routine as { findFirst: unknown }).findFirst = vi.fn(
+      async ({ where }: { where: Record<string, unknown> }) =>
+        created.find((row) => sameAs(row, where)) ?? null,
+    );
+    prisma.routine.create.mockImplementation(
+      async ({ data }: { data: Record<string, unknown> }) => {
+        const row = { id: `routine-${created.length + 1}`, active: true, ...data };
+        created.push(row);
+        return row;
+      },
+    );
+
+    const approved = { ...canonical, timezone: "Africa/Cairo", timezoneFromAccount: true };
+    const first = await createChildRoutine(writeDeps(prisma), run, approved);
+    expect(first).toMatchObject({ ok: true, routineId: "routine-1" });
+    // Created in the account's current zone, not the one the approval froze.
+    expect(created[0]).toMatchObject({ timezone: "Europe/London" });
+
+    const replay = await createChildRoutine(writeDeps(prisma), run, approved);
+    expect(replay).toMatchObject({
+      ok: true,
+      routineId: "routine-1",
+      name: "Daily",
+      cron: "0 9 * * *",
+      nextRunAt: "2026-10-19T08:00:00.000Z",
+      oneShot: false,
+      botId: "bot-writer",
+      botName: "Writer",
+    });
+    expect(prisma.routine.create).toHaveBeenCalledTimes(1);
+  });
+
   it("creates the routine in the child's thread and rolls it back if enqueueing fails", async () => {
     const { prisma } = fakeFleet(fleet);
     const deps = writeDeps(prisma);
@@ -1627,8 +1795,9 @@ describe("space bot management", () => {
     ).toMatchObject({ ok: true });
   });
 
-  it.each([{ spaceId: "another-space" }, { userId: "another-user" }])(
-    "refuses management outside the current account and space (%j)",
+  // A teammate's bot in the same shared space is in scope; another space's is not.
+  it.each([{ spaceId: "another-space" }])(
+    "refuses management outside the current space (%j)",
     async (scope) => {
       const { deps, prisma } = fakeFleet({ bots: [{ ...target, ...scope }] });
       for (const [tool, args] of requests) {

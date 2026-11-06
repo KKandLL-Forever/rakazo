@@ -219,7 +219,7 @@ export function narrateTool(toolName: string): string | null {
     [/^set_child_instructions$/, "rewriting a bot's instructions"],
     [/^set_child_bot_model$/, "setting a bot's model"],
     [/^create_child_routine$/, "scheduling a routine"],
-    [/^(archive_bot|delete_bot)$/, "archiving a bot"],
+    [/^archive_bot$/, "archiving a bot"],
     [/^remember$/, "writing a memory"],
     [/^save_shared_memory$/, "saving shared memory"],
     [/^attach_file$/, "attaching a file"],
@@ -255,14 +255,19 @@ export function speechFromBlocks(blocks: MessageBlock[]): string {
     .join("\n");
 }
 
-const YES = /^(yes|yeah|yep|yup|ok|okay|sure|do it|go ahead|approve|confirmed|affirmative)\b/i;
-const NO = /^(no|nope|nah|cancel|stop|don't|do not|reject|deny|negative)\b/i;
+// Without its accent "si" is Spanish for "if", so only "sí" says yes. `\b` only knows
+// ASCII letters, so a word ends wherever no letter or digit follows.
+const YES =
+  /^¡?(yes|yeah|yep|yup|ok|okay|sure|do it|go ahead|approve|confirmed|affirmative|sí|vale|okey|de acuerdo|adelante|hazlo|confirmo|aprobado)(?![\p{L}\p{N}])/iu;
+const NO =
+  /^¡?(no|nope|nah|cancel|stop|don't|do not|reject|deny|negative|cancela|cancelar|cancélalo|rechaza|rechazado|mejor no|detente)(?![\p{L}\p{N}])/iu;
 
 /** Consent must never be inferred from a sentence that merely contained "sure". */
 export function spokenDecision(transcript: string): "yes" | "no" | null {
   const text = transcript.trim();
-  if (!text) return null;
-  if (YES.test(text) && text.split(/\s+/).length <= 6) return "yes";
-  if (NO.test(text) && text.split(/\s+/).length <= 6) return "no";
+  // A question ("¿Sí? ¿Cuáles?") is not an answer.
+  if (!text || /[?¿]/.test(text) || text.split(/\s+/).length > 6) return null;
+  if (YES.test(text)) return "yes";
+  if (NO.test(text)) return "no";
   return null;
 }

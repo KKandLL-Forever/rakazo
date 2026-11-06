@@ -5,16 +5,25 @@ type Props = {
   size?: "md" | "sm";
   external?: boolean;
   "data-attr"?: string;
+  "aria-label"?: string;
 };
 
-const { href, variant = "primary", size = "md", external = false, "data-attr": dataAttr } = Astro.props;
+const {
+  href,
+  variant = "primary",
+  size = "md",
+  external = false,
+  "data-attr": dataAttr,
+  "aria-label": ariaLabel,
+} = Astro.props;
 ---
 
 <a
   class:list={["button", `button--${variant}`, size === "sm" && "button--small"]}
   href={href}
   data-attr={dataAttr}
-  {...(external ? { target: "_blank", rel: "noreferrer" } : {})}
+  aria-label={ariaLabel}
+  {...(external ? { target: "_blank", rel: "noopener" } : {})}
 >
   <slot />
 </a>

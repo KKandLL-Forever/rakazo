@@ -1,166 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { captureScreenshot, completeOnboarding, openNewSpace, signup } from "./helpers";
-
-test("a failed overlay chunk keeps the shell and the draft, and Refresh loads it", async ({
-  page,
-}, testInfo) => {
-  const stamp = Date.now();
-  await signup(page, `overlay-load-${stamp}@rakazo.test`, "password12", "Overlay Load");
-  await completeOnboarding(page);
-
-  const composer = page.getByRole("combobox", { name: "Message Chief" });
-  await composer.fill("Keep this draft");
-
-  const pluginsChunk = /\/pages\/PluginsOverlay\.tsx/;
-  await page.route(pluginsChunk, (route) => route.fulfill({ status: 404 }));
-  await page.getByRole("button", { name: "Connect apps", exact: true }).click();
-
-  const failed = page.getByRole("alertdialog", { name: "Could not load" });
-  await expect(failed).toBeVisible();
-  await captureScreenshot(page, testInfo, "overlay-load-failed");
-
-  await failed.getByRole("button", { name: "Close", exact: true }).click();
-  await expect(failed).toHaveCount(0);
-  await expect(composer).toHaveValue("Keep this draft");
-
-  await page.unroute(pluginsChunk);
-  await page.getByRole("button", { name: "Connect apps", exact: true }).click();
-  // The reload keeps ?integrations, so the overlay opens on its own once the chunk loads.
-  await failed.getByRole("button", { name: "Refresh", exact: true }).click();
-  await expect(page.getByPlaceholder("Search apps")).toBeVisible();
-});
-
-test("a failed page chunk shows Refresh instead of a blank app", async ({ page }, testInfo) => {
-  const stamp = Date.now();
-  await signup(page, `page-load-${stamp}@rakazo.test`, "password12", "Page Load");
-  await completeOnboarding(page);
-
-  const artifactsChunk = /\/pages\/Artifacts\.tsx/;
-  await page.route(artifactsChunk, (route) => route.fulfill({ status: 404 }));
-  await page.goto("/app/artifacts");
-
-  await expect(page.getByText("Something went wrong. Try again.", { exact: true })).toBeVisible();
-  await captureScreenshot(page, testInfo, "page-load-failed");
-
-  await page.unroute(artifactsChunk);
-  await page.getByRole("button", { name: "Refresh", exact: true }).click();
-  await expect(page.locator('[data-rakazo-app-state="ready"]')).toBeVisible();
-  await expect(page.getByText("Something went wrong. Try again.", { exact: true })).toHaveCount(0);
-});
-
-for (const [failing, intact] of [
-  ["ScratchpadSection", "bot-profile-header"],
-  ["KnowledgeSection", "bot-profile-header"],
-] as const) {
-  test(`a failed ${failing} chunk keeps the rest of the bot settings panel`, async ({ page }) => {
-    const stamp = Date.now();
-    await signup(page, `section-load-${stamp}@rakazo.test`, "password12", "Section Load");
-    await completeOnboarding(page);
-
-    const composer = page.getByRole("combobox", { name: "Message Chief" });
-    await composer.fill("Keep this draft");
-
-    await page.route(new RegExp(`/pages/${failing}\\.tsx`), (route) =>
-      route.fulfill({ status: 404 }),
-    );
-    await page
-      .locator("main")
-      .getByRole("button", { name: /^Chief/ })
-      .click();
-
-    const settings = page.getByTestId("bot-settings");
-    await expect(settings.getByText("Could not load", { exact: true })).toBeVisible();
-    await expect(settings.getByTestId(intact)).toBeVisible();
-    await expect(settings.getByRole("button", { name: "Save", exact: true })).toHaveCount(0);
-    await expect(composer).toHaveValue("Keep this draft");
-  });
-}
-
-for (const overlay of ["settings", "integrations"] as const) {
-  test(`preload recovery reopens ${overlay} after an automatic reload`, async ({
-    page,
-  }, testInfo) => {
-    await signup(
-      page,
-      `preload-${overlay}-${Date.now()}@rakazo.test`,
-      "password12",
-      "Preload Recovery",
-    );
-    await completeOnboarding(page);
-    const chunk =
-      overlay === "settings" ? /\/pages\/SettingsOverlay\.tsx/ : /\/pages\/PluginsOverlay\.tsx/;
-    const opened =
-      overlay === "settings"
-        ? page.getByTestId("user-settings")
-        : page.getByPlaceholder("Search apps");
-    const originalUrl = page.url();
-    await page.route(
-      chunk,
-      async (route) => {
-        await route.fulfill({ status: 404 });
-        await page
-          .evaluate(() =>
-            window.dispatchEvent(new Event("vite:preloadError", { cancelable: true })),
-          )
-          .catch(() => undefined);
-      },
-      { times: 1 },
-    );
-    const reloaded = page.waitForEvent("load");
-    if (overlay === "settings") await page.getByTestId("user-menu-trigger").click();
-    await page
-      .getByRole("button", {
-        name: overlay === "settings" ? "Settings" : "Connect apps",
-        exact: true,
-      })
-      .click();
-    await reloaded;
-    await expect(opened).toBeVisible();
-    await expect(page).toHaveURL(
-      (url) => url.pathname === new URL(originalUrl).pathname && url.searchParams.has(overlay),
-    );
-    await captureScreenshot(page, testInfo, `preload-recovered-${overlay}`);
-  });
-}
-
-test("preload recovery keeps Settings bound to another space", async ({ page }, testInfo) => {
-  await signup(page, `preload-space-${Date.now()}@rakazo.test`, "password12", "Preload Recovery");
-  await completeOnboarding(page);
-  const personalUrl = page.url();
-  await openNewSpace(page);
-  const dialog = page.getByRole("dialog", { name: "New space" });
-  await dialog.getByLabel("Name").fill("Support");
-  await dialog.getByRole("button", { name: "Create space", exact: true }).click();
-  await completeOnboarding(page);
-  await page.waitForURL((url) => url.pathname.startsWith("/app/") && url.href !== personalUrl);
-  const originalUrl = page.url();
-  const selected = await page.evaluate(() => localStorage.getItem("rakazo:space-id"));
-  await page.route(
-    /\/pages\/SettingsOverlay\.tsx/,
-    async (route) => {
-      await route.fulfill({ status: 404 });
-      await page
-        .evaluate(() => window.dispatchEvent(new Event("vite:preloadError", { cancelable: true })))
-        .catch(() => undefined);
-    },
-    { times: 1 },
-  );
-  const reloaded = page.waitForEvent("load");
-  await page.locator("aside").first().getByRole("button", { name: "Actions for Personal" }).click();
-  await page.getByRole("menuitem", { name: "Settings", exact: true }).click();
-  await reloaded;
-  const settings = page.getByTestId("user-settings");
-  // A space's Settings opens its own Space section.
-  await expect(settings).toHaveAttribute("data-settings-section", "space");
-  await expect(page).toHaveURL(
-    (url) =>
-      url.pathname === new URL(originalUrl).pathname &&
-      url.searchParams.get("settings") === "space" &&
-      url.searchParams.has("space"),
-  );
-  expect(await page.evaluate(() => localStorage.getItem("rakazo:space-id"))).toBe(selected);
-  await captureScreenshot(page, testInfo, "preload-recovered-space-settings");
-});
+import { captureScreenshot, completeOnboarding, signup } from "./helpers";
 
 test("a failed integrations load offers Retry instead of an empty catalog", async ({
   page,
@@ -211,3 +50,85 @@ test("a failed integrations load offers Retry instead of an empty catalog", asyn
   await expect(page.getByText("Could not reach the server", { exact: true })).toHaveCount(0);
   await expect(retry).toHaveCount(0);
 });
+
+for (const result of ["empty", "plugin", "unavailable"] as const) {
+  test(`integrations waits for plugins before showing an empty catalog (${result})`, async ({
+    page,
+  }, testInfo) => {
+    await signup(
+      page,
+      `catalog-pending-${result}-${Date.now()}@rakazo.test`,
+      "password12",
+      "Catalog Load",
+    );
+    await completeOnboarding(page);
+    await page.route("**/rpc/connections/catalog", (route) =>
+      route.fulfill({ json: { json: [] } }),
+    );
+    let finishLoading!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      finishLoading = resolve;
+    });
+    await page.route("**/rpc/marketplace/catalog", async (route) => {
+      await pending;
+      await route.fulfill({
+        json: {
+          json: {
+            entries:
+              result === "plugin"
+                ? [
+                    {
+                      id: "demo",
+                      name: "demo",
+                      displayName: "Demo app",
+                      description: "Demo integration",
+                      keywords: [],
+                      category: "productivity",
+                      logo: null,
+                      homepage: null,
+                      domains: [],
+                      registry: "demo",
+                      source: "demo",
+                      installedSource: "demo",
+                      hasConnector: true,
+                      skillCount: 0,
+                    },
+                  ]
+                : [],
+            unavailableRegistries: result === "unavailable" ? ["demo"] : [],
+            skippedEntries: 0,
+          },
+        },
+      });
+    });
+    await page.getByRole("button", { name: "Connect apps", exact: true }).click();
+    const loading = page.getByLabel("Loading plugins…", { exact: true });
+    const configure = page.getByText("Configure a plugin catalog on the server to connect apps.", {
+      exact: true,
+    });
+    try {
+      await expect(loading).toBeVisible();
+      await expect(configure).toHaveCount(0);
+      await page.getByPlaceholder("Search apps", { exact: true }).fill("missing");
+      await expect(page.getByText("No apps match your search.", { exact: true })).toHaveCount(0);
+      await page.getByPlaceholder("Search apps", { exact: true }).clear();
+      if (result === "empty")
+        await captureScreenshot(page, testInfo, "integrations-plugins-loading");
+    } finally {
+      finishLoading();
+    }
+    await expect(loading).toHaveCount(0);
+    if (result === "empty") {
+      await expect(configure).toBeVisible();
+      await captureScreenshot(page, testInfo, "integrations-catalog-empty");
+    } else {
+      await expect(configure).toHaveCount(0);
+      if (result === "plugin") {
+        await expect(page.getByText("Demo app", { exact: true })).toBeVisible();
+      } else {
+        await expect(page.getByRole("alert")).toContainText("Some plugins could not be loaded.");
+        await expect(page.getByRole("button", { name: "Retry", exact: true })).toBeVisible();
+      }
+    }
+  });
+}

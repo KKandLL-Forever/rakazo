@@ -1,5 +1,5 @@
 import { Plural, Trans, useLingui } from "@lingui/react/macro";
-import type { Bot, BotSection } from "@rakazo/contracts";
+import type { AccountItem, Bot, BotSection } from "@rakazo/contracts";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -10,6 +10,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
   Button,
+  Checkbox,
   Dialog,
   DialogContent,
   DialogDescription,
@@ -35,27 +36,107 @@ function closeUnlessBusy(busy: boolean, onCancel: () => void) {
 
 export function NewSpaceDialog({
   onCancel,
-  onConfirm,
+  onCreate,
+  loadItems,
+  chooseItems,
+  onDone,
 }: {
   onCancel: () => void;
-  onConfirm: (name: string) => Promise<void>;
+  onCreate: (name: string) => Promise<string>;
+  /** The user's own skills, servers, plugins and tool sources, across their spaces. */
+  loadItems: () => Promise<AccountItem[]>;
+  chooseItems: (spaceId: string, items: AccountItem[]) => Promise<void>;
+  onDone: (spaceId: string) => void;
 }) {
   const { t } = useLingui();
   const nameId = useId();
   const [name, setName] = useState("");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [created, setCreated] = useState<{ id: string; items: AccountItem[] } | null>(null);
+  const [chosen, setChosen] = useState<Set<string>>(new Set());
+  const key = (item: AccountItem) => `${item.kind}:${item.id}`;
 
   const create = () => {
     const trimmed = name.trim();
     if (!trimmed || saving) return;
     setSaving(true);
     setError(null);
-    void onConfirm(trimmed).catch((reason: unknown) => {
-      setError(errorText(reason, t`Could not create space`));
+    void (async () => {
+      let spaceId: string;
+      try {
+        spaceId = await onCreate(trimmed);
+      } catch (reason) {
+        setError(errorText(reason, t`Could not create space`));
+        setSaving(false);
+        return;
+      }
+      // Without items of their own there is nothing to choose, so the space is ready.
+      const items = await loadItems().catch(() => []);
+      if (!items.length) return onDone(spaceId);
+      setChosen(new Set(items.filter((item) => item.availability.allSpaces).map(key)));
+      setCreated({ id: spaceId, items });
       setSaving(false);
-    });
+    })();
   };
+
+  const finish = () => {
+    if (!created || saving) return;
+    setSaving(true);
+    setError(null);
+    void chooseItems(
+      created.id,
+      created.items.filter((item) => chosen.has(key(item))),
+    )
+      .then(() => onDone(created.id))
+      .catch((reason: unknown) => {
+        setError(errorText(reason, t`Could not save`));
+        setSaving(false);
+      });
+  };
+
+  if (created)
+    return (
+      <Dialog open onOpenChange={closeUnlessBusy(true, onCancel)}>
+        <DialogContent showCloseButton={false}>
+          <DialogHeader>
+            <DialogTitle>
+              <Trans>What can this space use?</Trans>
+            </DialogTitle>
+          </DialogHeader>
+          <div data-testid="new-space-items" className="max-h-80 space-y-1 overflow-y-auto">
+            {created.items.map((item) => (
+              <div
+                key={key(item)}
+                className="flex items-center gap-3 rounded-lg px-1 py-1.5 text-body text-foreground"
+              >
+                <Checkbox
+                  id={`new-space-item-${key(item)}`}
+                  checked={chosen.has(key(item))}
+                  onCheckedChange={(checked) =>
+                    setChosen((current) => {
+                      const next = new Set(current);
+                      if (checked) next.add(key(item));
+                      else next.delete(key(item));
+                      return next;
+                    })
+                  }
+                />
+                <label htmlFor={`new-space-item-${key(item)}`} className="min-w-0 flex-1 truncate">
+                  {item.name}
+                </label>
+              </div>
+            ))}
+          </div>
+          {error ? <p className="text-body text-destructive">{error}</p> : null}
+          <DialogFooter>
+            <Button disabled={saving} onClick={finish}>
+              {saving ? <Trans>Saving…</Trans> : <Trans>Continue</Trans>}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    );
 
   return (
     <Dialog open onOpenChange={closeUnlessBusy(saving, onCancel)}>
@@ -71,7 +152,7 @@ export function NewSpaceDialog({
             <Trans>New space</Trans>
           </DialogTitle>
         </DialogHeader>
-        <label htmlFor={nameId} className="block text-[13.5px] text-foreground/75">
+        <label htmlFor={nameId} className="block text-body text-foreground/75">
           <Trans>Name</Trans>
           <Input
             id={nameId}
@@ -79,13 +160,17 @@ export function NewSpaceDialog({
             value={name}
             onChange={(event) => setName(event.target.value)}
             onKeyDown={(event) => {
+              if (event.nativeEvent.isComposing || event.keyCode === 229) {
+                if (event.key === "Escape") event.stopPropagation();
+                return;
+              }
               if (event.key === "Enter") create();
             }}
             placeholder={t`Customer support`}
             className="mt-2"
           />
         </label>
-        {error ? <p className="text-[13.5px] text-destructive">{error}</p> : null}
+        {error ? <p className="text-body text-destructive">{error}</p> : null}
         <DialogFooter>
           <Button variant="outline" disabled={saving} onClick={onCancel}>
             <Trans>Cancel</Trans>
@@ -139,7 +224,7 @@ export function NewBotSectionDialog({
               <Trans>Create a section and move {bot.name} into it.</Trans>
             </DialogDescription>
           </DialogHeader>
-          <label htmlFor={nameId} className="block text-[13.5px] text-foreground/75">
+          <label htmlFor={nameId} className="block text-body text-foreground/75">
             <Trans>Name</Trans>
             <Input
               id={nameId}
@@ -149,7 +234,7 @@ export function NewBotSectionDialog({
               className="mt-2"
             />
           </label>
-          {error ? <p className="text-[13.5px] text-destructive">{error}</p> : null}
+          {error ? <p className="text-body text-destructive">{error}</p> : null}
           <DialogFooter>
             <Button type="button" variant="outline" disabled={saving} onClick={onCancel}>
               <Trans>Cancel</Trans>
@@ -202,7 +287,7 @@ export function RenameBotSectionDialog({
               <Trans>Rename section</Trans>
             </DialogTitle>
           </DialogHeader>
-          <label htmlFor={nameId} className="block text-[13.5px] text-foreground/75">
+          <label htmlFor={nameId} className="block text-body text-foreground/75">
             <Trans>Name</Trans>
             <Input
               id={nameId}
@@ -213,7 +298,7 @@ export function RenameBotSectionDialog({
               autoFocus
             />
           </label>
-          {error ? <p className="text-[13.5px] text-destructive">{error}</p> : null}
+          {error ? <p className="text-body text-destructive">{error}</p> : null}
           <DialogFooter>
             <Button type="button" variant="outline" disabled={saving} onClick={onCancel}>
               <Trans>Cancel</Trans>
@@ -255,7 +340,7 @@ export function ClearConversationDialog({
             </Trans>
           </AlertDialogDescription>
         </AlertDialogHeader>
-        {error ? <p className="text-[13.5px] text-destructive">{error}</p> : null}
+        {error ? <p className="text-body text-destructive">{error}</p> : null}
         <AlertDialogFooter>
           <AlertDialogCancel disabled={clearing}>
             <Trans>Cancel</Trans>
@@ -310,7 +395,7 @@ export function DeleteBotDialog({
           </AlertDialogDescription>
         </AlertDialogHeader>
         <div className="space-y-2">
-          <p id={memoriesLabelId} className="mb-2 text-[13.5px] text-foreground/75">
+          <p id={memoriesLabelId} className="mb-2 text-body text-foreground/75">
             <Trans>What about its memories?</Trans>
           </p>
           <RadioGroup
@@ -322,10 +407,10 @@ export function DeleteBotDialog({
             <label className="flex cursor-pointer gap-3 rounded-lg border border-border p-3">
               <RadioGroupItem value="keep" className="mt-0.5" />
               <span>
-                <span className="block text-[14px] text-foreground">
+                <span className="block text-body text-foreground">
                   <Trans>Keep memories</Trans>
                 </span>
-                <span className="mt-0.5 block text-[12.5px] text-muted-foreground">
+                <span className="mt-0.5 block text-body-sm text-muted-foreground">
                   <Trans>Move them to your shared memory.</Trans>
                 </span>
               </span>
@@ -334,17 +419,17 @@ export function DeleteBotDialog({
             <label className="flex cursor-pointer gap-3 rounded-lg border border-border p-3">
               <RadioGroupItem value="delete" className="mt-0.5" />
               <span>
-                <span className="block text-[14px] text-foreground">
+                <span className="block text-body text-foreground">
                   <Trans>Delete memories too</Trans>
                 </span>
-                <span className="mt-0.5 block text-[12.5px] text-muted-foreground">
+                <span className="mt-0.5 block text-body-sm text-muted-foreground">
                   <Trans>This cannot be undone.</Trans>
                 </span>
               </span>
             </label>
           </RadioGroup>
         </div>
-        {error ? <p className="text-[13.5px] text-destructive">{error}</p> : null}
+        {error ? <p className="text-body text-destructive">{error}</p> : null}
         <AlertDialogFooter>
           <AlertDialogCancel disabled={deleting}>
             <Trans>Cancel</Trans>
@@ -418,7 +503,7 @@ export function DeleteItemDialog({
   onConfirm,
 }: {
   item: { name: string };
-  noun: "group" | "routine" | "section" | "space";
+  noun: "group" | "page" | "routine" | "section" | "space";
   title?: React.ReactNode;
   description?: React.ReactNode;
   onCancel: () => void;
@@ -437,7 +522,7 @@ export function DeleteItemDialog({
             {description ?? <Trans>This cannot be undone.</Trans>}
           </AlertDialogDescription>
         </AlertDialogHeader>
-        {error ? <p className="text-[13.5px] text-destructive">{error}</p> : null}
+        {error ? <p className="text-body text-destructive">{error}</p> : null}
         <AlertDialogFooter>
           <AlertDialogCancel disabled={deleting}>
             <Trans>Cancel</Trans>
@@ -458,7 +543,9 @@ export function DeleteItemDialog({
                         ? t`Could not delete space`
                         : noun === "section"
                           ? t`Could not delete section`
-                          : t`Could not delete routine`,
+                          : noun === "page"
+                            ? t`Could not delete page`
+                            : t`Could not delete routine`,
                   ),
                 );
                 setDeleting(false);

@@ -5,8 +5,10 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import type { ElectronApplication } from "@playwright/test";
+import type { ElectronApplication, Page } from "@playwright/test";
 import { _electron as electron, expect, test } from "@playwright/test";
+import type { RakazoDesktop } from "@rakazo/contracts";
+import { shownWindow } from "./shown-window.js";
 
 const APP_MARKER = "Existing Rakazo instance ready";
 /** Outlasts the shell's 20s wait for a mounted app before it rejects the server. */
@@ -41,6 +43,12 @@ test.beforeAll(async () => {
       response.end(JSON.stringify({ dsn: null }));
       return;
     }
+    if (request.url?.startsWith("/redirect?")) {
+      const target = new URL(request.url, serverUrl).searchParams.get("to") ?? "/";
+      response.writeHead(302, { location: target });
+      response.end();
+      return;
+    }
     if (request.url === "/rpc/health" && request.method === "POST") {
       response.writeHead(200, { "content-type": "application/json; charset=utf-8" });
       response.end(JSON.stringify({ json: { ok: true, version: "0.1.0" } }));
@@ -66,6 +74,8 @@ test.afterAll(async () => {
 
 test.beforeEach(async () => {
   userData = await mkdtemp(path.join(tmpdir(), "rakazo-desktop-e2e-"));
+  // Setup otherwise follows the machine's language; these specs read its English text.
+  await writeFile(path.join(userData, "ui-locale.txt"), "en\n");
 });
 
 test.afterEach(async () => {
@@ -75,7 +85,10 @@ test.afterEach(async () => {
 });
 
 function launch(extraEnv: Record<string, string> = {}) {
-  const env = { ...process.env, RAKAZO_PERFORMANCE_USER_DATA: userData };
+  const env: Record<string, string | undefined> = {
+    ...process.env,
+    RAKAZO_PERFORMANCE_USER_DATA: userData,
+  };
   // A stale RAKAZO_WEB_URL from the developer's shell would bypass setup entirely.
   delete env.RAKAZO_WEB_URL;
   const executablePath = process.env.RAKAZO_E2E_EXECUTABLE;
@@ -83,7 +96,7 @@ function launch(extraEnv: Record<string, string> = {}) {
     ...(executablePath ? { executablePath: path.resolve(executablePath) } : {}),
     args: executablePath ? [] : ["."],
     cwd: path.resolve(import.meta.dirname, ".."),
-    env: { ...env, ...extraEnv },
+    env: { ...env, ...extraEnv } as Record<string, string>,
   });
 }
 
@@ -150,6 +163,34 @@ test("first run offers Rakazo Cloud first, with local and existing instances", a
       path.join(import.meta.dirname, "screenshots", "08-setup-macos-native-controls.png"),
     ]);
   }
+});
+
+test("setup opens in the language the app last used", async () => {
+  await writeFile(path.join(userData, "ui-locale.txt"), "es\n");
+  app = await launch();
+  const setup = await app.firstWindow();
+
+  await expect(setup.locator("html")).toHaveAttribute("lang", "es");
+  await expect(
+    setup.getByRole("heading", { name: "Te damos la bienvenida a Rakazo" }),
+  ).toBeVisible();
+  await expect(setup.getByRole("button", { name: "Continuar" })).toBeEnabled();
+  await setup.screenshot({
+    path: path.join(import.meta.dirname, "screenshots", "10-setup-spanish.png"),
+  });
+});
+
+test("setup lays out right to left in Hebrew", async () => {
+  await writeFile(path.join(userData, "ui-locale.txt"), "he\n");
+  app = await launch();
+  const setup = await app.firstWindow();
+
+  await expect(setup.locator("html")).toHaveAttribute("dir", "rtl");
+  await expect(setup.getByRole("heading", { name: "ברוכים הבאים ל-Rakazo" })).toBeVisible();
+  await expect(setup.getByRole("button", { name: "המשך" })).toBeEnabled();
+  await setup.screenshot({
+    path: path.join(import.meta.dirname, "screenshots", "11-setup-hebrew.png"),
+  });
 });
 
 test("Rakazo Cloud saves the hosted address and is reselected when saved", async () => {
@@ -258,7 +299,7 @@ test("Continue verifies and remembers the instance so setup does not run again",
   await app.close();
 
   app = await launch();
-  const relaunched = await app.firstWindow();
+  const relaunched = await shownWindow(app);
   await expect(relaunched.getByText(APP_MARKER)).toBeVisible();
   await expect(relaunched.locator("#setup")).toHaveCount(0);
 });
@@ -587,7 +628,7 @@ test("an unreachable saved server falls back to setup with a recovery message", 
 
 test("the native application menu can reopen setup without exposing setup IPC to the server", async () => {
   app = await launch({ RAKAZO_WEB_URL: serverUrl });
-  const appWindow = await app.firstWindow();
+  const appWindow = await shownWindow(app);
   await expect(appWindow.getByText(APP_MARKER)).toBeVisible();
 
   const setupPromise = app.waitForEvent("window");
@@ -643,13 +684,13 @@ test("servers on the same host but different ports do not share login cookies", 
 
   try {
     app = await launch({ RAKAZO_WEB_URL: `http://127.0.0.1:${firstAddress.port}` });
-    const firstWindow = await app.firstWindow();
+    const firstWindow = await shownWindow(app);
     await expect(firstWindow.getByText("Cookie stored")).toBeVisible();
     await expect.poll(() => firstWindow.evaluate(() => document.cookie)).toContain("fake-one");
     await app.close();
 
     app = await launch({ RAKAZO_WEB_URL: `http://127.0.0.1:${secondAddress.port}` });
-    const secondWindow = await app.firstWindow();
+    const secondWindow = await shownWindow(app);
     await expect(secondWindow.getByText("Cookies: none")).toBeVisible();
   } finally {
     await app?.close();
@@ -667,13 +708,97 @@ test("servers on the same host but different ports do not share login cookies", 
 
 test("setup IPC is not reachable from the connected app window", async () => {
   app = await launch({ RAKAZO_WEB_URL: serverUrl });
-  const appWindow = await app.firstWindow();
+  const appWindow = await shownWindow(app);
   await expect(appWindow.getByText(APP_MARKER)).toBeVisible();
 
   const exposed = await appWindow.evaluate(() =>
     Object.keys((window as typeof window & { rakazoSetup?: unknown }).rakazoSetup ?? {}),
   );
   expect(exposed).toEqual([]);
+});
+
+test("the app window stays on its server when a link redirects to another site", async () => {
+  const elsewhere = createServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    response.end("<!doctype html><main>Another site</main>");
+  });
+  await new Promise<void>((resolve) => elsewhere.listen(0, "127.0.0.1", resolve));
+  const address = elsewhere.address();
+  if (address === null || typeof address === "string") throw new Error("fixture has no port");
+  const elsewhereUrl = `http://127.0.0.1:${address.port}/landing`;
+  const signInUrl = "https://sign-in.invalid/authorize";
+  const openSignIn = (page: Page) =>
+    page.evaluate(
+      (url) =>
+        (window as typeof window & { rakazoDesktop: RakazoDesktop }).rakazoDesktop.oauth.open!(
+          url,
+        ).then(
+          () => "opened",
+          (error: Error) => error.message,
+        ),
+      signInUrl,
+    );
+
+  try {
+    const launched = await launch({ RAKAZO_WEB_URL: serverUrl });
+    app = launched;
+    const appWindow = await shownWindow(launched);
+    await expect(appWindow.getByText(APP_MARKER)).toBeVisible();
+    await launched.evaluate(({ shell }) => {
+      const opened: string[] = [];
+      Object.assign(globalThis, { opened });
+      shell.openExternal = async (url) => {
+        opened.push(url);
+      };
+    });
+    const openedUrls = () =>
+      launched.evaluate(() => (globalThis as typeof globalThis & { opened: string[] }).opened);
+
+    // Links to another site go to the system browser.
+    await appWindow.evaluate((to) => window.location.assign(to), elsewhereUrl);
+    await expect.poll(openedUrls).toEqual([elsewhereUrl]);
+    // Playwright keeps waiting on a navigation cancelled before it starts, so ask the page itself.
+    expect(await appWindow.evaluate(() => window.location.href)).toBe(`${serverUrl}/`);
+
+    // So does a server redirect to another site.
+    await appWindow.evaluate(
+      (to) => window.location.assign(`/redirect?to=${encodeURIComponent(to)}`),
+      elsewhereUrl,
+    );
+    await expect.poll(openedUrls).toEqual([elsewhereUrl, elsewhereUrl]);
+    await expect(appWindow).toHaveURL(`${serverUrl}/`);
+    await expect(appWindow.getByText(APP_MARKER)).toBeVisible();
+
+    // Embedded frames may still follow redirects to other sites.
+    await appWindow.evaluate((to) => {
+      const frame = document.createElement("iframe");
+      frame.src = `/redirect?to=${encodeURIComponent(to)}`;
+      document.body.append(frame);
+    }, elsewhereUrl);
+    await expect(appWindow.frameLocator("iframe").getByText("Another site")).toBeVisible();
+
+    // Redirects within the server still load in the app.
+    await appWindow.evaluate(() => window.location.assign("/redirect?to=/after"));
+    await expect(appWindow).toHaveURL(`${serverUrl}/after`);
+    await expect(appWindow.getByText(APP_MARKER)).toBeVisible();
+    expect(await openSignIn(appWindow)).toBe("opened");
+    await expect.poll(openedUrls).toEqual([elsewhereUrl, elsewhereUrl, signInUrl]);
+
+    // Another site in the app window cannot start a browser sign-in.
+    await launched.evaluate(
+      ({ BrowserWindow }, url) => BrowserWindow.getAllWindows()[0]?.webContents.loadURL(url),
+      elsewhereUrl,
+    );
+    await expect(appWindow.getByText("Another site")).toBeVisible();
+    expect(await openSignIn(appWindow)).toContain("Invalid sign-in request.");
+    expect(await openedUrls()).toEqual([elsewhereUrl, elsewhereUrl, signInUrl]);
+  } finally {
+    await app?.close();
+    app = undefined;
+    await new Promise<void>((resolve, reject) => {
+      elsewhere.close((error) => (error ? reject(error) : resolve()));
+    });
+  }
 });
 
 for (const failure of ["load", "save"] as const) {
@@ -684,7 +809,7 @@ for (const failure of ["load", "save"] as const) {
     );
     const initialRequests = monitoringRequests;
     app = await launch();
-    const previous = await app.firstWindow();
+    const previous = await shownWindow(app);
     await expect(previous.getByText(APP_MARKER)).toBeVisible();
     await expect.poll(() => monitoringRequests).toBeGreaterThan(initialRequests);
     const connectedRequests = monitoringRequests;

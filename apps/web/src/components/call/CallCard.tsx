@@ -11,6 +11,7 @@ import {
   toggleTranscript,
   useCallSession,
 } from "../../lib/call-session";
+import { CallWindow } from "./CallWindow";
 
 const BARS = [9, 15, 21, 15, 9];
 const TRANSCRIPT_LINES = 4;
@@ -64,7 +65,7 @@ export function CallCard({ onSettings }: { onSettings: () => void }) {
           ? t`Muted`
           : t`Listening`;
   return (
-    <div
+    <CallWindow
       data-testid="call-view"
       role="dialog"
       aria-label={t`Call with ${call.botName}`}
@@ -118,14 +119,19 @@ export function CallCard({ onSettings }: { onSettings: () => void }) {
               style={{ borderColor: defaultBotAvatarValue(call.botColor) }}
             />
           ) : null}
-          <BotAvatar color={call.botColor} identity={call.botId} size={96} />
+          <BotAvatar
+            avatarSet={call.botAvatarSet}
+            color={call.botColor}
+            identity={call.botId}
+            size={96}
+          />
         </button>
         <div className="flex flex-col items-center gap-1 text-center">
-          <span className="text-2xl font-semibold text-foreground md:text-xl" dir="auto">
+          <span className="text-heading1 font-semibold text-foreground md:text-heading2" dir="auto">
             {call.botName}
           </span>
           <span
-            className="flex gap-2 text-sm tabular-nums text-muted-foreground"
+            className="flex gap-2 text-body tabular-nums text-muted-foreground"
             aria-live="polite"
           >
             {ringing ? (
@@ -161,7 +167,7 @@ export function CallCard({ onSettings }: { onSettings: () => void }) {
       </div>
 
       {call.transcriptOpen ? (
-        <div className="mb-4 flex flex-col gap-1.5 border-t border-border pt-2.5 text-sm leading-[1.45]">
+        <div className="mb-4 flex flex-col gap-1.5 border-t border-border pt-2.5 text-body leading-[1.45]">
           {call.exchanges.slice(-TRANSCRIPT_LINES).map((exchange, index) => (
             <p
               key={`${exchange.role}-${index + 1}-${exchange.text.slice(0, 24)}`}
@@ -181,7 +187,7 @@ export function CallCard({ onSettings }: { onSettings: () => void }) {
           ) : null}
         </div>
       ) : call.caption ? (
-        <p className="mb-4 text-center text-sm text-muted-foreground" dir="auto">
+        <p className="mb-4 text-center text-body text-muted-foreground" dir="auto">
           {call.caption}
         </p>
       ) : null}
@@ -207,7 +213,7 @@ export function CallCard({ onSettings }: { onSettings: () => void }) {
           <PhoneOff className="size-5" />
         </Button>
       </div>
-    </div>
+    </CallWindow>
   );
 }
 
@@ -222,7 +228,7 @@ export function CallReturnBar() {
       type="button"
       data-testid="call-return-bar"
       onClick={() => setCallMinimized(false)}
-      className="app-no-drag flex min-h-10 w-full shrink-0 items-center justify-center gap-1.5 bg-success px-3 text-sm font-medium text-background"
+      className="app-no-drag flex min-h-10 w-full shrink-0 items-center justify-center gap-1.5 bg-success px-3 text-body font-medium text-background"
     >
       <span dir="auto">{t`Return to call with ${call.botName}`}</span>
       <span className="ms-1 tabular-nums">

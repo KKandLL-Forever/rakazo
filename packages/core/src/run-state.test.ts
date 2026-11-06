@@ -9,6 +9,8 @@ import {
   isConversationalRun,
   isRunWaitingOnUser,
   isRunWorking,
+  messageBypassesTakeoverWait,
+  messageSteersRun,
   QUEUE_HOLDING_RUN_STATUSES,
   WAITING_ON_USER_RUN_STATUSES,
   WORKING_RUN_STATUSES,
@@ -18,6 +20,27 @@ describe("run state machine", () => {
   it("keeps paused cards active without holding admission, while takeover still holds it", () => {
     expect(isActive("waiting_input")).toBe(true);
     expect(QUEUE_HOLDING_RUN_STATUSES).toEqual(["queued", "leased", "running", "waiting_takeover"]);
+  });
+
+  it("lets a takeover wait hold only a message it takes as steering", () => {
+    const bypasses = messageBypassesTakeoverWait;
+    expect(bypasses({ status: "waiting_takeover", trigger: "user" })).toBe(false);
+    expect(bypasses({ status: "waiting_takeover", trigger: "user" }, false)).toBe(true);
+    expect(bypasses({ status: "waiting_takeover", trigger: "routine" })).toBe(true);
+    expect(bypasses({ status: "waiting_takeover", trigger: "bot_message" })).toBe(true);
+    expect(bypasses({ status: "running", trigger: "routine" })).toBe(false);
+  });
+
+  it("isolates messaging steering by chat while preserving other triggers", () => {
+    expect(messageSteersRun("messaging", "messaging")).toBe(true);
+    expect(messageSteersRun("messaging", "messaging", "group-1", "group-1")).toBe(true);
+    expect(messageSteersRun("messaging", "messaging", "group-1")).toBe(false);
+    expect(messageSteersRun("messaging", "messaging", undefined, "group-1")).toBe(false);
+    expect(messageSteersRun("messaging", "messaging", "group-1", "group-2")).toBe(false);
+    expect(messageSteersRun("messaging", "user")).toBe(false);
+    expect(messageSteersRun("user", "messaging", undefined, "group-1")).toBe(true);
+    expect(messageSteersRun("webhook", "messaging")).toBe(false);
+    expect(messageSteersRun("user", "routine")).toBe(false);
   });
 
   it("splits active runs into working and waiting on the user", () => {

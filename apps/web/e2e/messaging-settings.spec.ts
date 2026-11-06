@@ -185,8 +185,8 @@ test("messaging settings show linked chat apps, channels, connections, and team 
   await messagingSettings.getByRole("button", { name: "Settings", exact: true }).click();
   const conversationSettings = page.getByTestId("external-conversation-settings");
   await expect(conversationSettings).toBeVisible();
-  await expect(conversationSettings.getByText("Listening")).toBeVisible();
-  await expect(conversationSettings.getByText("Room guidance")).toBeVisible();
+  await expect(conversationSettings.getByText("Replies to")).toBeVisible();
+  await expect(conversationSettings.getByText("Instructions for this room")).toBeVisible();
   await expect(conversationSettings.getByText("GitHub")).toBeVisible();
   await captureScreenshot(page, testInfo, "messaging-team-conversation-settings");
   await settings.getByTestId("settings-nav-general").click();
@@ -203,7 +203,6 @@ test("messaging settings show linked chat apps, channels, connections, and team 
   // Scoped to the panel: the settings nav has its own 승인 (Approvals).
   await expect(messagingSettings.getByRole("button", { name: "승인" })).toHaveCount(2);
 
-  // Linking flow: pick a chat app, request a code, read it back.
   await messagingSettings.getByRole("button", { name: "채팅 앱 연결" }).click();
   await page.getByRole("menuitem", { name: "iMessage", exact: true }).click();
   await expect(page.getByTestId("messaging-link-code")).toContainText("ABCD-2345");

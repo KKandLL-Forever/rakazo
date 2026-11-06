@@ -1,3 +1,5 @@
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { validateToolArguments } from "@earendil-works/pi-ai/utils/validation";
 import { approvalEffectKey } from "@rakazo/core/node/approval-effect-key";
 import { describe, expect, it, vi } from "vitest";
@@ -583,6 +585,58 @@ describe("OpenAPI connector import", () => {
     ]);
   });
 
+  it("prefers parameter descriptions while preserving schema descriptions as a fallback", () => {
+    const imported = importOpenApiDocument({
+      openapi: "3.1.0",
+      servers: [{ url: "https://api.example.test" }],
+      components: {
+        schemas: { Value: { type: "string", description: "Shared value" } },
+        parameters: {
+          Referenced: {
+            name: "referenced",
+            in: "query",
+            description: "Referenced parameter",
+            schema: { $ref: "#/components/schemas/Value" },
+          },
+        },
+      },
+      paths: {
+        "/items": {
+          get: {
+            operationId: "listItems",
+            parameters: [
+              {
+                name: "direct",
+                in: "query",
+                description: "Direct parameter",
+                schema: { $ref: "#/components/schemas/Value" },
+              },
+              { $ref: "#/components/parameters/Referenced" },
+              { name: "schemaOnly", in: "query", schema: { $ref: "#/components/schemas/Value" } },
+              {
+                name: "empty",
+                in: "query",
+                description: "",
+                schema: { $ref: "#/components/schemas/Value" },
+              },
+              { name: "plain", in: "query", schema: { type: "number" } },
+              { name: "fallback", in: "query", description: "Fallback parameter" },
+            ],
+          },
+        },
+      },
+    });
+
+    expect(imported.operations[0]?.inputSchema.properties).toEqual({
+      direct: { type: "string", description: "Direct parameter" },
+      referenced: { type: "string", description: "Referenced parameter" },
+      schemaOnly: { type: "string", description: "Shared value" },
+      empty: { type: "string", description: "" },
+      plain: { type: "number" },
+      fallback: { type: "string", description: "Fallback parameter" },
+    });
+  });
+
   it("refuses ambiguous specs without stable operation ids", () => {
     expect(() =>
       importOpenApiDocument({
@@ -616,6 +670,49 @@ describe("OpenAPI connector import", () => {
       }),
     ).toThrow("unsafe header Authorization");
   });
+
+  it.each([
+    { status: 503, size: 1_000_000, error: "OpenAPI document returned HTTP 503" },
+    { status: 200, size: 2_000_001, error: "OpenAPI document is too large" },
+  ])(
+    "releases a rejected OpenAPI response ($status, $size bytes) before closing",
+    async ({ status, size, error }) => {
+      const server = createServer((_request, response) => {
+        response.writeHead(status, { "content-length": String(size) });
+        // Keep the body open so dispatcher cleanup cannot finish without cancellation.
+        response.write("x");
+      });
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      const { port } = server.address() as AddressInfo;
+      const controller = new AbortController();
+      const prepared = prepareApiInstall({
+        source: `http://127.0.0.1:${port}/openapi`,
+        config: { openApi: true, auth: { type: "none" } },
+        signal: controller.signal,
+        allowPrivateEndpoint: true,
+      });
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await expect(
+          Promise.race([
+            prepared,
+            new Promise<never>((_resolve, reject) => {
+              timer = setTimeout(
+                () => reject(new Error("OpenAPI rejection did not settle")),
+                2_000,
+              );
+            }),
+          ]),
+        ).rejects.toThrow(error);
+      } finally {
+        clearTimeout(timer);
+        controller.abort();
+        server.closeAllConnections();
+        await prepared.catch(() => undefined);
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    },
+  );
 
   const prepareOpenApiFrom = (body: string) => {
     const fetch = vi.fn(async (_url: string | URL | Request, _init?: RequestInit) => {
@@ -1518,6 +1615,279 @@ describe("OpenAPI connector import", () => {
         credential: "fake-credential",
       }),
     ).rejects.toThrow("Sensitive headers cannot be model-controlled");
+  });
+});
+
+describe("installed MCP sessions last for a whole run", () => {
+  const publicResolver = async () => [{ address: "203.0.113.10", family: 4 as const }];
+
+  /** Streamable HTTP server that keeps its state per mcp-session-id, like a
+   * stateful executor: `pause` stores a paused execution under the calling
+   * session and `resume` only knows it in that same session. */
+  function statefulMcpServer() {
+    const sessions = new Set<string>();
+    const paused = new Map<string, string>();
+    const toolCalls: Array<{ session: string | null; tool: string; args: unknown }> = [];
+    const deletes: Array<string | null> = [];
+    let initializations = 0;
+    const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const request = new Request(input, init);
+      const session = request.headers.get("mcp-session-id");
+      if (request.method === "GET") return new Response(null, { status: 405 });
+      if (request.method === "DELETE") {
+        deletes.push(session);
+        if (session) sessions.delete(session);
+        return new Response(null, { status: 202 });
+      }
+      if (request.method !== "POST") return new Response(null, { status: 405 });
+      const message = JSON.parse(await request.text()) as {
+        id?: number;
+        method?: string;
+        params?: { name?: string; arguments?: Record<string, unknown> };
+      };
+      if (message.method === "initialize") {
+        initializations += 1;
+        const id = `session-${initializations}`;
+        sessions.add(id);
+        return Response.json(
+          {
+            jsonrpc: "2.0",
+            id: message.id,
+            result: {
+              protocolVersion: "2025-11-25",
+              capabilities: { tools: {} },
+              serverInfo: { name: "stateful", version: "1" },
+            },
+          },
+          { headers: { "mcp-session-id": id } },
+        );
+      }
+      if (!session || !sessions.has(session)) return new Response(null, { status: 404 });
+      if (message.id === undefined) return new Response(null, { status: 202 });
+      if (message.method === "tools/list") {
+        return Response.json({
+          jsonrpc: "2.0",
+          id: message.id,
+          result: {
+            tools: [
+              { name: "pause", inputSchema: { type: "object" } },
+              { name: "resume", inputSchema: { type: "object" } },
+            ],
+          },
+        });
+      }
+      if (message.method === "tools/call") {
+        const tool = message.params?.name ?? "";
+        toolCalls.push({ session, tool, args: message.params?.arguments });
+        if (tool === "pause") {
+          const executionId = `exec-of-${session}`;
+          paused.set(session, executionId);
+          return Response.json({
+            jsonrpc: "2.0",
+            id: message.id,
+            result: {
+              content: [{ type: "text", text: "waiting for interaction" }],
+              structuredContent: { status: "waiting_for_interaction", executionId },
+            },
+          });
+        }
+        if (tool === "resume") {
+          const expected = paused.get(session);
+          if (expected !== message.params?.arguments?.executionId) {
+            return Response.json({
+              jsonrpc: "2.0",
+              id: message.id,
+              error: {
+                code: -32000,
+                message: `Paused execution is unknown: ${String(
+                  message.params?.arguments?.executionId,
+                )}`,
+              },
+            });
+          }
+          paused.delete(session);
+          return Response.json({
+            jsonrpc: "2.0",
+            id: message.id,
+            result: { content: [{ type: "text", text: "resumed" }] },
+          });
+        }
+      }
+      return new Response(null, { status: 202 });
+    });
+    const install = {
+      id: "mcp-stateful",
+      kind: "mcp",
+      name: "Stateful MCP",
+      source: "https://mcp.example.test/mcp",
+      secretId: null,
+      createdAt: new Date(0),
+      config: { preset: "custom", auth: { type: "none" } },
+    };
+    return {
+      fetch,
+      install,
+      initializations: () => initializations,
+      toolCalls,
+      deletes,
+    };
+  }
+
+  function providerFor(server: ReturnType<typeof statefulMcpServer>) {
+    const prisma = {
+      capabilityInstall: { findFirst: vi.fn().mockResolvedValue(server.install) },
+    };
+    return new InstalledConnectorProvider(prisma as never, {} as never, {
+      fetch: server.fetch as unknown as typeof globalThis.fetch,
+      resolveHostname: publicResolver,
+    });
+  }
+
+  function runContext(runId: string) {
+    const controller = new AbortController();
+    const context = {
+      spaceId: "space-1",
+      userId: "user-1",
+      runId,
+      signal: controller.signal,
+    } as never;
+    return { context, controller };
+  }
+
+  async function callTool(
+    provider: InstalledConnectorProvider,
+    context: never,
+    tool: string,
+    args: Record<string, unknown>,
+  ): Promise<Array<{ type: string; data?: unknown; message?: string }>> {
+    const events: Array<{ type: string; data?: unknown; message?: string }> = [];
+    for await (const event of provider.execute(
+      {
+        tool,
+        args,
+        executionId: tool,
+        route: { connectorId: "installed", resourceId: "mcp-stateful", toolName: tool },
+      },
+      context,
+    )) {
+      events.push(event as never);
+    }
+    return events;
+  }
+
+  function pausedExecutionId(events: Array<{ type: string; data?: unknown }>): string {
+    const data = events[0] as { data: { structuredContent: { executionId: string } } };
+    return data.data.structuredContent.executionId;
+  }
+
+  it("keeps one session across a run's pause and resume calls", async () => {
+    const server = statefulMcpServer();
+    const provider = providerFor(server);
+    const { context } = runContext("run-1");
+
+    const pause = await callTool(provider, context, "pause", {});
+    expect(pause).toMatchObject([{ type: "result" }]);
+    const executionId = pausedExecutionId(pause);
+
+    const resume = await callTool(provider, context, "resume", { executionId });
+
+    expect(resume).toMatchObject([{ type: "result" }]);
+    expect(server.initializations()).toBe(1);
+  });
+
+  it("reuses the session on a run's next attempt after it waited for input", async () => {
+    const server = statefulMcpServer();
+    const provider = providerFor(server);
+    // One attempt is one continueRun pass: its own signal, the same run scope.
+    const waiting = runContext("run-1");
+    const pause = await callTool(provider, waiting.context, "pause", {});
+    const executionId = pausedExecutionId(pause);
+
+    // The run waits for the owner's answer (waiting_input), then the same run
+    // continues in this process with a fresh attempt and a fresh signal.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const resumed = runContext("run-1");
+
+    const resume = await callTool(provider, resumed.context, "resume", { executionId });
+
+    expect(resume).toMatchObject([{ type: "result" }]);
+    expect(server.initializations()).toBe(1);
+  });
+
+  it("does not share a session between two runs", async () => {
+    const server = statefulMcpServer();
+    const provider = providerFor(server);
+    const first = runContext("run-1");
+    const second = runContext("run-2");
+
+    const pause = await callTool(provider, first.context, "pause", {});
+    const executionId = pausedExecutionId(pause);
+
+    await expect(
+      callTool(provider, second.context, "resume", { executionId }),
+    ).resolves.toMatchObject([{ type: "error", message: /Paused execution is unknown/ }]);
+    expect(new Set(server.toolCalls.map((call) => call.session))).toEqual(
+      new Set(["session-1", "session-2"]),
+    );
+  });
+
+  it("keeps the session when an attempt aborts, so the run's next attempt reuses it", async () => {
+    const server = statefulMcpServer();
+    const provider = providerFor(server);
+    // One attempt is one continueRun pass: its own signal, the same run scope.
+    const waiting = runContext("run-1");
+    const pause = await callTool(provider, waiting.context, "pause", {});
+    const executionId = pausedExecutionId(pause);
+
+    // The run waits for the owner's answer; withRuntimeCleanup aborts this
+    // attempt's signal on the way out, which must not close the run's session.
+    waiting.controller.abort();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(server.deletes).toEqual([]);
+
+    const resumed = runContext("run-1");
+    const resume = await callTool(provider, resumed.context, "resume", { executionId });
+
+    expect(resume).toMatchObject([{ type: "result" }]);
+    expect(server.initializations()).toBe(1);
+  });
+
+  it("closes the session when its run ends, and only that run's", async () => {
+    const server = statefulMcpServer();
+    const provider = providerFor(server);
+    const first = runContext("run-1");
+    await callTool(provider, first.context, "pause", {});
+    const second = runContext("run-2");
+    const executionId = pausedExecutionId(await callTool(provider, second.context, "pause", {}));
+
+    provider.endRun("run-1");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(server.deletes).toEqual(["session-1"]);
+    const resume = await callTool(provider, second.context, "resume", { executionId });
+    expect(resume).toMatchObject([{ type: "result" }]);
+    expect(server.initializations()).toBe(2);
+    await provider.close();
+  });
+
+  it("keeps the session after a JSON-RPC error response with code -32000", async () => {
+    const server = statefulMcpServer();
+    const provider = providerFor(server);
+    const { context } = runContext("run-1");
+
+    const pause = await callTool(provider, context, "pause", {});
+    const executionId = pausedExecutionId(pause);
+    // A recoverable server error between pause and resume, answered in a normal
+    // JSON-RPC error response: the connection itself is still healthy.
+    await expect(
+      callTool(provider, context, "resume", { executionId: "other" }),
+    ).resolves.toMatchObject([{ type: "error", message: /Paused execution is unknown/ }]);
+    expect(server.deletes).toEqual([]);
+
+    const resume = await callTool(provider, context, "resume", { executionId });
+
+    expect(resume).toMatchObject([{ type: "result" }]);
+    expect(server.initializations()).toBe(1);
   });
 });
 

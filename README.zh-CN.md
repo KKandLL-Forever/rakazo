@@ -5,20 +5,20 @@
 [![GitHub stars](https://img.shields.io/github/stars/elie222/rakazo?labelColor=black&style=for-the-badge&color=2563EB)](https://github.com/elie222/rakazo/stargazers)
 [![加入 Discord 社区](https://img.shields.io/badge/Discord-Join%20the%20community-5865F2?labelColor=black&style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/RWwKa2Sn7h)
 [![在 App Store 下载 iPhone 版](https://img.shields.io/badge/App%20Store-Download%20for%20iPhone-black?labelColor=black&style=for-the-badge&logo=apple&logoColor=white)](https://apps.apple.com/app/rakazo/id6801531099)
-[![下载 Android APK](https://img.shields.io/badge/Android-Download%20APK-black?labelColor=black&style=for-the-badge&logo=android&logoColor=white)](https://github.com/elie222/rakazo/releases/download/android/rakazo.apk)
+[![在 Google Play 下载 Android 版](https://img.shields.io/badge/Google%20Play-Get%20the%20app-black?labelColor=black&style=for-the-badge&logo=googleplay&logoColor=white)](https://play.google.com/store/apps/details?id=com.rakazo.app)
 
 ![Rakazo：由你掌控的 AI 队友](./docs/readme-hero.png)
 
 Rakazo 是一个开源 AI 智能体项目，让你拥有可长期协作的 AI 队友，也可以作为自托管 AI 助手在自己的电脑上运行。
 它提供网页版、Electron 桌面应用，以及 [iPhone](https://apps.apple.com/app/rakazo/id6801531099) 和
-[Android](https://github.com/elie222/rakazo/releases/download/android/rakazo.apk) 应用。
+[Android](https://play.google.com/store/apps/details?id=com.rakazo.app) 应用。
 你可以接入自己的模型和计算环境提供商，也可以在本地运行完整服务。
 
 它是 Grok Bot、Meta Muse、OpenAI Dots、Instinct、OpenClaw、Hermes Agent、Claude Duet 和 Hark Pro 的开源、自托管替代方案。
 
 Rakazo 目前处于测试阶段。详情见 [rakazo.com](https://rakazo.com)。
 
-本文是 [英文 README](./README.md) 的简体中文译文，链接指向的其他文档目前仍为英文。
+本文是 [英文 README](./README.md) 的简体中文译文。[自托管指南](./docs/zh-CN/self-host.md)已提供中文。
 
 ## 与其他产品的比较
 
@@ -46,7 +46,7 @@ Muse、Dots、Instinct、Claude Duet 和 Hark Pro 是托管式助手；OpenClaw 
 - 机器人可将任务委派给其他机器人或临时子智能体
 - 通过 Pi 接入自己的模型凭据
 - 通过 Composio 或 Pipedream Connect 集成应用，也支持用户自行安装的 Treg、远程 MCP 和 OpenAPI 工具来源
-- 支持 Docker、E2B、Daytona、CreateOS、Box，以及受信任的本机计算环境
+- 支持 Docker、E2B、Daytona、CreateOS、Boat，以及受信任的本机计算环境
 
 ## 演示
 
@@ -62,7 +62,7 @@ https://github.com/user-attachments/assets/dccdeddb-2134-4a56-8eed-b2e591736b1c
 - Better Auth
 - Graphile Worker
 - Pi
-- Docker、E2B、Daytona、CreateOS 和 Box
+- Docker、E2B、Daytona、CreateOS 和 Boat
 - Composio、Pipedream Connect、MCP 和 OpenAPI 集成
 
 ## 部署到 Railway
@@ -87,15 +87,14 @@ bash install-images.sh
 再次运行时会保留已有的 `.env`。
 
 打开 [http://127.0.0.1:5173](http://127.0.0.1:5173)，创建账号并连接模型。
-默认启用本地 Docker 计算机。也可以选择远程提供商 `e2b`、`daytona`、`createos`、`box` 或 `railway`，
-并配置相应的 API 密钥。
+默认启用本地 Docker 计算机。远程计算机所需的凭据、模板和准备步骤见[计算机提供商（英文）](./docs/self-host-sandbox-providers.md)。
 
 默认镜像标签为 `edge`，由主分支构建，支持 `linux/amd64` 和 `linux/arm64`。
-镜像详情与标签见[自托管指南](./docs/self-host.md#published-images-no-checkout)。
+镜像详情与标签见[自托管指南](./docs/zh-CN/self-host.md#已发布镜像无需检出源码)。
 
 在受限网络中，可以覆盖安装器的下载地址前缀（`RAKAZO_DOWNLOAD_BASE`），跳过已有的 Compose 文件
 （`--local` / `RAKAZO_DOWNLOAD_SKIP_EXISTING`），或使用引导脚本的镜像地址。
-参见[受限网络与镜像下载](./docs/self-host.md#restricted-networks--mirror-downloads)。
+参见[受限网络与镜像下载](./docs/zh-CN/self-host-restricted-network.md)。
 
 如需让智能体协助安装，请使用 [SETUP_PROMPT.md](./SETUP_PROMPT.md)。
 
@@ -110,7 +109,7 @@ bash install-images.sh --prepare-only
 bash install-images.sh
 ```
 
-为 5173 端口配置 HTTPS 入口。[docs/self-host.md](./docs/self-host.md#public-single-vm-deployment)
+为 5173 端口配置 HTTPS 入口。[docs/self-host-production.md](./docs/self-host-production.md#public-single-vm-deployment)
 介绍了 Caddy 配置和主机加固方法。在桌面应用中选择 **Existing instance**（已有实例），填写 `https://` 地址。
 
 ## 本地开发（从源码运行）
@@ -125,7 +124,7 @@ cp .env.example .env
 ```
 
 将 `POSTGRES_PASSWORD` 和 `POSTGRES_APP_PASSWORD` 分别设置为由 `openssl rand -hex 16` 生成的两个值，再把它们填入 `DATABASE_MIGRATION_URL` 和 `DATABASE_URL`。
-应用以自己的 `rakazo_app` 登录身份连接数据库，并受行级安全策略约束；迁移则以所有者身份运行（参见 [数据库角色](docs/self-host.md#database-roles)）。
+应用以自己的 `rakazo_app` 登录身份连接数据库，并受行级安全策略约束；迁移则以所有者身份运行（参见 [数据库角色](docs/self-host-configuration.md#database-roles)）。
 为 `BETTER_AUTH_SECRET`、`ENCRYPTION_KEY` 和 `SCREEN_PROXY_SECRET` 分别设置独立的长随机值。
 Docker 沙箱还需要专用的 `SANDBOX_SUPERVISOR_TOKEN`。
 你也可以设置 `OPENROUTER_API_KEY`，或在首次设置时连接支持的模型提供商。
@@ -144,31 +143,35 @@ Treg 按用量计费。自托管用户需提供自己的 Treg 令牌；
 其中要求托管转售须签订书面协议。
 
 ```bash
-docker compose --env-file .env \
-  -f infra/compose/docker-compose.yml \
-  -f infra/compose/docker-compose.postgres-host.yml \
-  up postgres -d
 pnpm install
-pnpm db:generate
-pnpm db:migrate
 pnpm sandbox:build
 pnpm dev
 ```
 
-默认 Compose 文件中的 Postgres 仅在容器网络内可访问，与已发布镜像的部署方式一致。
-`postgres-host` 叠加配置将数据库端口发布到宿主机的回环地址 `127.0.0.1:5433`，供宿主机上的 `pnpm` 和数据库工具使用。
-如果端口被占用，请同时修改 `.env` 中的 `POSTGRES_HOST_PORT` 以及 `DATABASE_URL` 和 `DATABASE_MIGRATION_URL` 中的端口。
-不使用叠加配置时，可以通过以下命令进入数据库交互终端：
-`docker compose --env-file .env -f infra/compose/docker-compose.yml exec postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"'`。
+`pnpm dev` 会使用 `DATABASE_URL` 指向且可连接的 Postgres；否则会通过 Docker 启动本地
+`rakazo-dev-postgres` 容器，所有检出目录共用该容器。启动服务前会应用数据库迁移并生成 Prisma 客户端。
+如果当前分支新增了 `main` 尚未包含的迁移，会在同一服务器上使用独立数据库，条件允许时从共享数据库复制，
+避免未合入的数据库结构变更影响共享数据库。默认端口被占用时（例如另一个 Git worktree 正在运行），
+会选择下一个空闲端口组并打印访问地址。
+
+如需改用 Compose 中的 Postgres，可通过 `postgres-host` 叠加配置启动，将端口发布到回环地址
+`127.0.0.1:5433`，并让 `DATABASE_URL` 和 `DATABASE_MIGRATION_URL` 指向它：
+
+```bash
+docker compose --env-file .env \
+  -f infra/compose/docker-compose.yml \
+  -f infra/compose/docker-compose.postgres-host.yml \
+  up postgres -d
+```
 
 `POSTGRES_PASSWORD` 应使用无需 URI 转义的字符，例如通过 `openssl rand -hex 16` 生成。
 已有的 `pgdata` 数据卷会保留首次初始化时的用户、密码和数据库，
 因此应保留 `.env` 中相应的值，或使用 `ALTER ROLE`、重命名等方式在数据库中修改。
 只有在完成备份后，或确认数据可以丢弃时，才重建数据卷；`docker compose down -v` 会删除全部 Postgres 数据。
 
-打开 [http://127.0.0.1:5173](http://127.0.0.1:5173)，创建账号、连接模型，并创建第一个机器人。
+打开终端打印的地址（默认是 [http://127.0.0.1:5173](http://127.0.0.1:5173)），创建账号、连接模型，并创建第一个机器人。
 
-部署、提供商选择、备份与升级说明见[自托管指南](./docs/self-host.md)。
+部署、提供商选择、备份与升级说明见[自托管指南](./docs/zh-CN/self-host.md)。
 
 使用 CreateOS 时，设置 `SANDBOX_PROVIDER=createos` 和 `CREATEOS_SANDBOX_API_KEY`。
 可选配置 `CREATEOS_SANDBOX_BASE_URL`、`CREATEOS_SANDBOX_SHAPE` 和 `CREATEOS_SANDBOX_ROOTFS`
@@ -206,7 +209,7 @@ pnpm --filter @rakazo/desktop dev
 因此需要先安装 Docker Desktop、OrbStack 或 Docker Engine；未安装时，应用会提供相应链接。
 已安装的发行版将镜像标签固定为自身版本，未打包的开发版本则拉取 `edge`。
 
-运行 `pnpm dev` 的开发者应选择 **Existing instance**（已有实例），地址填写 `http://127.0.0.1:5173`。
+运行 `pnpm dev` 的开发者应选择 **Existing instance**（已有实例），地址填写终端打印的地址（默认为 `http://127.0.0.1:5173`）。
 公共服务器必须使用 HTTPS；只有回环地址和局域网私有地址允许 HTTP，不包括链路本地地址。
 应用会在保存地址前检查 Rakazo 的健康检查端点，之后启动时直接连接该实例。
 退出应用后，服务仍会继续运行；可通过应用菜单中的 **Stop Local Stack**（停止本地服务）将其关闭。
@@ -229,13 +232,14 @@ chmod +x Rakazo-*.AppImage
 ## 界面语言
 
 网页版及 Electron 内嵌界面可在 **Settings → Language**（设置 → 语言）中选择英语、德语、韩语、土耳其语、
-印地语、巴西葡萄牙语、简体中文、西班牙语、俄语、法语、希伯来语、荷兰语和日语。
-Expo 应用包含英语、简体中文、俄语、德语、荷兰语和日语翻译，**Account → Language**（账号 → 语言）列出这六种语言。
+印地语、巴西葡萄牙语、简体中文、繁体中文、西班牙语、俄语、法语、希伯来语、荷兰语、日语和波兰语。
+Expo 应用包含英语、简体中文、繁体中文、俄语、德语、荷兰语、日语、西班牙语和波兰语翻译，**Account → Language**（账号 → 语言）列出这九种语言。
 在用户保存选择之前，移动端的初始语言由设备语言或 `EXPO_PUBLIC_DEFAULT_UI_LOCALE` 决定。
 
-官网首页（`apps/www`）提供英语、德语、韩语、中文和日语版本，可通过页脚语言链接切换，
-对应路径为 `/`、`/de/`、`/ko/`、`/zh/` 和 `/ja/`；其他官网页面仍为英文。
-俄语官网首页，以及 Electron 原生设置窗口和菜单的本地化仍有待完成。
+Electron 原生设置窗口和菜单也支持上述网页版语言，并跟随应用中保存的选择；首次启动使用系统语言。
+
+官网首页（`apps/www`）可通过页脚切换全部 15 种语言，简体中文路径为 `/zh/`，繁体中文为 `/zh-tw/`。
+其他官网页面主要仍为英文。
 
 ## 开发
 
@@ -260,13 +264,16 @@ pnpm test:e2e
 
 ## 文档
 
-- [自托管](./docs/self-host.md)
-- [自托管密钥管理](./docs/self-host-secrets.md)
-- [计算机运行时与隔离](./docs/computer-runtime.md)
-- [桌面端发布](./docs/desktop-release.md)
-- [移动端发布](./docs/mobile-release.md)
-- [性能测试](./docs/performance.md)
-- [计算机集群管理](./docs/fleet-management.md)
+- [自托管](./docs/zh-CN/self-host.md)
+- [模型接入、审批与语音](./docs/zh-CN/self-host-models.md)
+- [备份与恢复](./docs/zh-CN/self-host-backups.md)
+- [升级](./docs/zh-CN/self-host-upgrading.md)
+- [受限网络与镜像下载](./docs/zh-CN/self-host-restricted-network.md)
+- [部署配置](./docs/self-host-configuration.md)、[密钥管理](./docs/self-host-secrets.md)、[账号与登录](./docs/self-host-accounts.md)（英文）
+- [工具集成](./docs/self-host-integrations.md)、[计算机提供商](./docs/self-host-sandbox-providers.md)、[Docker 计算机](./docs/self-host-docker-computers.md)（英文）
+- [存储与加密](./docs/self-host-storage.md)、[生产部署](./docs/self-host-production.md)、[日志与监控](./docs/self-host-observability.md)、[审计日志](./docs/self-host-audit-log.md)（英文）
+- [客户端](./docs/self-host-clients.md)、[计费](./docs/self-host-billing.md)、[计算机运行时与隔离](./docs/computer-runtime.md)（英文）
+- [桌面端发布](./docs/desktop-release.md)、[移动端发布](./docs/mobile-release.md)、[性能测试](./docs/performance.md)、[管理机器人的机器人](./docs/fleet-management.md)（英文）
 
 ## 参与贡献
 

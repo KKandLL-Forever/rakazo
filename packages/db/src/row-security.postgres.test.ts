@@ -12,6 +12,7 @@ import {
   drainUnscopedDatabaseAccess,
   ROW_SECURITY_MODELS,
   runAsSystem,
+  runAsSystemInTransaction,
   runAsTenant,
 } from "./row-security.js";
 
@@ -101,6 +102,21 @@ function rowsFor(t: Tenant, tag: string): Array<[string, Record<string, unknown>
       { spaceId: t.spaceId, userId: t.userId, name: `n-${tag}`, description: "d", content: "c" },
     ],
     ["userVoiceCredential", { userId: t.userId, provider: "p", secretId: t.personalSecretId }],
+    ["trustedLinkSite", { userId: t.userId, site: `${tag}.example.test` }],
+    ["spendingLimit", { userId: t.userId, amount: 100, currency: "usd", period: "month" }],
+    [
+      "payment",
+      {
+        operationKey: `rls-payment-${tag}-${t.userId}`,
+        userId: t.userId,
+        spaceId: t.spaceId,
+        botId: t.botId,
+        threadId: "thread",
+        site: "shop.example.test",
+        amount: 100,
+        currency: "usd",
+      },
+    ],
   ];
 }
 
@@ -248,9 +264,11 @@ describePostgres("row-level security (PostgreSQL)", () => {
         "taughtSkill",
         "agentSkill",
         "userVoiceCredential",
+        "trustedLinkSite",
       ].map(async (table) => {
-        const scope =
-          table === "userVoiceCredential" || table === "vaultCredential" ? "userId" : "spaceId";
+        const scope = ["userVoiceCredential", "vaultCredential", "trustedLinkSite"].includes(table)
+          ? "userId"
+          : "spaceId";
         const ids = tenants.map((t) => t[scope]);
         const rows = (await Reflect.get(db, table).findMany({
           where: { [scope]: { in: ids } },
@@ -561,26 +579,67 @@ describePostgres("row-level security (PostgreSQL)", () => {
     drainUnscopedDatabaseAccess();
   });
 
-  it("leaves the newer tables open to the previous release, which sets no version", async () => {
+  it("reports a bypass key that no longer matches until db:migrate runs again", async () => {
+    expect((await describeRowSecurity(db)).systemBlocked).toBeUndefined();
+    await owner.prisma
+      .$executeRaw`UPDATE rakazo_private.rls_bypass_keys SET digest = sha256('stale')`;
+    expect((await describeRowSecurity(db)).systemBlocked).toBe(true);
+    await provisionRuntimeRole(migrationUrl!, runtimeUrl!);
+    expect((await describeRowSecurity(db)).systemBlocked).toBeUndefined();
+  });
+
+  it("ignores a bypass a tenant session turns on without the key", async () => {
     const client = await app.pool.connect();
     try {
-      // What the previous release's connections look like: a tenant without a version.
-      await client.query(
-        "SELECT set_config('app.space_id', $1, false), set_config('app.user_id', $2, false), set_config('app.rls_bypass', 'off', false), set_config('app.rls_version', '', false)",
-        [a.spaceId, a.userId],
-      );
-      const bots = await client.query("SELECT id FROM bots WHERE id = ANY($1)", [
-        tenants.map((t) => t.botId),
-      ]);
-      expect(bots.rowCount).toBe(2);
-      // The tables protected before keep their policies for it.
-      const threads = await client.query("SELECT id FROM threads WHERE id = ANY($1)", [
-        threadIds(),
-      ]);
-      expect(threads.rows.map((row) => row.id)).toEqual([a.threadId]);
+      // What SQL run in a tenant context could do to its own session.
+      for (const key of ["", "guess"]) {
+        await client.query(
+          "SELECT set_config('app.space_id', $1, false), set_config('app.user_id', $2, false), set_config('app.rls_bypass', 'on', false), set_config('app.rls_bypass_key', $3, false), set_config('app.rls_version', '', false)",
+          [a.spaceId, a.userId, key],
+        );
+        const threads = await client.query("SELECT id FROM threads WHERE id = ANY($1)", [
+          threadIds(),
+        ]);
+        expect(threads.rows.map((row) => row.id)).toEqual([a.threadId]);
+        const bots = await client.query("SELECT id FROM bots WHERE id = ANY($1)", [
+          tenants.map((t) => t.botId),
+        ]);
+        expect(bots.rows.map((row) => row.id)).toEqual([a.botId]);
+      }
+      await expect(
+        client.query("SELECT count(*) FROM rakazo_private.rls_bypass_keys"),
+      ).rejects.toThrow(/permission denied/);
     } finally {
       client.release(true);
     }
+  });
+
+  it("routes every bypass policy through the key check", async () => {
+    const policies = await owner.prisma.$queryRaw<
+      Array<{ policyname: string; qual: string; with_check: string | null }>
+    >`
+      SELECT policyname, qual, with_check FROM pg_policies WHERE schemaname = 'public'
+        AND (policyname LIKE '%\\_system' OR qual LIKE '%rls\\_%' OR with_check LIKE '%rls\\_%')`;
+    expect(policies.length).toBeGreaterThan(50);
+    expect(
+      policies.filter(
+        (p) => p.qual !== "( SELECT app_rls_bypass() AS app_rls_bypass)" || p.with_check !== null,
+      ),
+    ).toEqual([]);
+  });
+
+  it("lets a system step inside a tenant transaction across tenants and back", async () => {
+    const counts = await runAsTenant(a, () =>
+      db.$transaction(async (tx) => {
+        const before = await tx.thread.count({ where: { id: { in: threadIds() } } });
+        const during = await runAsSystemInTransaction(tx, "row-level security test", () =>
+          tx.thread.count({ where: { id: { in: threadIds() } } }),
+        );
+        const after = await tx.thread.count({ where: { id: { in: threadIds() } } });
+        return [before, during, after];
+      }),
+    );
+    expect(counts).toEqual([1, 2, 1]);
   });
 
   it("gives the runtime login the job queue, replacing a hand-made policy", async () => {
@@ -659,7 +718,7 @@ describePostgres("row-level security (PostgreSQL)", () => {
     ).rejects.toThrow(/row-level security/);
   });
 
-  it("applies the same rules to secrets, skills and voice credentials", async () => {
+  it("applies the same rules to secrets, skills, voice credentials and trusted link sites", async () => {
     const none = {
       botSecret: [],
       vaultCredential: [],
@@ -667,6 +726,7 @@ describePostgres("row-level security (PostgreSQL)", () => {
       taughtSkill: [],
       agentSkill: [],
       userVoiceCredential: [],
+      trustedLinkSite: [],
     };
     expect(await owners()).toEqual(none);
     expect(await runAsTenant(a, owners)).toEqual({
@@ -677,6 +737,7 @@ describePostgres("row-level security (PostgreSQL)", () => {
       taughtSkill: [a.spaceId],
       agentSkill: [a.spaceId],
       userVoiceCredential: [a.userId],
+      trustedLinkSite: [a.userId],
     });
     const everyone = await runAsSystem("row-level security test", owners);
     expect(everyone.agentSkill).toEqual(tenants.map((t) => t.spaceId).sort());
@@ -689,6 +750,30 @@ describePostgres("row-level security (PostgreSQL)", () => {
     }
     // The unscoped reads and writes above are deliberate.
     drainUnscopedDatabaseAccess();
+  });
+
+  it("shows a user's trusted link sites in every space and no one else's", async () => {
+    const sites = () =>
+      db.trustedLinkSite.findMany({
+        where: { userId: { in: tenants.map((t) => t.userId) } },
+        select: { userId: true, site: true },
+      });
+    // The user of one space reading from another space they belong to.
+    expect(await runAsTenant({ spaceId: b.spaceId, userId: a.userId }, sites)).toEqual([
+      { userId: a.userId, site: `fixture.example.test` },
+    ]);
+    expect(
+      await runAsTenant(b, () => db.trustedLinkSite.deleteMany({ where: { userId: a.userId } })),
+    ).toEqual({ count: 0 });
+    // Trusting a site again, as the API does, is a no-op under the policy.
+    expect(
+      await runAsTenant(a, () =>
+        db.trustedLinkSite.createMany({
+          data: { userId: a.userId, site: "fixture.example.test" },
+          skipDuplicates: true,
+        }),
+      ),
+    ).toEqual({ count: 0 });
   });
 
   it("keeps normal reads, writes and transactions working for the tenant", async () => {

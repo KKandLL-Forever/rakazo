@@ -5,6 +5,7 @@ import { inboundRoutineModelPin } from "@rakazo/adapters";
 import type { MessageBlock } from "@rakazo/contracts";
 import { escapePromptData, inboundRoutineBlock, messageBlockForArtifact } from "@rakazo/core";
 import type { PrismaClient } from "@rakazo/db";
+import { accountDeactivated } from "@rakazo/db";
 import { getLogger } from "@rakazo/logging";
 
 export const WEBHOOK_MAX_BODY_BYTES = 64 * 1024;
@@ -184,7 +185,6 @@ function loadWebhookSecret(
   return entry.plaintext;
 }
 
-/** Load the bot webhook secret target, or null when the bot/secret is missing or invalid. */
 export async function loadWebhookTarget(
   deps: Pick<WebhookDeps, "prisma" | "secrets">,
   cache: WebhookSecretCache,
@@ -201,7 +201,8 @@ export async function loadWebhookTarget(
     },
   });
 
-  if (!bot?.thread || !bot.webhookSecretId) {
+  // A deactivated owner's bot takes no deliveries; callers see the usual unauthorized reply.
+  if (!bot?.thread || !bot.webhookSecretId || (await accountDeactivated(deps.prisma, bot.userId))) {
     cache.delete(botId);
     return null;
   }
@@ -251,7 +252,6 @@ export function messagingWakeIdempotencyKey(provider: string, handle: string): s
   return `${provider}:${handle}`;
 }
 
-/** Client nonce for idempotent inbound deliveries (webhook / github / messaging). */
 export function inboundDeliveryClientNonce(
   source: "webhook" | "github" | "messaging",
   botId: string,

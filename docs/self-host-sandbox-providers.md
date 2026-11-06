@@ -10,12 +10,69 @@ for the sharing and persistence contract.
 | --- | --- | --- |
 | Local Docker computers | `SANDBOX_PROVIDER=docker` | `SANDBOX_SUPERVISOR_TOKEN`, computer image, Docker socket for supervisor |
 | UI only, no computers | `SANDBOX_PROVIDER=none` | No provider credential; published-images Compose still requires `SANDBOX_SUPERVISOR_TOKEN` |
-| Managed remote desktop | `e2b` / `daytona` / `boat` | `SANDBOX_SUPERVISOR_TOKEN` (published-images Compose), matching API key (and optional URL knobs for Daytona/Boat) |
+| Managed remote desktop | `e2b` / `novita` / `daytona` / `createos` / `boat` / `boxd` | `SANDBOX_SUPERVISOR_TOKEN` (published-images Compose), matching API key (and optional URL knobs for Daytona/CreateOS/Boat) |
 | One pod per computer on your own cluster | `SANDBOX_PROVIDER=kubernetes` | API and worker running in the cluster, a namespace and a Role that can create, read, delete and exec into pods |
+| One app container per computer on your own Incus server | `SANDBOX_PROVIDER=incus` | Incus API address, a client certificate restricted to one project, and a route from the API, worker and web to the computers' network |
 
 Published-images [Compose](../infra/compose/docker-compose.images.yml) defaults to **`docker`**.
 It always starts the supervisor and requires `SANDBOX_SUPERVISOR_TOKEN`, including for `none`
 and remote providers. This stack credential does not replace a remote provider's API key.
+
+## Settings configuration
+
+Set `COMPUTER_SETTINGS_ENABLED=true` on the API to turn this on. Admins can then choose
+**Settings → Computer → New computers run on** and save a supported provider's fields.
+The API supplies the provider's field descriptors and validates values server-side. Credentials are encrypted in the secret store and
+never returned; a blank secret field keeps its saved value for the same provider and destination.
+Changing a URL requires credentials again. **Default** uses `SANDBOX_PROVIDER`.
+Docker, Kubernetes, Incus, desktop, fake, and none remain environment-only. Settings overrides are disabled
+for desktop and fake deployments.
+
+The account form offers only providers that declare support for account-owned computers.
+Team Computers follow their owner's account choice; Private Computers use the deployment choice. See [Wuying setup](./wuying-computers.md) for that adapter's fields and requirements.
+
+## Choosing a provider
+
+The Electron desktop app is a client of the same API. Docker remains the default. For an app-managed local instance, the local operator can choose **Use this Mac** (macOS) or **Use this computer** (Windows/Linux). After native confirmation, an authenticated bridge sends commands from the Docker backend to Electron, where they run under your OS account. **Computer Access…** in the app menu changes the choice; **Revoke Local Computer Access** immediately disconnects active operations and revokes the saved permission. Local execution requires the desktop app to remain running. Connecting to an existing remote instance does not grant it access to your computer. Browser and mobile clients use the deployment’s configured computer; they do not expose their own host. `SANDBOX_PROVIDER=desktop` is a separate, development-only configuration for backends running directly on the intended host.
+
+Native file reads and workspace exports are limited to 8 MiB per file. A larger workspace file fails the checkpoint and preserves the previous saved workspace; local files remain on the computer. Writes are bounded by the 12 MiB encoded request limit.
+
+- **Published images** (`docker-compose.images.yml`) default to `SANDBOX_PROVIDER=docker` with a
+  local supervisor and published `ghcr.io/elie222/rakazo/computer` image. No E2B account required.
+  Optional: set `e2b`, `novita`, `daytona`, `createos`, or `boat` plus the matching API key for remote computers.
+- **Docker** is the quick-start default for published images and for a source checkout / full local
+  Compose stack. Workspace bots share a persistent Team Computer by default; Private computers are
+  optional. Keep the supervisor private, as the included Compose files do.
+- **E2B** runs bot computers away from the Rakazo host and is a good choice for public or multi-user
+  production deployments. Rakazo checkpoints the portable workspace and browser-profile directory to
+  `DATA_DIR`; the E2B disk is a runtime cache, not the durable source of truth.
+- **Daytona** provides the same remote-computer contract through Daytona sandboxes. Configure
+  `DAYTONA_API_KEY` and optionally `DAYTONA_API_URL` / `DAYTONA_TARGET` / `DAYTONA_SNAPSHOT`.
+- **CreateOS** provides the same remote-computer contract through CreateOS desktop sandboxes.
+  Configure `CREATEOS_SANDBOX_API_KEY` and optionally `CREATEOS_SANDBOX_BASE_URL`,
+  `CREATEOS_SANDBOX_SHAPE`, or `CREATEOS_SANDBOX_ROOTFS`. Rakazo defaults to
+  `https://api.sb.createos.sh`, `s-2vcpu-2gb`, and `desktop:1`.
+- **Boat** provides a managed Linux desktop through `BOAT_API_KEY` and optionally
+  `BOAT_API_URL`. Rakazo always creates or resumes sandboxes with `noEnv: true`, keeps the portable
+  workspace under `/home/user/rakazo-home`, and refreshes a two-hour TTL. Boat uses the shared Linux
+  desktop runtime and protected port routes for concurrent bot desktops. Each bot has its own
+  persistent Chrome profile; logins are not shared between bots.
+- **Local computer access** in the app-managed Electron instance runs commands on Windows, macOS,
+  or Linux through the native bridge. Bots can read/change local files and launch installed apps
+  through OS commands, subject to your account and OS permissions. Portable file tools and
+  checkpoints remain scoped to bot workspaces; use commands for other local folders. Graphical
+  screen control is unavailable. Permission is remembered locally and can be revoked from the
+  app menu. Only enable this for a trusted personal instance: every bot on that instance can use
+  your account’s permissions.
+- **Desktop provider** (`SANDBOX_PROVIDER=desktop`) runs commands directly on the API/worker host,
+  with only a minimal shell environment (no server secrets). The API and worker refuse it unless
+  `NODE_ENV` is `development` or `test`, so a production server never runs bot commands on itself.
+  Setting this inside a container does not grant access to the physical computer. Docker deployments
+  use the authenticated native bridge when local computer access is selected; they never silently
+  fall back to executing on the backend host.
+- **Fake** is only an emulator for verification.
+- **None** boots the product without a computer host (fallback when Docker/supervisor is not
+  configured, or when a remote provider is selected without its API key).
 
 ## `docker` (in-stack supervisor)
 
@@ -39,6 +96,9 @@ curl -fsS http://127.0.0.1:3100/internal/health
 Missing supervisor token is a **setup failure**: do not treat `sandbox: "none"` as success for this path.
 
 Signup and local Docker computers work **without** an E2B (or other remote) account.
+
+Resource ceilings, network isolation and shared folders for these computers are covered in
+[Docker computers](./self-host-docker-computers.md).
 
 ### Bot browser
 
@@ -76,13 +136,17 @@ The API and worker talk to the Kubernetes API with their own service account (or
 | `KUBERNETES_SANDBOX_READY_TIMEOUT_MS` | `120000` | How long a new pod has to become ready |
 
 Each pod runs the image's own user (uid 1000) with no service account token and no service links,
+with all Linux capabilities dropped, privilege escalation off and the runtime's default seccomp
+profile, like a Docker computer (these apply to newly created pods; a pod that was already running
+keeps its old spec until it is stopped and recreated),
 and is labelled `app.kubernetes.io/name=rakazo-computer` and `rakazo-bot-id=<bot id>`. Commands,
 file transfers and workspace save and restore go through `pods/exec`; save and restore stream the
 home as one tar archive. Screens use the image's desktop gateway on the pod IP, so the API, the
 worker and the web screen proxy must be able to reach pods in that namespace on port `6080` and the
 display ports from `6100` upward. Pods are ephemeral: the
 saved workspace is the persistence boundary, as with the remote providers. Kubernetes computers do
-not bill while running, so `COMPUTER_MAX_ACTIVE_MS` does not apply to them.
+not bill while running, so `COMPUTER_MAX_ACTIVE_MS` does not apply to them;
+`COMPUTER_MAX_ACTIVE_UNBILLED_MS` caps them when set.
 
 ### Mounted home (optional)
 
@@ -118,6 +182,124 @@ Bind it to the service account the API and worker run as with a `RoleBinding`. A
 that admits only the API, worker and web pods to the computer pods, and denies their egress to
 private ranges, is recommended.
 
+## `incus`
+
+Each computer is an [Incus](https://linuxcontainers.org/incus/) application container started
+from the published computer image through Incus's OCI support (Incus 6.11 or newer; the start
+command's uid needs the `oci.uid` and `oci.gid` keys). The API and
+worker call the Incus REST API with a client certificate; no supervisor or Docker socket is
+involved.
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `INCUS_SANDBOX_URL` | none | The Incus API, such as `https://incus.example.test:8443` |
+| `INCUS_SANDBOX_CLIENT_CERT` / `_CLIENT_KEY` | none | PEM client certificate and key; `\n` escapes are accepted. API and worker only |
+| `INCUS_SANDBOX_SERVER_CERT` | unset | The server's own certificate (`incus info` shows it), trusted exactly. Unset uses the system CAs and the URL's host name |
+| `INCUS_SANDBOX_PROJECT` | `default` | Use a project of its own, below |
+| `INCUS_SANDBOX_COMPUTER_IMAGE` | `ghcr.io/elie222/rakazo/computer:edge` | Pin a release tag or digest in production |
+| `INCUS_SANDBOX_CPU_LIMIT` / `_MEMORY_LIMIT` / `_PROCESS_LIMIT` | `2` / `2GiB` / `2048` | Incus `limits.cpu`, `limits.memory` and `limits.processes` of each computer |
+
+Computers without the URL, certificate or key fall back to `none`.
+
+Each instance is unprivileged, without nesting, with an isolated id map (its own range of host
+uids) and the limits above, all set on the instance so a profile cannot loosen them. The image's
+own start command and every command run as uid 1000, set on the instance and on each exec rather
+than taken from the image's user, with no privilege
+escalation, the same boundary as a Docker computer, so a custom image must keep that command.
+
+Each start creates a new instance named `rakazo-<uuid>` and labelled `user.rakazo-bot-id=<bot id>`;
+one carrying another bot's id is never reused or deleted. Instances are ephemeral: Incus deletes
+one when it stops, and the saved workspace is the persistence boundary, copied in when a computer
+starts and saved back when it stops, as on Kubernetes. Only cache paths and the screen size are set
+in the instance environment. Incus computers do not bill while running, so
+`COMPUTER_MAX_ACTIVE_UNBILLED_MS` caps them when set.
+The first computer downloads the image into the project, which can take a few minutes.
+
+The instance's root disk and network come from the project's default profile. Screens use the
+image's desktop gateway on the instance address, so the API, the worker and the web screen proxy
+must reach that network on port `6100`, for example by running them on the Incus host or in an
+instance on a network the host routes to the computers.
+
+### Restricted project and certificate
+
+Give Rakazo a project and a client certificate that can reach nothing else. A restricted
+certificate cannot change its project's restrictions or limits. On the Incus host:
+
+```bash
+incus network create rakazo0
+incus network acl create rakazo-computers
+# Public internet only: no host, LAN, link-local, multicast or cloud-metadata addresses.
+incus network acl rule add rakazo-computers egress action=reject \
+  destination=0.0.0.0/8,10.0.0.0/8,100.64.0.0/10,127.0.0.0/8,169.254.0.0/16,172.16.0.0/12,192.0.0.0/24,192.168.0.0/16,198.18.0.0/15,224.0.0.0/3
+incus network acl rule add rakazo-computers egress action=reject protocol=tcp \
+  destination=::1/128,fc00::/7,fe80::/10,ff00::/8
+incus network acl rule add rakazo-computers egress action=reject protocol=udp \
+  destination=::1/128,fc00::/7,fe80::/10,ff00::/8
+incus network acl rule add rakazo-computers egress action=reject protocol=icmp6 icmp_type=128 \
+  destination=::1/128,fc00::/7,fe80::/10
+# Screens, from the address the API, worker and web connect from.
+incus network acl rule add rakazo-computers ingress action=allow protocol=tcp \
+  source=<rakazo-server-address> destination_port=6100
+
+incus project create rakazo -c features.images=true -c features.profiles=true \
+  -c restricted=true -c restricted.networks.access=rakazo0 \
+  -c restricted.images.servers=ghcr.io
+incus profile device add default root disk path=/ pool=default --project rakazo
+incus profile device add default eth0 nic network=rakazo0 --project rakazo \
+  security.acls=rakazo-computers security.acls.default.egress.action=allow \
+  security.ipv4_filtering=true security.ipv6_filtering=true
+
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:secp384r1 -nodes -days 3650 \
+  -subj /CN=rakazo -keyout rakazo.key -out rakazo.crt
+incus config trust add-certificate rakazo.crt --restricted --projects rakazo
+```
+
+The ACL sits on each computer's network device, so it also keeps computers from reaching each
+other and other instances on the bridge; it needs the `nftables` firewall driver. Connections to a
+computer are refused except to the screen port. IPv6 neighbour discovery keeps working because only
+echo requests are refused among ICMPv6 messages to private addresses; DHCP and DNS from the bridge are
+allowed by Incus before any ACL rule. The IP filtering options stop
+a computer from spoofing addresses or sending router advertisements to the host. Set
+`INCUS_SANDBOX_PROJECT=rakazo` and the certificate and key from `rakazo.crt` and `rakazo.key`.
+
+## `wuying`
+
+Bot computers run on one existing Wuying (无影) cloud computer. An admin can also set this up in
+**Settings → Computer** instead of these variables; see [Wuying cloud computers](./wuying-computers.md)
+for the full setup. Each computer's home is a folder
+under the desktop user's profile (`%USERPROFILE%\rakazo\<home>`), and the desktop's own disk
+keeps it between stops, so nothing is copied in or out. Commands run in PowerShell; files,
+screenshots and input go through the desktop's MCP gateway. Stopping the last computer on it
+powers the desktop off; deleting one removes only its home folder, never the desktop.
+
+| Variable | Notes |
+| --- | --- |
+| `WUYING_ACCESS_KEY_ID` / `WUYING_ACCESS_KEY_SECRET` | RAM user allowed `ecd:DescribeDesktops`, `ecd:StartDesktops`, `ecd:StopDesktops` and `appstream-center:GetAuthCode`. API and worker only |
+| `WUYING_REGION_ID` | Defaults to `cn-hangzhou` |
+| `WUYING_DESKTOP_ID` | The cloud computer, assigned to the end user below |
+| `WUYING_END_USER_ID` | Screen logins are issued for this user |
+| `WUYING_MCP_URL` / `WUYING_MCP_TOKEN` | The desktop's MCP gateway and its bearer token |
+
+The web and Electron screen is drawn by the Wuying Web SDK in `/computer-screen/screen.html`, served by
+the web app. Mobile rejects the custom screen URL and does not embed this SDK. The
+SDK is not committed; fetch the pinned release before building the web app:
+
+```bash
+node scripts/wuying-web-sdk.mjs
+```
+
+The SDK runs in an opaque-origin sandboxed frame with an in-memory storage shim and a no-op
+cookie accessor in both its launcher and nested runtime. A CSP scoped to `/computer-screen/` permits
+the vendor hosts, blob workers and WebAssembly compilation. The one-time login code stays
+only in the URL fragment, outside HTTP requests and Referer.
+
+All bots, users and spaces configured with this provider, including Private Computers, share
+the same Windows desktop and account permissions, including files outside their workspace
+folders. Use it only in a trusted deployment.
+The gateway bounds each call to one minute, 16 KiB of command output and 1,000 folder entries.
+A command allowed longer than a minute runs detached with its output in files under
+`%USERPROFILE%\rakazo\.runs`, read back every second and removed when it ends or is cancelled.
+
 ## `none`
 
 Runs API/web without provisioning bot computers.
@@ -129,8 +311,13 @@ Set `SANDBOX_PROVIDER` to exactly one of:
 | Value | Credential | Notes |
 | --- | --- | --- |
 | `e2b` | `E2B_API_KEY` | Hosted sandboxes |
+| `novita` | `NOVITA_API_KEY` | Build the desktop template first; optional `SANDBOX_TEMPLATE` |
 | `daytona` | `DAYTONA_API_KEY` | Optional `DAYTONA_API_URL`, `DAYTONA_TARGET`, `DAYTONA_SNAPSHOT` |
 | `boat` | `BOAT_API_KEY` | Optional `BOAT_API_URL` (see `.env.example`) |
+| `boxd` | `BOXD_API_KEY` | Optional `BOXD_ORG` to create computers in a boxd organization |
+| `createos` | `CREATEOS_SANDBOX_API_KEY` | Optional `CREATEOS_SANDBOX_BASE_URL`, `CREATEOS_SANDBOX_SHAPE`, `CREATEOS_SANDBOX_ROOTFS` |
+| `railway` | `RAILWAY_API_TOKEN` and `RAILWAY_ENVIRONMENT_ID` | Optional `RAILWAY_SANDBOX_REGION`; `RAILWAY_MAX_WORKSPACE_FILE_BYTES` (default 64 MiB) caps each workspace file Rakazo reads or saves. Railway supplies the environment ID when Rakazo runs there; see the [Railway template](../infra/railway/README.md) |
+| `wuying` | `WUYING_*` (below) | One existing Wuying cloud computer (Windows) |
 
 Remote paths still need a working API/worker; they do not replace Postgres or
 the web UI. They require egress to the provider. For air-gapped hosts prefer
@@ -138,13 +325,18 @@ the web UI. They require egress to the provider. For air-gapped hosts prefer
 
 A run starts its computer only when it first uses a computer tool. With idle sleep on,
 a computer suspends after `SANDBOX_IDLE_MS` idle. On providers that bill while running
-(E2B, Daytona, Boat, CreateOS, Railway), it also suspends after `COMPUTER_MAX_ACTIVE_MS`
+(E2B, Daytona, Boat, boxd, CreateOS, Railway), it also suspends after `COMPUTER_MAX_ACTIVE_MS`
 (default 2 hours) up in one stretch, even with background work or an open screen, unless
-a run is executing on it or a user is in control of its screen. `0` turns the cap off.
+a run is executing on it, a user is in control of its screen, or a coding agent CLI (Codex,
+Claude Code, OpenCode) wrote its session within the last `SANDBOX_IDLE_MS`. An agent waiting
+at its prompt writes nothing, so it does not hold the computer. `0` turns the cap off.
 That exception lifts only the uptime cap; idle suspension after `SANDBOX_IDLE_MS` still
 applies once nothing holds the computer.
-Docker and this-Mac computers are never capped. The next use resumes it. Asking for
-takeover restarts the idle timer, and on providers that do not bill while running the run
+Docker, Kubernetes and Incus computers are capped only when `COMPUTER_MAX_ACTIVE_UNBILLED_MS` is set
+(off by default; minimum 60000), with the same exceptions, so an abandoned background command
+cannot keep one running for days. Like every cap, it needs idle sleep on: `SANDBOX_IDLE_MS=0`
+turns it off too. This-Mac computers are never capped. The next use resumes it.
+Asking for takeover restarts the idle timer, and on providers that do not bill while running the run
 also holds the computer for 30 minutes after asking, so the user can answer the push on
 the same open page.
 
@@ -219,6 +411,40 @@ E2B_API_KEY=<deployment key> pnpm sandbox:e2b-template
 Until it exists, new computers use the stock desktop template. Existing computers keep
 the size they were created with until they are replaced.
 
+### Novita computer template
+
+Set `SANDBOX_PROVIDER=novita` and `NOVITA_API_KEY` on both the API and worker.
+Build the desktop template once in the account that owns that key:
+
+```bash
+NOVITA_API_KEY=<deployment-key> pnpm sandbox:novita-template
+```
+
+The `rakazo-computer` template uses Novita's desktop image at 2 vCPU and 4 GB.
+The provider requires this template and does not fall back to the larger stock desktop.
+To use another desktop template, set `SANDBOX_TEMPLATE` to the same name when building
+and on both services. Rebuild when the template definition changes; existing computers
+keep their original template and resources.
+
+Computers pause on idle timeout and on stop, preserving files, browser profiles, and
+running-process memory. Reconnecting resumes the same computer. Destruction deletes
+it without resuming it. Stop retries pause requests and checks the remote state. Command
+cancellation and deadlines retry termination; if termination cannot be confirmed, the
+adapter attempts to pause the computer and reports that the command may remain suspended.
+An unconfirmed command stop also quarantines the computer in the shared database, so
+API heartbeats, worker jobs, and restarts cannot silently resume it. Use the existing
+Recover or Reset action to replace it from saved work; the paused guest is preserved
+until that explicit action. Normal reads and heartbeats do not resume a paused Novita
+computer.
+An outage can prevent both operations; the configured idle timeout remains the final
+auto-pause boundary. This recovery does not delete the saved computer. Paused storage remains subject to Novita's storage billing
+and retention terms. This provider uses the shared Linux desktop runtime for screens,
+takeover, terminal, and portable workspace transfer.
+
+A missing key disables computers without preventing startup. A present but invalid key,
+a missing template, or a quota failure surfaces when a computer starts; an authentication
+or network error does not authorize replacing an existing computer.
+
 ### Boat computer snapshot
 
 Boat computers start from a named snapshot, `rakazo-computer-<hash>`, that already has the
@@ -235,6 +461,22 @@ first computer, in the Boat account that owns `BOAT_API_KEY`:
 BOAT_API_KEY=<deployment key> pnpm sandbox:boat-snapshot
 ```
 
+### boxd computers
+
+boxd computers are isolated microVMs: no boxd credentials inside, and no route to the
+account's other machines. They start from a snapshot, `rakazo-computer-<hash>`, with the
+desktop tools and Chrome installed, built the same way as Boat's: once in the background
+when missing, from a fresh machine that is deleted afterwards. To build it ahead of the
+first computer:
+
+```bash
+BOXD_API_KEY=<deployment key> pnpm sandbox:boxd-snapshot
+```
+
+The desktop is served on the machine's own public HTTPS address; every screen and terminal
+still needs its own token, which the desktop gateway checks. Stopping a computer suspends it
+with its memory, so programs it was running continue when it resumes.
+
 ## Verify a provider change
 
 After changing provider or keys (from the published-images drop directory that
@@ -245,7 +487,7 @@ docker compose --env-file .env -f docker-compose.images.yml up -d
 curl -fsS http://127.0.0.1:3100/internal/health
 ```
 
-Confirm `sandbox` equals the intended provider (`e2b`, `daytona`, or `boat`).
+Confirm `sandbox` equals the intended provider (`e2b`, `novita`, `daytona`, `boat`, or `boxd`).
 HTTP 200 alone does not verify a remote provider: a missing API key falls back to `sandbox: "none"`.
 A present but invalid key still reports the selected provider. Open a bot's computer to verify
 provisioning and desktop access.

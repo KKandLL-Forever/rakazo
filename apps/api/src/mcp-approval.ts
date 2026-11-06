@@ -1,10 +1,14 @@
 import type { Actor, MessageBlock } from "@rakazo/contracts";
 import { QUEUE_HOLDING_RUN_STATUSES } from "@rakazo/core";
 import type { Prisma, PrismaClient, ThreadEvents } from "@rakazo/db";
-import { appendEventInTransaction, IsolationError, withTransactionRetry } from "@rakazo/db";
+import {
+  appendEventInTransaction,
+  availableInSpace,
+  IsolationError,
+  withTransactionRetry,
+} from "@rakazo/db";
 import { requireBotThread } from "./bot-thread.js";
 
-/** Dependencies for resolving pending MCP approval cards in a bot's threads. */
 export type McpApprovalDeps = {
   prisma: PrismaClient;
   events: ThreadEvents;
@@ -45,19 +49,25 @@ async function threadsForDecision(
   actor: Actor,
   input: McpApprovalResolution,
 ): Promise<ApprovalThread[]> {
+  // Threads are shared by the space, but a card is about one member's own server:
+  // only that member resolves it.
+  const server = await deps.prisma.mcpServer.findFirst({
+    where: { id: input.serverId, ...availableInSpace(actor) },
+    select: { id: true },
+  });
+  if (!server) return [];
   if (!input.threadId) return threadsForBot(deps.prisma, actor, input.botId);
   const member = await deps.prisma.thread.findMany({
     where: {
       id: input.threadId,
       spaceId: actor.spaceId,
-      userId: actor.userId,
       OR: [{ botId: input.botId }, { group: { members: { some: { botId: input.botId } } } }],
     },
     select: { id: true, botId: true },
   });
   if (member.length > 0) return member;
   // A bot removed from a group leaves its card behind. The bot still has to
-  // belong to this actor; the fallback never opens another bot's direct chat.
+  // belong to this space; the fallback never opens another bot's direct chat.
   try {
     await requireBotThread(deps, actor, input.botId);
   } catch (error) {
@@ -68,7 +78,6 @@ async function threadsForDecision(
     where: {
       id: input.threadId,
       spaceId: actor.spaceId,
-      userId: actor.userId,
       groupId: { not: null },
     },
     select: { id: true, botId: true },
@@ -85,7 +94,6 @@ async function threadsForBot(
   return db.thread.findMany({
     where: {
       spaceId: actor.spaceId,
-      userId: actor.userId,
       OR: [{ botId }, { groupId: { not: null }, messages: { some: { botId } } }],
     },
     select: { id: true, botId: true },
@@ -164,8 +172,6 @@ export async function resolveMcpApprovalCards<T>(
             ? (block: ApprovalBlock) => block.status !== "connected"
             : isOpen;
         const painted = await rewriteCards(tx, actor, threads, input, selectable);
-        // Only a card decision can lose to a dismissal that already committed.
-        // Settings and onboarding approve without a threadId and must still assign.
         const dismissalWon =
           input.threadId !== undefined &&
           painted.flipped === 0 &&
@@ -214,7 +220,7 @@ async function closeServerCards(
 ): Promise<ThreadSeq[]> {
   const messages = await client.message.findMany({
     where: {
-      thread: { spaceId: actor.spaceId, userId: actor.userId },
+      thread: { spaceId: actor.spaceId },
       blocks: { array_contains: [{ kind: "mcp_approval", serverId }] },
     },
     select: {
@@ -286,7 +292,6 @@ export async function queueMcpConnectedRun(
     where: {
       id: input.threadId,
       spaceId: actor.spaceId,
-      userId: actor.userId,
       OR: [
         { botId: input.botId },
         { group: { archivedAt: null, members: { some: { botId: input.botId } } } },
@@ -297,7 +302,7 @@ export async function queueMcpConnectedRun(
   if (!thread) return null;
   const [bot, busy, server] = await Promise.all([
     tx.bot.findFirst({
-      where: { id: input.botId, spaceId: actor.spaceId, userId: actor.userId, archivedAt: null },
+      where: { id: input.botId, spaceId: actor.spaceId, archivedAt: null },
       select: { id: true },
     }),
     tx.run.findFirst({
@@ -309,7 +314,7 @@ export async function queueMcpConnectedRun(
       select: { id: true },
     }),
     tx.mcpServer.findFirst({
-      where: { id: input.serverId, spaceId: actor.spaceId, userId: actor.userId },
+      where: { id: input.serverId, ...availableInSpace(actor) },
       select: { name: true },
     }),
   ]);

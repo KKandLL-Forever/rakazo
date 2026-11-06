@@ -7,9 +7,28 @@ export function runSecretKind(runId: string): string {
   return `run-secret:${runId}`;
 }
 
+/** A login card answered with "Save to Vault" off, kept for this run only under its name. */
+export function runLoginKind(runId: string, name: string): string {
+  return `run-login:${runId}:${name}`;
+}
+
+/** A texted or emailed code answered in chat, kept until it is typed into the page or the run ends. */
+export function runCodeKind(runId: string): string {
+  return `run-code:${runId}`;
+}
+
 /**
- * An ended run never reads its waiting answer, so drop it with the run. The answer is stored
- * under the run's user and space, which also keeps this delete on the secrets index.
+ * A code the page took. It is never typed again, and stays only so the run keeps hiding it from
+ * what the model reads.
+ */
+export function runCodeSpentKind(runId: string): string {
+  return `run-code-spent:${runId}`;
+}
+
+/**
+ * An ended run never reads its waiting answer or uses its run-only logins and codes, so drop them
+ * with the run. All are stored under the run's user and space, which also keeps this delete on the
+ * secrets index.
  */
 export async function deleteRunSecretsInTransaction(
   tx: Pick<Prisma.TransactionClient, "secret">,
@@ -18,11 +37,16 @@ export async function deleteRunSecretsInTransaction(
   if (runs.length === 0) return;
   await tx.secret.deleteMany({
     where: {
-      OR: runs.map((run) => ({
-        userId: run.userId,
-        spaceId: run.spaceId,
-        kind: runSecretKind(run.id),
-      })),
+      OR: runs.flatMap((run) => [
+        { userId: run.userId, spaceId: run.spaceId, kind: runSecretKind(run.id) },
+        { userId: run.userId, spaceId: run.spaceId, kind: runCodeKind(run.id) },
+        { userId: run.userId, spaceId: run.spaceId, kind: runCodeSpentKind(run.id) },
+        {
+          userId: run.userId,
+          spaceId: run.spaceId,
+          kind: { startsWith: runLoginKind(run.id, "") },
+        },
+      ]),
     },
   });
 }

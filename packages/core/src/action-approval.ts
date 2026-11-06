@@ -26,12 +26,13 @@ const APPROVAL_EXEMPT_TOOLS = new Set([
   "schedule_cancel",
   "list_fleet",
   "organize_bot",
+  // The wallet owner approves every purchase in the wallet itself; a card here would ask twice.
+  "request_purchase",
 ]);
 
 const APPROVAL_REQUIRED_BUILTIN_TOOLS = new Set([
   "generate_image",
   "generate_video",
-  "delete_bot",
   "archive_bot",
   "secret_request",
   "forget_secret",
@@ -40,16 +41,18 @@ const APPROVAL_REQUIRED_BUILTIN_TOOLS = new Set([
   "cloud_agent_reply",
   "cloud_agent_cancel",
   "user_computer_shell",
+  "user_computer_observe",
+  "user_computer_act",
+  "create_group",
+  "update_group",
+  "create_child_routine",
+  "feedback",
 ]);
 const EXPLICIT_APPROVAL_BUILTIN_TOOLS = new Set([
   "respond_agent_connection",
   "create_space",
-  "propose_instructions_update",
-  "create_group",
-  "update_group",
   "set_child_instructions",
   "set_child_bot_model",
-  "create_child_routine",
 ]);
 
 const UNATTENDED_SAFE_BUILTIN_TOOLS = new Set([
@@ -59,6 +62,7 @@ const UNATTENDED_SAFE_BUILTIN_TOOLS = new Set([
   "list_files",
   "list_fleet",
   "list_secrets",
+  "purchase_status",
   "read_file",
   "recall_memory",
   "request_takeover",
@@ -71,10 +75,12 @@ const UNATTENDED_SAFE_BUILTIN_TOOLS = new Set([
   "web_search",
 ]);
 
-const READ_ONLY_CONNECTOR_PATTERN = /(^|_)(get|list|search|find|read)(_|$)/i;
+const READ_ONLY_CONNECTOR_PATTERN = /(^|[_-])(get|list|search|find|read)([_-]|$)/i;
+/** App slug before a hyphenated action: letters and digits, with at most one underscore. */
+const PLAIN_CONNECTOR_SLUG = /^[a-z0-9]+(?:_[a-z0-9]+)?$/;
 const MUTATING_CONNECTOR_PATTERN =
-  /(^|_)(accept|add|approve|archive|assign|buy|cancel|charge|checkout|close|commit|copy|create|delete|deploy|disable|enable|execute|forward|grant|invite|link|mark|merge|modify|move|patch|pay|post|publish|purchase|put|register|reject|remove|rename|replace|reply|reset|revoke|run|schedule|send|set|share|start|stop|submit|subscribe|trigger|unassign|unlink|unsubscribe|update|upload|upsert|write)(_|$)/i;
-const COMPOUND_CONNECTOR_ACTION_PATTERN = /_(and|or|then)_/i;
+  /(^|[_-])(accept|add|approve|archive|assign|buy|cancel|charge|checkout|close|commit|copy|create|delete|deploy|disable|enable|execute|forward|grant|invite|link|mark|merge|modify|move|patch|pay|post|publish|purchase|put|register|reject|remove|rename|replace|reply|reset|revoke|run|schedule|send|set|share|start|stop|submit|subscribe|trigger|unassign|unlink|unsubscribe|update|upload|upsert|write)([_-]|$)/i;
+const COMPOUND_CONNECTOR_ACTION_PATTERN = /[_-](and|or|then)[_-]/i;
 
 const EMAIL_CONNECTOR_SLUGS = new Set(["gmail", "outlook", "microsoft_outlook"]);
 const PURCHASE_CONNECTOR_SLUGS = new Set(["stripe", "shopify", "paypal", "square"]);
@@ -88,9 +94,19 @@ export function connectorKindFromToolName(toolName: string, connectorKinds: stri
   const normalizedTool = toolName.toLowerCase();
   const matched = connectorKinds
     .map((kind) => kind.toLowerCase())
-    .filter((kind) => normalizedTool === kind || normalizedTool.startsWith(`${kind}_`))
+    .filter(
+      (kind) =>
+        normalizedTool === kind ||
+        normalizedTool.startsWith(`${kind}_`) ||
+        normalizedTool.startsWith(`${kind}-`),
+    )
     .sort((left, right) => right.length - left.length)[0];
   if (matched) return matched;
+  const hyphen = normalizedTool.indexOf("-");
+  if (hyphen > 0) {
+    const slug = normalizedTool.slice(0, hyphen);
+    if (PLAIN_CONNECTOR_SLUG.test(slug)) return slug;
+  }
   const [segment] = toolName.split("_");
   return (segment ?? toolName).toLowerCase();
 }
@@ -110,6 +126,7 @@ export function connectorToolRequiresApproval(toolName: string, readOnly?: boole
 /** Unattended watches require explicit read-only metadata and must respect approval rules. */
 export function watchToolRefusal(input: {
   toolName: string;
+  toolAliases?: readonly string[];
   readOnly?: boolean;
   connectorKind?: string;
   rules: ActionApprovalRule[];
@@ -120,6 +137,7 @@ export function watchToolRefusal(input: {
   }
   const decision = resolveActionApprovalDetail({
     toolName,
+    toolAliases: input.toolAliases,
     connectorKind: input.connectorKind,
     readOnly,
     rules: input.rules,
@@ -141,6 +159,32 @@ export function toolRequiresApproval(
   if (APPROVAL_REQUIRED_BUILTIN_TOOLS.has(toolName)) return true;
   if (viaConnector) return connectorToolRequiresApproval(toolName, readOnly);
   return false;
+}
+
+/**
+ * Whether this call repeats one of `denied`, the requests a person denied for this tool earlier in
+ * the run. A Composio multi-execute repeats only when it shares an inner tool slug. Telling the
+ * model not to retry did not stop it.
+ */
+export function repeatsDeniedAction(input: {
+  toolName: string;
+  args: unknown;
+  denied: unknown[];
+}): boolean {
+  return input.denied.some((request) => {
+    if (input.toolName !== "COMPOSIO_MULTI_EXECUTE_TOOL") return true;
+    const before = innerToolSlugs(request);
+    return innerToolSlugs(input.args).some((slug) => before.includes(slug));
+  });
+}
+
+function innerToolSlugs(args: unknown): string[] {
+  const tools = (args as { tools?: unknown } | null)?.tools;
+  if (!Array.isArray(tools)) return [];
+  return tools.flatMap((item) => {
+    const slug = (item as { tool_slug?: unknown } | null)?.tool_slug;
+    return typeof slug === "string" && slug.trim() ? [slug.trim().toUpperCase()] : [];
+  });
 }
 
 /** Security-boundary changes cannot be auto-reviewed or permanently allowed. */
@@ -173,15 +217,17 @@ export function unattendedTriggerToolRequiresApproval(
 /**
  * Tools whose results bring in nothing from outside during the run: confirmations of the bot's own
  * writes, the owner's answers, and the product's own saved state (memory, skills, history), which
- * is treated like the conversation already in context. Every other result (pages, search hits,
- * files, connector data, the screen, shell output, other bots) can carry text an attacker wrote,
- * and taints the run. New tools taint by default.
+ * is treated like the conversation already in context. save_page confirms the bot's own write; its
+ * read mode returns a page's stored source and taints the run in its handler. Every other result
+ * (pages, search hits, files, connector data, the screen, shell output, other bots) can carry text
+ * an attacker wrote, and taints the run. New tools taint by default.
  */
 const OWN_STATE_RESULT_TOOLS = new Set([
   "ask_user",
   "connect_app",
   "attach_file",
   "end_call",
+  "feedback",
   "generate_secret",
   "list_fleet",
   "list_secrets",
@@ -192,6 +238,7 @@ const OWN_STATE_RESULT_TOOLS = new Set([
   "render_plot",
   "request_secret",
   "save_memory",
+  "save_page",
   "save_shared_memory",
   "schedule_cancel",
   "schedule_create",
@@ -205,6 +252,7 @@ const OWN_STATE_RESULT_TOOLS = new Set([
   "search_history",
   "skill_read",
   "task_catalog",
+  "update_preferences",
   "write_file",
 ]);
 
@@ -251,6 +299,12 @@ export function newSiteOutcome(input: {
   if (input.decision === "allow") return "allow";
   return input.trigger === "webhook" ? "deny" : "ask";
 }
+
+/**
+ * These send data to the site their url names, so a site the run was not given is gated, and
+ * "Always allow" on a card naming that site allows the site, never the tool.
+ */
+export const SITE_SENDING_TOOLS: ReadonlySet<string> = new Set(["web_fetch", "paid_request"]);
 
 export function siteAlwaysAllowed(rules: ActionApprovalRule[], site: string): boolean {
   return rules.some(
@@ -336,7 +390,20 @@ export type ActionApprovalResolved = {
   decision: "ask" | "allow" | "deny";
   source: ActionApprovalSource;
   matchingRules: ActionApprovalRule[];
+  /** The rules that produced this decision; broader matches remain in `matchingRules`. */
+  decisiveRules: ActionApprovalRule[];
 };
+
+/**
+ * The saved rules responsible for an ask or block. Broader rules that also matched
+ * are omitted so a refusal points at the decisive rule instead of every candidate.
+ */
+export function decisiveActionApprovalRules(
+  resolved: ActionApprovalResolved,
+): ActionApprovalRule[] {
+  if (resolved.source !== "require_approval" && resolved.source !== "deny") return [];
+  return resolved.decisiveRules.filter((rule) => rule.effect === resolved.source);
+}
 
 /**
  * Deterministic rule resolution. A block always wins, so a narrower allow cannot punch through it.
@@ -345,28 +412,45 @@ export type ActionApprovalResolved = {
  */
 export function resolveActionApprovalDetail(input: {
   toolName: string;
+  toolAliases?: readonly string[];
   connectorKind?: string;
   readOnly?: boolean;
   site?: string;
   rules: ActionApprovalRule[];
 }): ActionApprovalResolved {
   const connectorKind = input.connectorKind ?? connectorKindFromToolName(input.toolName);
-  const matchingRules = input.rules.filter((rule) =>
-    ruleMatches(rule, input.toolName, connectorKind, input.readOnly, input.site),
+  const matchingRules = input.rules.filter(
+    (rule) =>
+      ruleMatches(rule, input.toolName, connectorKind, input.readOnly, input.site) ||
+      (rule.matchKind === "tool" &&
+        input.toolAliases?.some((alias) => alias.toLowerCase() === rule.matchValue.toLowerCase())),
   );
   if (matchingRules.length === 0) {
-    return { decision: "allow", source: "default", matchingRules };
+    return { decision: "allow", source: "default", matchingRules, decisiveRules: [] };
   }
-  if (matchingRules.some((rule) => rule.effect === "deny")) {
-    return { decision: "deny", source: "deny", matchingRules };
+  const denyingRules = matchingRules.filter((rule) => rule.effect === "deny");
+  if (denyingRules.length > 0) {
+    const highestSpecificity = Math.max(...denyingRules.map(ruleSpecificity));
+    return {
+      decision: "deny",
+      source: "deny",
+      matchingRules,
+      decisiveRules: denyingRules.filter((rule) => ruleSpecificity(rule) === highestSpecificity),
+    };
   }
 
   const highestSpecificity = Math.max(...matchingRules.map(ruleSpecificity));
   const winners = matchingRules.filter((rule) => ruleSpecificity(rule) === highestSpecificity);
-  if (winners.some((rule) => rule.effect === "require_approval")) {
-    return { decision: "ask", source: "require_approval", matchingRules };
+  const askingRules = winners.filter((rule) => rule.effect === "require_approval");
+  if (askingRules.length > 0) {
+    return {
+      decision: "ask",
+      source: "require_approval",
+      matchingRules,
+      decisiveRules: askingRules,
+    };
   }
-  return { decision: "allow", source: "always_allow", matchingRules };
+  return { decision: "allow", source: "always_allow", matchingRules, decisiveRules: [] };
 }
 
 export function resolveActionApproval(input: {
@@ -378,29 +462,29 @@ export function resolveActionApproval(input: {
   return resolveActionApprovalDetail(input).decision;
 }
 
-/** Composio sends every batch of actions through this one tool, naming each in `tools[].tool_slug`. */
-export const COMPOSIO_MULTI_EXECUTE_TOOL = "COMPOSIO_MULTI_EXECUTE_TOOL";
-
 /**
- * The actions a Composio batch runs, or undefined when the call is not a batch. `complete` is false
- * when an entry names no action: nothing can show what it does, so the call must ask.
+ * The actions a batch call runs, where `shape` says the call names each one at
+ * `args[items][i][action]`. `complete` is false when an entry names no action, or the call lists
+ * none: nothing can show what it does, so the call must ask.
  */
-export function composioBatchActions(
-  toolName: string,
+export function batchActions(
+  shape: { items: string; action: string },
   args: unknown,
-): { slugs: string[]; complete: boolean } | undefined {
-  if (toolName !== COMPOSIO_MULTI_EXECUTE_TOOL) return undefined;
-  const tools = args && typeof args === "object" ? (args as { tools?: unknown }).tools : undefined;
-  if (!Array.isArray(tools)) return undefined;
-  const slugs = new Set<string>();
-  let complete = tools.length > 0;
-  for (const item of tools) {
-    const slug =
-      item && typeof item === "object" ? (item as { tool_slug?: unknown }).tool_slug : undefined;
-    if (typeof slug === "string" && slug.trim()) slugs.add(slug.trim());
+): { actions: string[]; complete: boolean } {
+  const items =
+    args && typeof args === "object" ? (args as Record<string, unknown>)[shape.items] : undefined;
+  if (!Array.isArray(items)) return { actions: [], complete: false };
+  const actions = new Set<string>();
+  let complete = items.length > 0;
+  for (const item of items) {
+    const action =
+      item && typeof item === "object"
+        ? (item as Record<string, unknown>)[shape.action]
+        : undefined;
+    if (typeof action === "string" && action.trim()) actions.add(action.trim());
     else complete = false;
   }
-  return { slugs: [...slugs], complete };
+  return { actions: [...actions], complete };
 }
 
 /**
@@ -409,14 +493,25 @@ export function composioBatchActions(
  * can only block: a block on the batch tool itself or its connector still stops every batch.
  */
 export function resolveActionApprovalForTools(input: {
-  tools: ReadonlyArray<{ name: string; connectorKind?: string; readOnly?: boolean }>;
+  tools: ReadonlyArray<{
+    name: string;
+    aliases?: readonly string[];
+    connectorKind?: string;
+    readOnly?: boolean;
+  }>;
   wrapper?: { name: string; connectorKind?: string };
   site?: string;
   rules: ActionApprovalRule[];
 }): ActionApprovalResolved {
-  const resolve = (tool: { name: string; connectorKind?: string; readOnly?: boolean }) =>
+  const resolve = (tool: {
+    name: string;
+    aliases?: readonly string[];
+    connectorKind?: string;
+    readOnly?: boolean;
+  }) =>
     resolveActionApprovalDetail({
       toolName: tool.name,
+      toolAliases: tool.aliases,
       connectorKind: tool.connectorKind,
       readOnly: tool.readOnly,
       site: input.site,
@@ -430,7 +525,12 @@ export function resolveActionApprovalForTools(input: {
     parts.find((part) => part.decision === "deny") ?? parts.find((part) => part.decision === "ask");
   if (strictest) return { ...strictest, matchingRules };
   const allAllowed = parts.length > 0 && parts.every((part) => part.source === "always_allow");
-  return { decision: "allow", source: allAllowed ? "always_allow" : "default", matchingRules };
+  return {
+    decision: "allow",
+    source: allAllowed ? "always_allow" : "default",
+    matchingRules,
+    decisiveRules: [],
+  };
 }
 
 /**
@@ -458,18 +558,18 @@ export function approvalPreferenceFromMode(mode: ApprovalMode): {
 export type AutoReviewJudgeDecision = "pass" | "ask" | "error";
 
 /**
- * The gate after rule resolution. A block refuses in every mode. An approval a person must give
- * asks, except in Never ask, which never waits: there it runs when the owner started the run and no
- * outside content entered it, and is refused otherwise, since outside text could have asked for
- * it. Otherwise Never ask runs it, an ask rule asks, and anything that would ask goes to the approval
- * model in Auto, falling back to asking when no model is set up.
+ * The gate after rule resolution. A block refuses in every mode. A purchase asks in every mode, Never
+ * ask included, and no allow rule or review passes it. An approval a person must give
+ * asks, except in Never ask, which never waits: there it runs, unless `steerable` says outside
+ * text could have asked for it. Otherwise Never ask runs it, an ask rule asks, and anything that
+ * would ask goes to the approval model in Auto, falling back to asking when no model is set up.
  */
 export function planActionGate(input: {
   resolved: ActionApprovalResolved;
   mode: ApprovalMode;
   /** Needs a person whatever the rules say (see toolRequiresExplicitApproval). */
   mandatory?: boolean;
-  /** The owner did not start this run, or outside content entered it. */
+  /** Never ask refuses it: the owner did not start this run, or outside content entered it. */
   steerable?: boolean;
   consequential: boolean;
   /**
@@ -480,8 +580,11 @@ export function planActionGate(input: {
   checkerConfigured: boolean;
   /** A fetch to a site the run was not given (see outboundSiteGate). */
   newDestination?: boolean;
+  /** A click that completes a purchase: a person approves it each time, in every mode. */
+  purchase?: boolean;
 }): "ask" | "allow" | "judge" | "deny" {
   if (input.resolved.decision === "deny") return "deny";
+  if (input.purchase) return "ask";
   if (input.mandatory) {
     if (input.mode !== "never") return "ask";
     return input.steerable ? "deny" : "allow";
@@ -535,4 +638,22 @@ export function isApprovalAskBlock(block: {
     actionIds.has("deny") &&
     [...actionIds].every((id) => id === "allow" || id === "always" || id === "deny")
   );
+}
+
+/**
+ * A payment receipt's page lines, leaving out any the page named like one of the card's own rows
+ * (`labels`, as the app words them), so merchant text never reads as the card's.
+ */
+export function receiptItems<Item extends { name: string }>(
+  items: readonly Item[],
+  labels: readonly string[],
+): Item[] {
+  const own = labels.map((label) => label.trim().toLocaleLowerCase()).filter(Boolean);
+  return items.filter((item) => {
+    const name = item.name.trim().toLocaleLowerCase();
+    // "Total" and "Total due" pose as the card's row; "Totally Oats" doesn't.
+    return !own.some(
+      (label) => name.startsWith(label) && !/^[\p{L}\p{N}]/u.test(name.slice(label.length)),
+    );
+  });
 }

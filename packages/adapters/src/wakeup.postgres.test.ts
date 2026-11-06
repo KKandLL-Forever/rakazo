@@ -1,4 +1,5 @@
 import type { BackgroundJob, BackgroundJobHandlers } from "@rakazo/adapter-kit";
+import { messagingDeliverJob, routineWakeupJob } from "@rakazo/adapter-kit";
 import type { PrismaClient } from "@rakazo/db";
 import { createPool, currentDbContext, runAsTenant } from "@rakazo/db";
 import { Pool } from "pg";
@@ -38,6 +39,8 @@ function handlers(overrides: Partial<BackgroundJobHandlers> = {}): BackgroundJob
     "messaging.deliver": vi.fn(async () => undefined),
     "messaging.credential-cleanup": vi.fn(async () => undefined),
     "cloud_agent.poll": vi.fn(async () => undefined),
+    "purchase.poll": vi.fn(async () => undefined),
+    "media.poll": vi.fn(async () => undefined),
     "push.receipt": vi.fn(async () => undefined),
     ...overrides,
   };
@@ -153,6 +156,66 @@ describePostgres("Graphile background jobs (PostgreSQL contract)", () => {
       await host.stop();
       await publisher.close();
       await legacy.close();
+    }
+  });
+
+  it("starts due maintenance jobs while others are still running", async () => {
+    const publisher = new GraphileJobPublisher(testPool());
+    const host = createReservedGraphileJobWorkerHost(testPool(), { pollInterval: 25 });
+    const release = deferred();
+    const sleeping: string[] = [];
+    const woken: string[] = [];
+    try {
+      await host.start(
+        handlers({
+          "computer.sleep": async ({ computerId }) => {
+            sleeping.push(computerId);
+            await release.promise;
+          },
+          "routine.wakeup": async ({ routineId }) => {
+            woken.push(routineId);
+          },
+        }),
+      );
+      for (const computerId of ["computer-a", "computer-b", "computer-c"]) {
+        await publisher.enqueue({ name: "computer.sleep", payload: { computerId } });
+      }
+      await waitFor(() => expect(sleeping).toHaveLength(3));
+      await publisher.enqueue(routineWakeupJob("routine-due", new Date()));
+      await waitFor(() => expect(woken).toEqual(["routine-due"]));
+    } finally {
+      release.resolve();
+      await host.stop();
+      await publisher.close();
+    }
+  });
+
+  it("runs outgoing message drains in parallel", async () => {
+    const publisher = new GraphileJobPublisher(testPool());
+    const host = createReservedGraphileJobWorkerHost(testPool(), { pollInterval: 25 });
+    const release = deferred();
+    const draining: string[] = [];
+    try {
+      await host.start(
+        handlers({
+          "messaging.deliver": async ({ runId }) => {
+            draining.push(runId ?? "drain");
+            await release.promise;
+          },
+        }),
+      );
+      await publisher.enqueue(messagingDeliverJob("run-first"));
+      await waitFor(() => expect(draining).toEqual(["run-first"]));
+      // The second drain starts while the first is still sending: one slow
+      // conversation must not hold back the rest of the outbox. Order inside a
+      // conversation is kept by the drain's claim, not by a shared queue.
+      await publisher.enqueue(messagingDeliverJob("run-second"));
+      await waitFor(() => expect(draining).toEqual(["run-first", "run-second"]));
+      release.resolve();
+    } finally {
+      release.resolve();
+      await host.stop();
+      await publisher.close();
     }
   });
 
@@ -300,9 +363,62 @@ describePostgres("Graphile background jobs (PostgreSQL contract)", () => {
       release.resolve();
       await stopping;
       expect(completed).toBe(true);
+      // The completion is written before stop returns, so the worker can exit right after.
+      const { rowCount } = await testPool().query(
+        "select 1 from graphile_worker._private_jobs where payload->>'runId' = 'graceful-stop' or payload->'payload'->>'runId' = 'graceful-stop'",
+      );
+      expect(rowCount).toBe(0);
     } finally {
       release.resolve();
       await host.stop();
+      await publisher.close();
+    }
+  });
+
+  it("hands a job still running at the drain deadline back for another worker to retry", async () => {
+    const publisher = new GraphileJobPublisher(testPool());
+    const host = new GraphileJobWorkerHost(testPool(), {
+      concurrency: 1,
+      pollInterval: 25,
+      drainTimeoutMs: 200,
+    });
+    const entered = deferred();
+    const hung = deferred();
+    const target = handlers({
+      "computer.sleep": async () => {
+        entered.resolve();
+        await hung.promise;
+      },
+    });
+    const key = "computer.sleep:drain-deadline";
+
+    try {
+      await host.start(target);
+      await publisher.enqueue({
+        name: "computer.sleep",
+        payload: { computerId: "drain-deadline" },
+        replaceKey: key,
+      });
+      await entered.promise;
+      await host.stop();
+
+      const { rows } = await testPool().query<{
+        locked_at: Date | null;
+        last_error: string | null;
+        attempts: number;
+        max_attempts: number;
+      }>(
+        "select locked_at, last_error, attempts, max_attempts from graphile_worker._private_jobs where key = $1",
+        [key],
+      );
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.locked_at).toBeNull();
+      expect(rows[0]!.last_error).toBeTruthy();
+      expect(rows[0]!.attempts).toBeLessThan(rows[0]!.max_attempts);
+    } finally {
+      hung.resolve();
+      await host.stop();
+      await testPool().query("select graphile_worker.remove_job($1::text)", [key]);
       await publisher.close();
     }
   });
@@ -311,31 +427,42 @@ describePostgres("Graphile background jobs (PostgreSQL contract)", () => {
     const publisher = new GraphileJobPublisher(testPool());
     const host = new GraphileJobWorkerHost(testPool(), { concurrency: 1, pollInterval: 25 });
     const received: string[] = [];
+    let ranAt = 0;
     const target = handlers({
       "computer.sleep": async ({ computerId }) => {
+        // Database time: the clock Graphile compares `run_at` against.
+        const { rows } = await testPool().query<{ now: Date }>("select clock_timestamp() as now");
+        ranAt = rows[0]!.now.getTime();
         received.push(computerId);
       },
     });
     const key = `contract:replacement:${Date.now()}`;
 
     try {
-      await host.start(target);
       await publisher.enqueue({
         name: "computer.sleep",
         payload: { computerId: "old" },
         availableAt: new Date(Date.now() + 300),
         replaceKey: key,
       });
+      const deadline = new Date(Date.now() + 800);
       await publisher.enqueue({
         name: "computer.sleep",
         payload: { computerId: "replacement" },
-        availableAt: new Date(Date.now() + 800),
+        availableAt: deadline,
         replaceKey: key,
       });
+      // The replacement must carry its own deadline, not keep the old job's:
+      // a payload swap at the 300 ms schedule would run it early.
+      expect((await keyedRow(key))?.runAt.getTime()).toBe(deadline.getTime());
 
-      await new Promise((resolve) => setTimeout(resolve, 500));
-      expect(received).toEqual([]);
+      await host.start(target);
+      // The replacement ran at its own later deadline, so the worker has polled
+      // well past the old job's earlier one; the exact list proves the old
+      // payload never ran.
       await waitFor(() => expect(received).toEqual(["replacement"]));
+      // It ran no earlier than its own deadline, so the worker honoured the schedule.
+      expect(ranAt).toBeGreaterThanOrEqual(deadline.getTime());
     } finally {
       await host.stop();
       await publisher.cancel(key).catch(() => undefined);
@@ -358,8 +485,21 @@ describePostgres("Graphile background jobs (PostgreSQL contract)", () => {
         replaceKey: key,
       });
       await publisher.cancel(key);
-      await new Promise((resolve) => setTimeout(resolve, 600));
-      expect(target["computer.sleep"]).not.toHaveBeenCalled();
+      // A sentinel due after the cancelled job proves the worker has polled past
+      // the cancelled job's deadline, so its silence is real, not a missed poll.
+      await publisher.enqueue({
+        name: "computer.sleep",
+        payload: { computerId: "sentinel" },
+        availableAt: new Date(Date.now() + 450),
+      });
+      await waitFor(() =>
+        expect(target["computer.sleep"]).toHaveBeenCalledWith(
+          expect.objectContaining({ computerId: "sentinel" }),
+        ),
+      );
+      expect(target["computer.sleep"]).not.toHaveBeenCalledWith(
+        expect.objectContaining({ computerId: "cancelled" }),
+      );
     } finally {
       await host.stop();
       await publisher.close();

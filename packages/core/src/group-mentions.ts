@@ -3,7 +3,6 @@ export type GroupMemberRef = {
   name: string;
 };
 
-/** The roster name of a group member bot, when the roster knows it. */
 export function memberName(
   members: readonly { botId: string; name: string }[] | undefined,
   botId: string | undefined,
@@ -36,12 +35,15 @@ export function parseMentionNames(text: string): string[] {
   return [...names];
 }
 
-export function resolveGroupTargetBotIds(input: {
+type GroupTargetInput = {
   text: string;
   members: GroupMemberRef[];
   /** Bot ids from typed mention chips (non-members are ignored for wake). */
   explicitMentions?: string[];
-}): string[] {
+};
+
+/** Members a message names (chip, @Name or @everyone). Empty when it names nobody. */
+export function mentionedGroupBotIds(input: GroupTargetInput): string[] {
   const membersById = new Map(input.members.map((member) => [member.id, member]));
   const targetIds = new Set<string>();
 
@@ -70,11 +72,13 @@ export function resolveGroupTargetBotIds(input: {
     }
   }
 
-  if (targetIds.size === 0 && input.members[0]) {
-    targetIds.add(input.members[0].id);
-  }
-
   return [...targetIds];
+}
+
+/** Named members wake; a message that names nobody reaches every member. */
+export function resolveGroupTargetBotIds(input: GroupTargetInput): string[] {
+  const mentioned = mentionedGroupBotIds(input);
+  return mentioned.length > 0 ? mentioned : input.members.map((member) => member.id);
 }
 
 export function inferHandoffTargetName(prompt: string): string | undefined {

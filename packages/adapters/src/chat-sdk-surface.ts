@@ -16,8 +16,9 @@ import type {
   MessagingSurface,
 } from "@rakazo/adapter-kit";
 import { getLogger } from "@rakazo/logging";
-import type { Adapter, Message, PostableMarkdown, Thread } from "chat";
-import { Chat, isLinkNode, text, toPlainText, walkAst } from "chat";
+import type { Adapter, Message, PostableMarkdown, Root, Thread } from "chat";
+import { Chat, isLinkNode, paragraph, parseMarkdown, root, text, toPlainText, walkAst } from "chat";
+import { getLarkTextParts } from "./lark/text-parts.js";
 
 /**
  * Per-webhook drain of Chat SDK waitUntil work, plus the Chat dedupe keys of
@@ -26,7 +27,34 @@ import { Chat, isLinkNode, text, toPlainText, walkAst } from "chat";
 const webhookDrain = new AsyncLocalStorage<{
   pending: Promise<unknown>[];
   failedKeys: string[];
+  markdownChars: number;
 }>();
+
+/**
+ * Markdown parsing is superlinear on hostile text (unmatched emphasis, deep
+ * quotes), so past this many characters in one webhook the text stays literal.
+ */
+export const INBOUND_MARKDOWN_MAX_CHARS = 8_000;
+
+/** Bound the adapter's inbound text-to-markdown parsing per webhook; sends are untouched. */
+export function boundInboundMarkdown(adapter: Adapter): void {
+  const converter = (adapter as unknown as { formatConverter: { toAst(value: string): Root } })
+    .formatConverter;
+  const toAst = converter.toAst.bind(converter);
+  converter.toAst = (value) => {
+    const drain = webhookDrain.getStore();
+    if (!drain) return toAst(value);
+    drain.markdownChars += value.length;
+    if (drain.markdownChars <= INBOUND_MARKDOWN_MAX_CHARS) {
+      try {
+        return toAst(value);
+      } catch {
+        // Deep nesting overflows the parser's stack.
+      }
+    }
+    return root([paragraph([text(value)])]);
+  };
+}
 
 /** Inbound webhook bodies larger than this are rejected before parsing. */
 export const MESSAGING_WEBHOOK_MAX_BODY_BYTES = 256 * 1024;
@@ -68,8 +96,32 @@ export interface MessagingPlatform {
   isPermanentSendError?: (error: unknown) => boolean;
   /** Group roster addresses from the raw inbound payload, excluding our line. */
   participants?: (raw: unknown) => string[];
-  /** Group display name from the raw inbound payload. */
+  /**
+   * When the raw payload says its roster was current, when the platform reports
+   * a time for the event; null when it reports none, so no comparison happens.
+   */
+  rosterAt?: (raw: unknown) => Date | null;
+  /**
+   * Member departures one raw payload reports, for platforms that send
+   * per-event leave notices instead of a roster (Telegram service messages).
+   * `botLeft` marks our own bot leaving the conversation; undefined when the
+   * payload reports no departure.
+   */
+  departures?: (raw: unknown) => { addresses: string[]; botLeft: boolean } | undefined;
   channelName?: (raw: unknown) => string | null;
+  /**
+   * Group-shaped raw payloads this platform still refuses (Telegram broadcast
+   * channel posts, which are not group conversations). Omitted by platforms
+   * that take every group message.
+   */
+  acceptsGroup?: (raw: unknown) => boolean;
+  /**
+   * Rewrites the adapter's native thread id for Rakazo thread identity when
+   * the SDK's granularity differs from the platform's conversations: Telegram
+   * marks a non-forum reply with the reply root as its message thread id,
+   * which is still the group's own conversation.
+   */
+  normalizeThreadId?: (threadId: string, raw: unknown) => string;
   /** User-facing transport carried by the raw message when it differs from the provider. */
   transport?: (raw: unknown) => string | null;
   /**
@@ -212,11 +264,15 @@ export class ChatSdkMessagingSurface implements MessagingSurface {
     await this.ensureInitialized();
     // Telegram converts Markdown and retries parse errors as plain text;
     // WhatsApp renders it as its own formatting and Lark posts it as an md
-    // block. Keep the other adapters' plain payloads (Slack markdown_text has
-    // a lower limit, iMessage has no markup).
+    // block; Photon's iMessage adapter renders it as native styled text. Keep
+    // the other adapters' plain payloads (Slack markdown_text has a lower
+    // limit, Sendblue's iMessage has no markup).
     const telegram = mounted.adapterName === "telegram";
     const markdown =
-      telegram || mounted.adapterName === "whatsapp" || mounted.adapterName === "lark";
+      telegram ||
+      mounted.adapterName === "whatsapp" ||
+      mounted.adapterName === "lark" ||
+      mounted.adapterName === "imessage";
     const { attachment } = request;
     if (telegram && attachment && attachment.data.byteLength > TELEGRAM_UPLOAD_MAX_BYTES) {
       throw new MessagingSendError(new Error("File is larger than Telegram accepts"), {
@@ -388,7 +444,11 @@ export class ChatSdkMessagingSurface implements MessagingSurface {
     // only register the work via waitUntil. Drain that work before ACKing so
     // a vendor 200 cannot race ahead of provision/enqueue, and surface sink
     // failures as 5xx so the vendor retries.
-    const drain = { pending: [] as Promise<unknown>[], failedKeys: [] as string[] };
+    const drain = {
+      pending: [] as Promise<unknown>[],
+      failedKeys: [] as string[],
+      markdownChars: 0,
+    };
     const response = await webhookDrain.run(drain, async () => {
       const adapterResponse = await chat.webhooks[adapterName]!(forwarded, {
         waitUntil: (task) => {
@@ -426,22 +486,29 @@ export class ChatSdkMessagingSurface implements MessagingSurface {
     if (message.author.isMe || message.author.isSystem) return null;
     const { platform } = mounted;
     if (!isDirect && !platform.capabilities.groups) return null;
+    if (!isDirect && platform.acceptsGroup?.(message.raw) === false) return null;
     const fromLabel = message.author.fullName || message.author.userName || null;
     const transport = platform.transport?.(message.raw) ?? null;
     const attachments = inboundAttachments(message);
+    const departures = isDirect ? undefined : platform.departures?.(message.raw);
+    const rosterAt = isDirect ? undefined : (platform.rosterAt?.(message.raw) ?? undefined);
     const base: MessagingInboundMessage = {
       type: "message",
       provider: platform.provider,
       ...(transport ? { transport } : {}),
       handle: message.id,
-      threadId: toProviderThreadId(mounted, threadId),
+      threadId: toProviderThreadId(
+        mounted,
+        platform.normalizeThreadId?.(threadId, message.raw) ?? threadId,
+      ),
       isDirect,
       from: message.author.userId,
       fromLabel: fromLabel === message.author.userId ? null : fromLabel,
       channelName: isDirect ? null : (platform.channelName?.(message.raw) ?? null),
       participants: isDirect ? [] : (platform.participants?.(message.raw) ?? []),
+      ...(rosterAt ? { rosterAt } : {}),
       content: [
-        plainTextWithLinks(message),
+        plainTextWithLinks(message, platform.provider === "lark"),
         ...(attachments.length
           ? message.attachments
               .filter((file) => !file.fetchData && file.url)
@@ -453,6 +520,7 @@ export class ChatSdkMessagingSurface implements MessagingSurface {
       mediaUrl: message.attachments.find((attachment) => attachment.url)?.url ?? null,
       ...(attachments.length ? { attachments } : {}),
       ...(!isDirect && message.isMention ? { mentionsBot: true } : {}),
+      ...(departures ? { departures } : {}),
     };
     const enrichment = platform.enrichTeamRoom?.(message.raw, base) ?? {};
     return { ...base, ...enrichment };
@@ -501,9 +569,54 @@ function inboundAttachments(message: Message): MessagingInboundAttachment[] {
  * The SDK's message.text keeps only a link's label, so a Slack link labelled
  * `example.com/projects/…` reaches the model without its target.
  */
-function plainTextWithLinks(message: Message): string {
+function plainTextWithLinks(message: Message, lark: boolean): string {
+  const parts = lark ? getLarkTextParts(message.formatted) : undefined;
+  if (parts) {
+    const rendered = parts.map((part, index) => {
+      if (part.literal) return { value: part.text, addedTarget: false };
+      const value = part.text;
+      if (!value.trim()) return { value, addedTarget: false };
+      const result = renderLinks(parseMarkdown(value));
+      const first = result.ast.children.at(0);
+      const last = result.ast.children.at(-1);
+      const start = first?.position?.start.offset ?? 0;
+      const end = last?.position?.end.offset ?? value.length;
+      const prefix = value.slice(0, start);
+      const previous = parts[index - 1];
+      const sameLine = previous?.literal && !previous.text.endsWith("\n") && !prefix.includes("\n");
+      const leading = sameLine ? prefix : prefix.replace(/[^\r\n]/g, "");
+      let trailing = value.slice(end);
+      // Markdown drops spaces at a fragment boundary; preserve them when the
+      // next structured item is on the same row.
+      if (last?.type === "paragraph" && !trailing && parts[index + 1]?.literal)
+        trailing = value.match(/[ \t]+$/)?.[0] ?? "";
+      // A heading followed by a code row has the same paragraph separation as
+      // a heading followed by ordinary text in the SDK's plain-text renderer.
+      const headingBreak =
+        parts[index + 1]?.literal &&
+        result.ast.children.at(-1)?.type === "heading" &&
+        trailing === "\n"
+          ? "\n"
+          : "";
+      return {
+        value: leading + toPlainText(result.ast) + headingBreak + trailing,
+        addedTarget: result.addedTarget,
+      };
+    });
+    return rendered.some((part) => part.addedTarget)
+      ? rendered.map((part) => part.value).join("")
+      : (message.text ?? "");
+  }
+  const result = renderLinks(message.formatted);
+  return result.addedTarget ? toPlainText(result.ast) : (message.text ?? "");
+}
+
+function renderLinks(formatted: Message["formatted"]): {
+  ast: Message["formatted"];
+  addedTarget: boolean;
+} {
   let addedTarget = false;
-  const ast = walkAst(structuredClone(message.formatted), (node) => {
+  const ast = walkAst(structuredClone(formatted), (node) => {
     if (!isLinkNode(node)) return node;
     const label = toPlainText({ type: "root", children: node.children }).trim();
     const bare = node.url.replace(/^(?:https?:\/\/|mailto:)/, "");
@@ -516,7 +629,7 @@ function plainTextWithLinks(message: Message): string {
     addedTarget = true;
     return text(`${label} (${node.url})`);
   });
-  return addedTarget ? toPlainText(ast) : (message.text ?? "");
+  return { ast, addedTarget };
 }
 
 export function providerOfThreadId(threadId: string): string {

@@ -14,7 +14,15 @@ import {
   ContextMenuTrigger,
   GroupAvatar,
 } from "@rakazo/ui-web";
-import { ChevronDown, CircleAlert, Lock, MoreHorizontal, Pencil, Trash2 } from "lucide-react";
+import {
+  ChevronDown,
+  CircleAlert,
+  Lock,
+  MoreHorizontal,
+  Pencil,
+  Trash2,
+  Users,
+} from "lucide-react";
 import type { Dispatch, ReactNode, RefObject, SetStateAction } from "react";
 import { Suspense } from "react";
 import { IconTooltip } from "../../components/IconTooltip";
@@ -26,6 +34,7 @@ import {
 } from "../../lib/roster-status";
 import type { RosterDropAction, RosterDropTarget } from "./roster-drop";
 import type { sidebarGroupsForSpaces } from "./space-sidebar";
+import { useRedrawAtMidnight } from "./use-redraw-at-midnight";
 
 export function SidebarRoster({
   sidebarGroups,
@@ -90,6 +99,7 @@ export function SidebarRoster({
   botMenuContent: ReactNode;
   mini?: boolean;
 }) {
+  useRedrawAtMidnight();
   const { t } = useLingui();
   return (
     <>
@@ -155,7 +165,7 @@ export function SidebarRoster({
                       render={
                         group.emptySpaceId ? <button type="button" /> : <CollapsibleTrigger />
                       }
-                      className={`flex min-w-0 items-center justify-between gap-2 rounded-lg px-2.5 py-1 text-[11px] font-semibold tracking-wider uppercase text-foreground focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-ring ${hasSpaceActions ? "col-start-1 row-start-1 w-full" : "flex-1"}`}
+                      className={`flex min-w-0 items-center justify-between gap-2 rounded-lg px-2.5 py-1 text-label font-medium text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-ring ${hasSpaceActions ? "col-start-1 row-start-1 w-full" : "flex-1"}`}
                       onClick={() => {
                         if (group.emptySpaceId) {
                           openSpaceChat(group.emptySpaceId, "/onboarding");
@@ -187,7 +197,11 @@ export function SidebarRoster({
                         className={`flex min-w-0 items-center gap-1.5 truncate ${hasSpaceActions ? "pe-7" : ""}`}
                       >
                         {group.showLock ? (
-                          <Lock size={11} strokeWidth={2} aria-hidden="true" />
+                          group.shared ? (
+                            <Users size={11} strokeWidth={2} aria-hidden="true" />
+                          ) : (
+                            <Lock size={11} strokeWidth={2} aria-hidden="true" />
+                          )
                         ) : null}
                         <span className="truncate">{group.title}</span>
                         {group.subtitle ? (
@@ -300,6 +314,7 @@ export function SidebarRoster({
                 const avatar =
                   item.kind === "bot" ? (
                     <BotAvatar
+                      avatarSet={item.chat.avatarSet}
                       color={item.chat.color}
                       identity={item.chat.id}
                       size={mini ? 40 : compact ? 28 : 38}
@@ -443,7 +458,7 @@ export function SidebarRoster({
                             <span
                               dir="auto"
                               data-roster-bot-name={item.kind === "bot" ? "" : undefined}
-                              className={`min-w-0 truncate text-body2 text-foreground ${
+                              className={`max-w-full shrink-0 truncate text-body-sm text-foreground ${
                                 item.chat.unread ? "font-semibold" : "font-medium"
                               }`}
                             >
@@ -473,13 +488,6 @@ export function SidebarRoster({
                             ) : null}
                           </div>
                         </div>
-                        {!compact && item.kind === "bot" && item.chat.title ? (
-                          <div className="mt-1 flex">
-                            <span className="max-w-full truncate rounded-md border border-border bg-muted px-2 py-0.5 text-[11px] font-normal text-muted-foreground">
-                              {item.chat.title}
-                            </span>
-                          </div>
-                        ) : null}
                         {compact ? (
                           compactStatusLabel ? (
                             <div
@@ -491,7 +499,7 @@ export function SidebarRoster({
                                     ? item.chat.status
                                     : undefined
                               }
-                              className={`mt-0.5 flex items-center gap-1 text-[11.5px] ${
+                              className={`mt-0.5 flex items-center gap-1 text-label ${
                                 rowError
                                   ? "font-medium text-destructive"
                                   : workStatusLabel

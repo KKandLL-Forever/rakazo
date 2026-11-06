@@ -1,6 +1,6 @@
 import type { MessageBlock } from "@rakazo/contracts";
 import { callIdFromClientNonce, isBackgroundRunTrigger, redactSecrets } from "@rakazo/core";
-import type { Prisma } from "@rakazo/db";
+import type { Prisma, RunLease } from "@rakazo/db";
 import {
   appendEventInTransaction,
   createThreadMessageInTransaction,
@@ -8,6 +8,25 @@ import {
 } from "@rakazo/db";
 import { getLogger } from "@rakazo/logging";
 import type { ExecutorDeps } from "./executor-deps.js";
+
+/** Deps for one attempt: its run's history writes carry the lease, so a superseded attempt cannot write. */
+export function withRunLease(deps: ExecutorDeps, runId: string, lease: RunLease): ExecutorDeps {
+  return {
+    ...deps,
+    runLease: { runId, ...lease },
+    events: {
+      ...deps.events,
+      append: (input) => deps.events.append(input.runId === runId ? { lease, ...input } : input),
+    },
+  };
+}
+
+export function runLeaseFor(
+  deps: Pick<ExecutorDeps, "runLease">,
+  runId: string,
+): RunLease | undefined {
+  return deps.runLease?.runId === runId ? deps.runLease : undefined;
+}
 
 export function redactBlocks(blocks: MessageBlock[], secrets: string[]): MessageBlock[] {
   return blocks.map((block) => {
@@ -19,6 +38,17 @@ export function redactBlocks(blocks: MessageBlock[], secrets: string[]): Message
     }
     if (block.kind === "bot_message_sent" || block.kind === "bot_message_received") {
       return { ...block, text: redactSecrets(block.text, secrets) };
+    }
+    if (block.kind === "page") return { ...block, title: redactSecrets(block.title, secrets) };
+    if (block.kind === "steps") {
+      return {
+        ...block,
+        steps: block.steps.map((step) => ({
+          ...step,
+          label: redactSecrets(step.label, secrets),
+          ...(step.note === undefined ? {} : { note: redactSecrets(step.note, secrets) }),
+        })),
+      };
     }
     return block;
   });
@@ -44,6 +74,7 @@ export async function publishMessage(
     blocks = blocks.filter((block) => block.kind === "ask" || block.kind === "computer");
     if (blocks.length === 0 && !stoppedHelper) return null;
   }
+  const lease = runLeaseFor(deps, run.id);
   // Concurrent runs in one thread contend for its sequence counters; Postgres aborts a
   // deadlock victim, which commits nothing, so retry instead of failing the run.
   const committed = await withTransactionRetry(() =>
@@ -61,6 +92,7 @@ export async function publishMessage(
           type: "thread.subagent",
           payload,
           allowCancelledRun: true,
+          lease,
         });
       }
       if (blocks.length === 0 && helperEvent)
@@ -73,6 +105,7 @@ export async function publishMessage(
         markUnread,
         clientNonce,
         Boolean(stoppedHelper),
+        lease,
       );
     }),
   );
@@ -92,6 +125,7 @@ export async function persistMessageInTransaction(
   markUnread?: boolean,
   clientNonce?: string,
   allowCancelledRun = false,
+  lease?: RunLease,
 ) {
   const message = await createThreadMessageInTransaction(tx, {
     threadId: run.threadId,
@@ -102,6 +136,7 @@ export async function persistMessageInTransaction(
     markUnread,
     clientNonce,
     allowCancelledRun,
+    lease,
   });
   const event = await appendEventInTransaction(tx, {
     spaceId: run.spaceId,
@@ -110,6 +145,7 @@ export async function persistMessageInTransaction(
     type: "thread.message.created",
     runId: run.id,
     allowCancelledRun,
+    lease,
     payload: {
       messageId: message.id,
       role,

@@ -13,17 +13,22 @@ import {
 } from "react";
 import { Navigate, Outlet, Route, Routes, useLocation, useSearchParams } from "react-router-dom";
 import { LoadingState } from "./components/ai/primitives";
+import { CallLayout } from "./components/call/CallLayout";
 import { ErrorBoundary } from "./components/ErrorBoundary";
+import { MarkdownLinkPrompt } from "./components/markdown-link-prompt";
 import { PageLoading } from "./components/PageLoading";
 import { SubscriptionGate } from "./components/SubscriptionGate";
 import { authClient } from "./lib/auth";
 import { getTicketBoardEnabled, subscribeTicketBoardEnabled } from "./lib/bootstrap";
+import { syncCallIdentity } from "./lib/call-session";
 import { desktopBridge } from "./lib/desktop";
+import { syncWebLogoAvatarIdentity } from "./lib/logo-avatar-activity";
 import { identifyMonitoringUser } from "./lib/monitoring";
 import { markAfterPaint, markOnce } from "./lib/performance";
 import { lazyComponent } from "./lib/preload-recovery";
 import { QueryUserProvider, setQueryUser } from "./lib/query";
 import { getRemoteImagesEnabled, subscribeRemoteImages } from "./lib/remote-images-preference";
+import { hasSignedInBefore, rememberSignedIn } from "./lib/returning-user";
 import { rpc } from "./lib/rpc";
 import {
   holdAnonymousGate,
@@ -32,11 +37,20 @@ import {
   sessionRetryDelayMs,
   showSessionUnavailable,
 } from "./lib/session-gate";
+import {
+  MCP_OAUTH_CALLBACK_PATH,
+  newAccountDestination,
+  SLACK_INSTALL_CALLBACK_PATH,
+  signInNext,
+} from "./lib/sign-in-next";
+import { syncLogOutFailure } from "./lib/sign-out";
 import { completeSsoCallback, SSO_CALLBACK_PATH } from "./lib/sso-flow";
 import { IntegrationCallbackPage } from "./pages/IntegrationCallback";
 import { IntegrationSetupPage } from "./pages/IntegrationSetup";
 import { McpOAuthCallbackPage } from "./pages/McpOAuthCallback";
+import { SharedPagePage } from "./pages/SharedPage";
 import { ShellPage } from "./pages/Shell";
+import { SlackInstallCallbackPage } from "./pages/SlackInstallCallback";
 
 const AuthPage = lazyComponent(() => import("./pages/Auth").then((module) => module.AuthPage));
 const PasswordResetPage = lazyComponent(() =>
@@ -45,15 +59,24 @@ const PasswordResetPage = lazyComponent(() =>
 const OnboardingPage = lazyComponent(() =>
   import("./pages/Onboarding").then((module) => module.OnboardingPage),
 );
-const WelcomePage = lazyComponent(() =>
-  import("./pages/Welcome").then((module) => module.WelcomePage),
+const NotFoundPage = lazyComponent(() =>
+  import("./pages/NotFound").then((module) => module.NotFoundPage),
 );
 const ArtifactsPage = lazyComponent(() =>
   import("./pages/Artifacts").then((module) => module.ArtifactsPage),
 );
 const BoardPage = lazyComponent(() => import("./pages/Board").then((module) => module.BoardPage));
+const AdminPluginsPage = lazyComponent(() =>
+  import("./pages/AdminPluginsPage").then((module) => module.AdminPluginsPage),
+);
+const AdminAccessPage = lazyComponent(() =>
+  import("./pages/AdminAccessPage").then((module) => module.AdminAccessPage),
+);
 const NavLinkPage = lazyComponent(() =>
   import("./pages/NavLinkPage").then((module) => module.NavLinkPage),
+);
+const InvitePage = lazyComponent(() =>
+  import("./pages/Invite").then((module) => module.InvitePage),
 );
 
 function SsoCallbackPage() {
@@ -93,15 +116,14 @@ export function App() {
 
 function SessionApp() {
   const [searchParams] = useSearchParams();
-  const signInDestination =
-    searchParams.get("next") === "/integrations/setup" ? "/integrations/setup" : "/app";
+  const next = signInNext(searchParams.get("next"));
   const ticketBoardEnabled = useSyncExternalStore(
     subscribeTicketBoardEnabled,
     getTicketBoardEnabled,
     () => false,
   );
   const session = authClient.useSession();
-  const pathname = useLocation().pathname;
+  const { pathname, search } = useLocation();
   const screen = analyticsScreen(pathname);
   const analyticsUserId = session.data?.user.id;
   const lastScreen = useRef<string | undefined>(undefined);
@@ -124,6 +146,13 @@ function SessionApp() {
       .catch(() => undefined);
   }, [analyticsUserId, screen]);
   const gate = sessionGate(session);
+  useLayoutEffect(() => {
+    if (gate !== "authenticated" && gate !== "anonymous") return;
+    syncWebLogoAvatarIdentity(analyticsUserId ?? null);
+    syncCallIdentity(analyticsUserId ?? null);
+    syncLogOutFailure(gate === "authenticated");
+    if (gate === "authenticated") rememberSignedIn();
+  }, [gate, analyticsUserId]);
   useEffect(() => {
     if (gate === "authenticated" || gate === "anonymous") setQueryUser(analyticsUserId ?? null);
   }, [gate, analyticsUserId]);
@@ -150,66 +179,132 @@ function SessionApp() {
   const user = session.data?.user;
   return (
     <QueryUserProvider value={user?.id ?? null}>
-      <div className="h-full" data-rakazo-app-state="ready">
-        <Suspense fallback={<PageLoading />}>
-          <Routes>
-            <Route path="/" element={user ? <Navigate to="/app" replace /> : <WelcomePage />} />
-            <Route
-              path="/sign-in"
-              element={
-                user ? <Navigate to={signInDestination} replace /> : <AuthPage key="in" mode="in" />
-              }
-            />
-            <Route
-              path="/sign-up"
-              element={
-                user ? <Navigate to="/onboarding" replace /> : <AuthPage key="up" mode="up" />
-              }
-            />
-            <Route
-              path="/forgot-password"
-              element={
-                user ? <Navigate to="/app" replace /> : <AuthPage key="forgot" mode="forgot" />
-              }
-            />
-            <Route path="/reset-password" element={<PasswordResetPage />} />
-            <Route
-              path="/mcp/oauth/callback"
-              element={user ? <McpOAuthCallbackPage /> : <Navigate to="/sign-in" replace />}
-            />
-            <Route
-              path="/integrations/setup"
-              element={
-                user ? (
-                  <IntegrationSetupPage />
-                ) : (
-                  <Navigate to="/sign-in?next=/integrations/setup" replace />
-                )
-              }
-            />
-            <Route
-              element={
-                user ? (
-                  <SubscriptionGate fallback={<PageLoading />}>
-                    <Outlet />
-                  </SubscriptionGate>
-                ) : (
-                  <Navigate to="/sign-in" replace />
-                )
-              }
-            >
-              <Route path="/onboarding/:step?" element={<OnboardingPage />} />
-              <Route path="/app" element={<ShellPage />} />
-              <Route path="/app/g/:groupId" element={<ShellPage />} />
-              <Route path="/app/artifacts" element={<ArtifactsPage />} />
-              <Route path="/app/artifacts/:artifactId" element={<ArtifactsPage />} />
-              {ticketBoardEnabled ? <Route path="/app/board" element={<BoardPage />} /> : null}
-              <Route path="/app/x/:linkId" element={<NavLinkPage />} />
-              <Route path="/app/:botId" element={<ShellPage />} />
-            </Route>
-          </Routes>
-        </Suspense>
-      </div>
+      <MarkdownLinkPrompt>
+        <div className="h-full" data-rakazo-app-state="ready">
+          <Suspense fallback={<PageLoading />}>
+            <Routes>
+              <Route
+                path="/"
+                element={
+                  <Navigate
+                    to={user ? "/app" : hasSignedInBefore() ? "/sign-in" : "/sign-up"}
+                    replace
+                  />
+                }
+              />
+              <Route
+                path="/sign-in"
+                element={
+                  user ? <Navigate to={next ?? "/app"} replace /> : <AuthPage key="in" mode="in" />
+                }
+              />
+              <Route
+                path="/sign-up"
+                element={
+                  user ? (
+                    <Navigate to={newAccountDestination(next)} replace />
+                  ) : (
+                    <AuthPage key="up" mode="up" />
+                  )
+                }
+              />
+              <Route
+                path="/forgot-password"
+                element={
+                  user ? <Navigate to="/app" replace /> : <AuthPage key="forgot" mode="forgot" />
+                }
+              />
+              <Route path="/reset-password" element={<PasswordResetPage />} />
+              <Route path="/p/:slugToken" element={<SharedPagePage />} />
+              <Route
+                path={MCP_OAUTH_CALLBACK_PATH}
+                element={
+                  user ? (
+                    <McpOAuthCallbackPage />
+                  ) : (
+                    <Navigate
+                      to={`/sign-in?next=${encodeURIComponent(pathname + search)}`}
+                      replace
+                    />
+                  )
+                }
+              />
+              <Route
+                path={SLACK_INSTALL_CALLBACK_PATH}
+                element={
+                  user ? (
+                    <SlackInstallCallbackPage />
+                  ) : (
+                    <Navigate
+                      to={`/sign-in?next=${encodeURIComponent(pathname + search)}`}
+                      replace
+                    />
+                  )
+                }
+              />
+              <Route
+                path="/integrations/setup"
+                element={
+                  user ? (
+                    <IntegrationSetupPage />
+                  ) : (
+                    <Navigate to="/sign-in?next=/integrations/setup" replace />
+                  )
+                }
+              />
+              <Route
+                path="/admin/plugins"
+                element={
+                  user ? (
+                    <AdminPluginsPage />
+                  ) : (
+                    <Navigate to="/sign-in?next=/admin/plugins" replace />
+                  )
+                }
+              />
+              <Route
+                path="/invite/:token"
+                element={
+                  user ? (
+                    <InvitePage />
+                  ) : (
+                    <Navigate to={`/sign-in?next=${encodeURIComponent(pathname)}`} replace />
+                  )
+                }
+              />
+              <Route
+                path="/admin/access"
+                element={
+                  user ? <AdminAccessPage /> : <Navigate to="/sign-in?next=/admin/access" replace />
+                }
+              />
+              <Route
+                element={
+                  user ? (
+                    <SubscriptionGate fallback={<PageLoading />}>
+                      <Outlet />
+                    </SubscriptionGate>
+                  ) : (
+                    <Navigate to="/sign-in" replace />
+                  )
+                }
+              >
+                <Route path="/app" element={<ShellPage />} />
+                <Route path="/app/g/:groupId" element={<ShellPage />} />
+                <Route path="/app/:botId" element={<ShellPage />} />
+                <Route element={<CallLayout />}>
+                  <Route path="/onboarding/:step?" element={<OnboardingPage />} />
+                  <Route path="/app/artifacts" element={<ArtifactsPage />} />
+                  <Route path="/app/artifacts/:artifactId" element={<ArtifactsPage />} />
+                  {ticketBoardEnabled ? <Route path="/app/board" element={<BoardPage />} /> : null}
+                  <Route path="/app/x/:linkId" element={<NavLinkPage />} />
+                </Route>
+              </Route>
+              <Route path="*" element={<NotFoundPage />} />
+            </Routes>
+          </Suspense>
+        </div>
+      </MarkdownLinkPrompt>
     </QueryUserProvider>
   );
 }
@@ -246,7 +341,7 @@ function SessionUnavailable({ refetch }: { refetch: () => Promise<void> }) {
     <div className="grid h-full place-items-center bg-background px-6 text-center">
       <div className="flex flex-col items-center">
         <LoadingState label={t`Reconnecting`} />
-        <p className="mt-3 text-[13.5px] text-muted-foreground/80">
+        <p className="mt-3 text-body text-muted-foreground/80">
           <Trans>Can&apos;t reach the server.</Trans>
         </p>
         <div className="mt-4">
@@ -274,7 +369,7 @@ function AppFailed() {
       data-rakazo-app-state="failed"
     >
       <div className="flex flex-col items-center">
-        <p className="text-[13.5px] text-muted-foreground/80">
+        <p className="text-body text-muted-foreground/80">
           <Trans>Something went wrong. Try again.</Trans>
         </p>
         <div className="mt-4">

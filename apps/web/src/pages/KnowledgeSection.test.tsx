@@ -13,7 +13,21 @@ const memoryApi = vi.hoisted(() => ({
   list: vi.fn(async () => []),
   remove: vi.fn(),
   update: vi.fn(),
+  budget: vi.fn(async () => ({
+    limitBytes: 32768,
+    usedBytes: 0,
+    documents: [],
+    omitted: [],
+  })),
 }));
+// One space, so no "Available in" choice appears.
+vi.mock("../components/integrations/space-availability", () => ({
+  AvailabilityControl: () => null,
+  AvailabilityLabel: () => null,
+  reachesOtherSpaces: () => false,
+  useOwnSpaces: () => [],
+}));
+
 vi.mock("../lib/rpc", () => {
   const client = { agentSkills: api, memory: memoryApi };
   return {
@@ -25,7 +39,7 @@ vi.mock("../lib/rpc", () => {
 });
 vi.mock("../lib/artifact-open", () => ({ downloadArtifactBytes: vi.fn() }));
 vi.mock("@lingui/react/macro", () => {
-  const t = (parts: TemplateStringsArray) => parts.join("");
+  const t = (parts: TemplateStringsArray, ...values: unknown[]) => String.raw(parts, ...values);
   return { useLingui: () => ({ t }), Trans: ({ children }: { children: ReactNode }) => children };
 });
 vi.mock("@rakazo/ui-web", () => {
@@ -34,6 +48,10 @@ vi.mock("@rakazo/ui-web", () => {
     Button: ({ variant: _variant, ...props }: ComponentProps<"button"> & { variant?: string }) => (
       <button {...props} />
     ),
+    SectionHeading: ({
+      variant: _variant,
+      ...props
+    }: ComponentProps<"h3"> & { variant?: string }) => <h3 {...props} />,
     Textarea: (props: ComponentProps<"textarea">) => <textarea {...props} />,
     Skeleton: Container,
     Tabs: Container,
@@ -46,7 +64,7 @@ vi.mock("@rakazo/ui-web", () => {
 
 import { downloadArtifactBytes } from "../lib/artifact-open";
 import { spaceQueries } from "../lib/query";
-import { KnowledgeSection } from "./KnowledgeSection";
+import { AgentSkills, KnowledgeSection } from "./KnowledgeSection";
 
 const newClient = () => new QueryClient({ defaultOptions: { queries: { retry: false } } });
 let queryClient = newClient();
@@ -93,7 +111,7 @@ it("disables skill rows while a completed save is refreshing the catalog", async
     return found;
   };
   try {
-    await show(root, <KnowledgeSection botId="bot-fixture" skillsOnly />);
+    await show(root, <AgentSkills />);
     await act(async () => button("New skill").click());
     await act(async () => button("Save").click());
     expect(api.create).toHaveBeenCalledOnce();
@@ -115,7 +133,7 @@ it("disables skill rows while a completed save is refreshing the catalog", async
   }
 });
 
-it("labels the skills group and badges built-in and plugin skills", async () => {
+it("badges built-in skills and leaves plugin skills to their plugin", async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   const catalog: AgentSkillCatalogEntry[] = [
     {
@@ -159,10 +177,10 @@ it("labels the skills group and badges built-in and plugin skills", async () => 
     return found;
   };
   try {
-    await show(root, <KnowledgeSection botId="bot-fixture" skillsOnly />);
-    expect(container.textContent).toContain("Skills");
+    await show(root, <AgentSkills />);
     expect(button("Interrogate").textContent).toContain("Built-in");
-    expect(button("Triage mail").textContent).toContain("Plugin");
+    // Plugin skills are listed by their plugin in the Skills dialog, not one by one here.
+    expect(container.textContent).not.toContain("Triage mail");
     expect(button("greeting").textContent).not.toContain("Built-in");
     expect(button("greeting").textContent).not.toContain("Plugin");
     await act(async () => button("Interrogate").click());
@@ -403,7 +421,7 @@ it("opens skills from the composer's cached list and saves back into it", async 
   const button = (text: string) =>
     [...host.querySelectorAll("button")].find((node) => node.textContent?.includes(text));
   try {
-    await show(root, <KnowledgeSection botId="fixture" skillsOnly />);
+    await show(root, <AgentSkills />);
     expect(button("cached-skill")).toBeTruthy();
     expect(api.list).toHaveBeenCalledTimes(1);
     await act(async () => button("New skill")!.click());
@@ -417,6 +435,62 @@ it("opens skills from the composer's cached list and saves back into it", async 
       "new",
     ]);
   } finally {
+    await act(async () => root.unmount());
+    vi.unstubAllGlobals();
+  }
+});
+
+it("says how much memory no longer reaches the bot", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  const host = document.createElement("div");
+  const root = createRoot(host);
+  try {
+    memoryApi.list.mockReset().mockResolvedValue([
+      {
+        id: "doc-1",
+        path: "MEMORY.md",
+        content: "Fixture memory",
+        revision: 1,
+        scope: "bot",
+        botId: "fixture",
+        updatedAt: "",
+      },
+    ] as never);
+    memoryApi.budget.mockResolvedValue({
+      limitBytes: 32768,
+      usedBytes: 32768,
+      documents: [
+        {
+          scope: "bot",
+          path: "MEMORY.md",
+          revision: 1,
+          totalBytes: 40960,
+          includedBytes: 30720,
+          truncated: true,
+        },
+      ],
+      omitted: [
+        {
+          scope: "bot",
+          path: "notes/old.md",
+          revision: 1,
+          totalBytes: 10240,
+          includedBytes: 0,
+          truncated: false,
+        },
+      ],
+    } as never);
+
+    await show(root, <KnowledgeSection botId="fixture" />);
+
+    expect(host.textContent).toContain("About 20 KB of memory no longer reaches the bot.");
+  } finally {
+    memoryApi.budget.mockReset().mockResolvedValue({
+      limitBytes: 32768,
+      usedBytes: 0,
+      documents: [],
+      omitted: [],
+    });
     await act(async () => root.unmount());
     vi.unstubAllGlobals();
   }

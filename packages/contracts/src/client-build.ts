@@ -19,6 +19,7 @@ export type MinimumClientBuilds = Partial<Record<ClientKind, string>>;
 export const IOS_APP_STORE_URL = "https://apps.apple.com/app/rakazo/id6801531099";
 export const ANDROID_APK_URL =
   "https://github.com/elie222/rakazo/releases/download/android/rakazo.apk";
+export const ANDROID_APP_STORE_URL = "https://play.google.com/store/apps/details?id=com.rakazo.app";
 
 const BUILD_ID = /^\d{14}$/;
 
@@ -76,7 +77,6 @@ export function clientUpdateRequired(
   return (compareBuilds(client.build, minimums[client.kind]) ?? 0) < 0;
 }
 
-/** Whether a failed request was refused because this client build is no longer supported. */
 export function isClientUpdateRequiredError(error: unknown): boolean {
   if (typeof error !== "object" || error === null) return false;
   const { code, status } = error as { code?: unknown; status?: unknown };

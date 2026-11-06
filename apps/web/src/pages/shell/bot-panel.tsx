@@ -2,6 +2,7 @@ import { Trans, useLingui } from "@lingui/react/macro";
 import type {
   AgentSkillCatalogEntry,
   Bot,
+  BotAvatarSet,
   ComputerMode,
   ModelCatalogEntry,
   ThinkingLevel,
@@ -10,9 +11,9 @@ import {
   BOT_COMPUTER_MODES,
   BOT_DESCRIPTION_MAX_LENGTH,
   BOT_NAME_MAX_LENGTH,
-  BOT_TITLE_MAX_LENGTH,
   BUILTIN_TOOL_NAMES,
   isBuiltinToolName,
+  resolveBotAvatarSet,
 } from "@rakazo/contracts";
 import {
   chatModelChoices,
@@ -27,27 +28,27 @@ import {
   Input,
   NativeSelect,
   NativeSelectOption,
+  SectionHeading,
   Switch,
+  Tabs,
+  TabsContent,
+  TabsList,
+  TabsTrigger,
   Textarea,
   Toggle,
 } from "@rakazo/ui-web";
-import {
-  Collapsible,
-  CollapsibleContent,
-  CollapsibleTrigger,
-} from "@rakazo/ui-web/components/ui/collapsible";
 import { useQuery } from "@tanstack/react-query";
-import { ChevronDown, Download, Settings, X } from "lucide-react";
+import { Download, Settings, X } from "lucide-react";
 import type { ReactNode } from "react";
 import { Suspense, useEffect, useId, useRef, useState } from "react";
 import { ErrorBoundary, SectionLoadFailed } from "../../components/ErrorBoundary";
 import { InstructionSettings } from "../../components/InstructionSettings";
+import { PagesList } from "../../components/pages/PagesList";
 import { botProfilePatch } from "../../lib/bot-profile-patch";
 import { thinkingLevelLabel } from "../../lib/model-catalog";
 import { lazyComponent } from "../../lib/preload-recovery";
 import { useSpaceQueries } from "../../lib/query";
 import { errorText } from "../../lib/user-error";
-import { AgentImportUndo } from "./agent-import-undo";
 import { AvatarStudioPopover } from "./avatar-studio-popover";
 import { ChatModelPicker } from "./chat-model-picker";
 
@@ -59,7 +60,7 @@ const KnowledgeSection = lazyComponent(() =>
   import("../KnowledgeSection").then((module) => module.KnowledgeSection),
 );
 
-const rowLabelClass = "text-sm text-foreground";
+const rowLabelClass = "text-body text-foreground";
 
 /** The advanced fields one Save sends, in the order their saved snapshot keeps them. */
 function advancedValues(bot: Bot) {
@@ -99,17 +100,27 @@ export function ComputerModePicker({
   );
 }
 
+export type BotPanelTab = "computer" | "routines" | "pages" | "settings";
+
+/** A bot's profile above its Computer, Routines, Pages and Advanced tabs. */
 export function BotSettings({
   bot,
+  tab = "settings",
+  onTabChange,
+  computer,
+  routines,
   memoryProviderConfigured,
   onSave,
   onExport,
   onClear,
-  onUndoImport,
   focusModel = 0,
   onOpenConnections,
 }: {
   bot: Bot;
+  tab?: BotPanelTab;
+  onTabChange?: (tab: BotPanelTab) => void;
+  computer?: ReactNode;
+  routines?: ReactNode;
   focusModel?: number;
   onOpenConnections?: () => void;
   /** Unused: the skill sections read and save the shared cached skill list. */
@@ -117,16 +128,17 @@ export function BotSettings({
   memoryProviderConfigured: boolean;
   onSave: (patch: {
     name?: string;
-    title?: string;
     description?: string;
     instructions?: string;
     color?: string;
+    avatarSet?: BotAvatarSet;
     notifyOnFinish?: boolean;
     computerMode?: ComputerMode;
     memoryScope?: "isolated" | "shared" | null;
     autoSpeak?: boolean;
     fleetManagement?: boolean;
     crossSpaceCommunication?: boolean;
+    dailyCheckIns?: boolean;
     voiceId?: string | null;
     modelProvider?: string | null;
     modelId?: string | null;
@@ -135,26 +147,18 @@ export function BotSettings({
   }) => Promise<void>;
   onExport: () => Promise<void>;
   onClear: () => void;
-  /** Shown for bots that came from an agent import. */
-  onUndoImport?: () => void;
 }) {
   const { t } = useLingui();
   const ids = useId();
-  const [advancedOpen, setAdvancedOpen] = useState(Boolean(focusModel));
   const modelRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
-    if (focusModel) setAdvancedOpen(true);
-  }, [focusModel]);
-  useEffect(() => {
-    if (focusModel && advancedOpen) {
+    if (focusModel && tab === "settings") {
       modelRef.current?.scrollIntoView?.({ block: "nearest" });
       modelRef.current?.querySelector<HTMLElement>('[id$="-model"]')?.focus();
     }
-  }, [advancedOpen, focusModel]);
+  }, [tab, focusModel]);
   const [name, setName] = useState(bot.name);
-  const [title, setTitle] = useState(bot.title);
   const savedNameRef = useRef(bot.name);
-  const savedTitleRef = useRef(bot.title);
   const [description, setDescription] = useState(bot.description);
   // A roster refresh can skip replacing bots while a reorder is in flight, so
   // this prop keeps the description from when the panel opened. Later saves
@@ -162,22 +166,26 @@ export function BotSettings({
   // voice change treats that stale text as an edit and overwrites instructions.
   const savedDescriptionRef = useRef(bot.description ?? "");
   const [color, setColor] = useState(bot.color);
+  const [avatarSet, setAvatarSet] = useState(() => resolveBotAvatarSet(bot.avatarSet));
   const [notifyOnFinish, setNotifyOnFinish] = useState(bot.notifyOnFinish ?? true);
   const acceptedAutomatic = useRef({
     color: bot.color,
+    avatarSet: resolveBotAvatarSet(bot.avatarSet),
     notifyOnFinish: bot.notifyOnFinish ?? true,
   });
-  const automaticRevision = useRef({ color: 0, notifyOnFinish: 0 });
+  const automaticRevision = useRef({ color: 0, avatarSet: 0, notifyOnFinish: 0 });
   const [computerMode, setComputerMode] = useState(bot.computerMode);
   const [memoryScope, setMemoryScope] = useState(bot.memoryScope);
   const [autoSpeak, setAutoSpeak] = useState(bot.autoSpeak);
   const [crossSpaceCommunication, setCrossSpaceCommunication] = useState(
-    bot.crossSpaceCommunication ?? false,
+    bot.crossSpaceCommunication ?? true,
   );
   useEffect(
-    () => setCrossSpaceCommunication(bot.crossSpaceCommunication ?? false),
+    () => setCrossSpaceCommunication(bot.crossSpaceCommunication ?? true),
     [bot.crossSpaceCommunication],
   );
+  const [dailyCheckIns, setDailyCheckIns] = useState(bot.dailyCheckIns ?? true);
+  useEffect(() => setDailyCheckIns(bot.dailyCheckIns ?? true), [bot.dailyCheckIns]);
   const [fleetManagement, setFleetManagement] = useState(bot.fleetManagement);
   useEffect(() => setFleetManagement(bot.fleetManagement), [bot.fleetManagement]);
   const [voiceId, setVoiceId] = useState(bot.voiceId ?? "");
@@ -227,7 +235,6 @@ export function BotSettings({
   ]);
   const dirty =
     name.trim() !== savedNameRef.current.trim() ||
-    title.trim() !== savedTitleRef.current.trim() ||
     advancedSnapshot !== savedAdvanced ||
     description.trim() !== savedDescriptionRef.current;
   const [error, setError] = useState<string | null>(null);
@@ -236,16 +243,17 @@ export function BotSettings({
     (
       patchOverrides?: {
         name?: string;
-        title?: string;
         description?: string;
         color?: string;
+        avatarSet?: BotAvatarSet;
         notifyOnFinish?: boolean;
         fleetManagement?: boolean;
         crossSpaceCommunication?: boolean;
+        dailyCheckIns?: boolean;
         disabledBuiltinTools?: string[];
         baseDisabledBuiltinTools?: string[];
       },
-      revisions?: { color: number; notifyOnFinish: number },
+      revisions?: { color: number; avatarSet: number; notifyOnFinish: number },
     ) => Promise<void>
   >(async () => undefined);
   // The panel can open on a cached bot. When a newer copy arrives, every field not edited since
@@ -257,15 +265,19 @@ export function BotSettings({
     shownBotRef.current = bot;
     if (name.trim() === savedNameRef.current.trim()) setName(bot.name);
     savedNameRef.current = bot.name;
-    if (title.trim() === savedTitleRef.current.trim()) setTitle(bot.title);
-    savedTitleRef.current = bot.title;
     if (description.trim() === savedDescriptionRef.current) setDescription(bot.description);
     savedDescriptionRef.current = bot.description ?? "";
     const accepted = acceptedAutomatic.current;
     const nextNotify = bot.notifyOnFinish ?? true;
     if (color === accepted.color) setColor(bot.color);
+    const nextAvatarSet = resolveBotAvatarSet(bot.avatarSet);
+    if (avatarSet === accepted.avatarSet) setAvatarSet(nextAvatarSet);
     if (notifyOnFinish === accepted.notifyOnFinish) setNotifyOnFinish(nextNotify);
-    acceptedAutomatic.current = { color: bot.color, notifyOnFinish: nextNotify };
+    acceptedAutomatic.current = {
+      color: bot.color,
+      avatarSet: nextAvatarSet,
+      notifyOnFinish: nextNotify,
+    };
     const saved = JSON.parse(savedAdvanced) as unknown[];
     const next = advancedValues(bot);
     if (modelKey === saved[0]) setModelKey(next[0]);
@@ -320,16 +332,17 @@ export function BotSettings({
   async function executeSave(
     patchOverrides?: {
       name?: string;
-      title?: string;
       description?: string;
       color?: string;
+      avatarSet?: BotAvatarSet;
       notifyOnFinish?: boolean;
       fleetManagement?: boolean;
       crossSpaceCommunication?: boolean;
+      dailyCheckIns?: boolean;
       disabledBuiltinTools?: string[];
       baseDisabledBuiltinTools?: string[];
     },
-    revisions?: { color: number; notifyOnFinish: number },
+    revisions?: { color: number; avatarSet: number; notifyOnFinish: number },
   ) {
     try {
       setSaving(true);
@@ -338,32 +351,38 @@ export function BotSettings({
         await onSave({ crossSpaceCommunication: patchOverrides.crossSpaceCommunication });
         return;
       }
+      if (patchOverrides?.dailyCheckIns !== undefined) {
+        await onSave({ dailyCheckIns: patchOverrides.dailyCheckIns });
+        return;
+      }
       if (patchOverrides?.fleetManagement !== undefined) {
         await onSave({ fleetManagement: patchOverrides.fleetManagement });
         return;
       }
       const selected = selectedModel;
       const nextName = (patchOverrides?.name !== undefined ? patchOverrides.name : name).trim();
-      const nextTitle = (patchOverrides?.title !== undefined ? patchOverrides.title : title).trim();
       const nextDescription = (
         patchOverrides?.description !== undefined ? patchOverrides.description : description
       ).trim();
       const nextColor = patchOverrides?.color !== undefined ? patchOverrides.color : color;
+      const nextAvatarSet = patchOverrides?.avatarSet ?? avatarSet;
       const nextNotify =
         patchOverrides?.notifyOnFinish !== undefined
           ? patchOverrides.notifyOnFinish
           : notifyOnFinish;
 
       if (nextName) setName(nextName);
-      setTitle(nextTitle);
       setDescription(nextDescription);
       const patch = {
         ...(nextName && nextName !== savedNameRef.current.trim() ? { name: nextName } : {}),
-        ...(nextTitle !== savedTitleRef.current.trim() ? { title: nextTitle } : {}),
         // Keep untouched profile fields off the wire.
         ...botProfilePatch(savedDescriptionRef.current, nextDescription),
         // Unchanged color stays off the wire so a legacy named value cannot fail a name save.
         ...(nextColor !== acceptedAutomatic.current.color ? { color: nextColor } : {}),
+        ...(patchOverrides?.avatarSet !== undefined ||
+        nextAvatarSet !== acceptedAutomatic.current.avatarSet
+          ? { avatarSet: nextAvatarSet }
+          : {}),
         notifyOnFinish: nextNotify,
         computerMode,
         memoryScope,
@@ -414,9 +433,12 @@ export function BotSettings({
         persistedDisabledToolsRef.current = nextTools;
         break;
       }
-      acceptedAutomatic.current = { color: nextColor, notifyOnFinish: nextNotify };
+      acceptedAutomatic.current = {
+        color: nextColor,
+        avatarSet: nextAvatarSet,
+        notifyOnFinish: nextNotify,
+      };
       if (nextName) savedNameRef.current = nextName;
-      savedTitleRef.current = nextTitle;
       savedDescriptionRef.current = nextDescription;
       setSavedAdvanced(
         JSON.stringify([modelKey, thinkingLevel, computerMode, memoryScope, autoSpeak, voiceId]),
@@ -428,12 +450,19 @@ export function BotSettings({
       )
         setColor(acceptedAutomatic.current.color);
       if (
+        patchOverrides?.avatarSet !== undefined &&
+        revisions?.avatarSet === automaticRevision.current.avatarSet
+      )
+        setAvatarSet(acceptedAutomatic.current.avatarSet);
+      if (
         patchOverrides?.notifyOnFinish !== undefined &&
         revisions?.notifyOnFinish === automaticRevision.current.notifyOnFinish
       )
         setNotifyOnFinish(acceptedAutomatic.current.notifyOnFinish);
       if (patchOverrides?.crossSpaceCommunication !== undefined)
         setCrossSpaceCommunication(!patchOverrides.crossSpaceCommunication);
+      if (patchOverrides?.dailyCheckIns !== undefined)
+        setDailyCheckIns(!patchOverrides.dailyCheckIns);
       if (patchOverrides?.fleetManagement !== undefined)
         setFleetManagement(!patchOverrides.fleetManagement);
       setError(errorText(err, t`Could not save`));
@@ -460,12 +489,13 @@ export function BotSettings({
 
   function enqueueSave(patchOverrides?: {
     name?: string;
-    title?: string;
     description?: string;
     color?: string;
+    avatarSet?: BotAvatarSet;
     notifyOnFinish?: boolean;
     fleetManagement?: boolean;
     crossSpaceCommunication?: boolean;
+    dailyCheckIns?: boolean;
     disabledBuiltinTools?: string[];
   }) {
     // Serialize full-object auto-saves so an older in-flight request cannot
@@ -473,6 +503,7 @@ export function BotSettings({
     // queued work reads the latest field values, not a stale render closure.
     pendingSavesRef.current += 1;
     if (patchOverrides?.color !== undefined) automaticRevision.current.color += 1;
+    if (patchOverrides?.avatarSet !== undefined) automaticRevision.current.avatarSet += 1;
     if (patchOverrides?.notifyOnFinish !== undefined) automaticRevision.current.notifyOnFinish += 1;
     const revisions = { ...automaticRevision.current };
     const queuedPatch =
@@ -490,19 +521,21 @@ export function BotSettings({
 
   return (
     <div data-testid="bot-settings">
-      <div
-        data-testid="bot-profile-header"
-        className="flex flex-col items-center pb-6 pt-2 text-center"
-      >
+      <div data-testid="bot-profile-header" className="flex flex-col items-center pb-5 text-center">
         <div className="flex justify-center pb-4">
           <AvatarStudioPopover
             value={color}
             identity={bot.id}
             status={bot.status}
             size={76}
-            onChange={(newColor) => {
+            avatarSet={avatarSet}
+            onChange={(newColor, nextAvatarSet) => {
               setColor(newColor);
-              void enqueueSave({ color: newColor });
+              if (nextAvatarSet !== undefined) setAvatarSet(nextAvatarSet);
+              void enqueueSave({
+                color: newColor,
+                ...(nextAvatarSet !== undefined ? { avatarSet: nextAvatarSet } : {}),
+              });
             }}
           />
         </div>
@@ -511,81 +544,78 @@ export function BotSettings({
           editLabel={t`Edit name`}
           value={name}
           maxLength={BOT_NAME_MAX_LENGTH}
-          className="text-xl font-semibold"
+          className="text-heading2 font-semibold"
           onCommit={(value) => {
             if (!value.trim()) return;
             setName(value.trim());
             void enqueueSave({ name: value });
           }}
         />
-        <InlineProfileField
-          label={t`Title`}
-          editLabel={t`Edit label`}
-          placeholder={t`Add a label`}
-          value={title}
-          maxLength={BOT_TITLE_MAX_LENGTH}
-          className="mt-1 text-sm text-muted-foreground"
-          onCommit={(value) => {
-            setTitle(value.trim());
-            void enqueueSave({ title: value });
-          }}
-        />
       </div>
-      <InstructionSettings key={bot.id} bot={bot} />
-      <section className="mt-6">
-        <h3 className="mb-2 text-xs font-medium text-muted-foreground">
-          <Trans>Notifications</Trans>
-        </h3>
-        <div className="flex items-center justify-between gap-3 rounded-xl bg-muted/50 p-4">
-          <div>
-            <label
-              htmlFor={`${ids}-notify-finish`}
-              id={`${ids}-notify-finish-label`}
-              className="text-sm"
-            >
-              <Trans>When it finishes or needs input</Trans>
-            </label>
-          </div>
-          <Switch
-            id={`${ids}-notify-finish`}
-            checked={notifyOnFinish}
-            aria-labelledby={`${ids}-notify-finish-label`}
-            onCheckedChange={(checked) => {
-              setNotifyOnFinish(checked);
-              void enqueueSave({ notifyOnFinish: checked });
-            }}
-          />
-        </div>
-      </section>
-      <ErrorBoundary fallback={<SectionLoadFailed />}>
-        <Suspense fallback={null}>
-          <ScratchpadSection botId={bot.id} />
-        </Suspense>
-      </ErrorBoundary>
-      <ErrorBoundary fallback={<SectionLoadFailed />}>
-        <Suspense fallback={null}>
-          <KnowledgeSection botId={bot.id} />
-        </Suspense>
-      </ErrorBoundary>
-      <Collapsible
-        open={advancedOpen}
-        onOpenChange={setAdvancedOpen}
-        data-testid="bot-settings-advanced"
-        className="mt-6"
-      >
-        <h3 className="mb-0 text-xs font-medium text-muted-foreground">
-          <CollapsibleTrigger className="group flex w-full cursor-pointer min-h-11 items-center justify-between gap-2 text-xs font-medium text-muted-foreground text-start outline-none focus-visible:ring-3 focus-visible:ring-ring/50">
+      <Tabs value={tab} onValueChange={(next) => onTabChange?.(next as BotPanelTab)}>
+        <TabsList className="w-full">
+          <TabsTrigger value="computer">
+            <Trans>Computer</Trans>
+          </TabsTrigger>
+          <TabsTrigger value="routines">
+            <Trans>Routines</Trans>
+          </TabsTrigger>
+          <TabsTrigger value="pages">
+            <Trans>Pages</Trans>
+          </TabsTrigger>
+          <TabsTrigger value="settings">
             <Trans>Advanced</Trans>
-            <ChevronDown
-              aria-hidden="true"
-              className="size-4 text-muted-foreground transition-transform -rotate-90 group-aria-expanded:rotate-0 motion-reduce:transition-none"
-            />
-          </CollapsibleTrigger>
-        </h3>
-        <CollapsibleContent>
+          </TabsTrigger>
+        </TabsList>
+        <TabsContent value="computer" className="pt-4">
+          {computer}
+        </TabsContent>
+        <TabsContent value="routines" className="pt-4">
+          {routines}
+        </TabsContent>
+        <TabsContent value="pages" className="pt-4">
+          {tab === "pages" ? <PagesList botId={bot.id} /> : null}
+        </TabsContent>
+        {/* Stays mounted so scratchpad and knowledge drafts survive a tab switch. */}
+        <TabsContent value="settings" keepMounted data-testid="bot-settings-advanced">
+          <section className="mt-6">
+            <SectionHeading variant="label" className="mb-2">
+              <Trans>Notifications</Trans>
+            </SectionHeading>
+            <div className="flex items-center justify-between gap-3 rounded-xl bg-muted/50 p-4">
+              <div>
+                <label
+                  htmlFor={`${ids}-notify-finish`}
+                  id={`${ids}-notify-finish-label`}
+                  className="text-body"
+                >
+                  <Trans>When it finishes or needs input</Trans>
+                </label>
+              </div>
+              <Switch
+                id={`${ids}-notify-finish`}
+                checked={notifyOnFinish}
+                aria-labelledby={`${ids}-notify-finish-label`}
+                onCheckedChange={(checked) => {
+                  setNotifyOnFinish(checked);
+                  void enqueueSave({ notifyOnFinish: checked });
+                }}
+              />
+            </div>
+          </section>
+          <ErrorBoundary fallback={<SectionLoadFailed />}>
+            <Suspense fallback={null}>
+              <ScratchpadSection botId={bot.id} />
+            </Suspense>
+          </ErrorBoundary>
+          <ErrorBoundary fallback={<SectionLoadFailed />}>
+            <Suspense fallback={null}>
+              <KnowledgeSection botId={bot.id} />
+            </Suspense>
+          </ErrorBoundary>
           <div className="space-y-6 pt-6">
             <div ref={modelRef}>
-              <div className="mb-2 flex items-center justify-between text-xs font-medium text-muted-foreground pe-1">
+              <div className="mb-2 flex items-center justify-between text-label font-medium text-muted-foreground pe-1">
                 <Trans>Model</Trans>
                 {onOpenConnections ? (
                   <Button
@@ -618,7 +648,7 @@ export function BotSettings({
                 {thinkingOptions.length ? (
                   <label
                     htmlFor={`${ids}-thinking`}
-                    className="flex min-h-11 items-center justify-between gap-3 text-sm text-foreground"
+                    className="flex min-h-11 items-center justify-between gap-3 text-body text-foreground"
                   >
                     <Trans>Thinking</Trans>
                     <NativeSelect
@@ -643,7 +673,7 @@ export function BotSettings({
             <SettingsGroup label={t`Computer`} plain>
               <ComputerModePicker value={computerMode} onChange={setComputerMode} />
               {memoryProviderConfigured ? (
-                <div className="mt-4 text-sm text-foreground">
+                <div className="mt-4 text-body text-foreground">
                   <Trans>Memory scope</Trans>
                   <div className="mt-2 flex gap-2">
                     {(
@@ -673,7 +703,7 @@ export function BotSettings({
             <SettingsGroup label={t`Voice`}>
               <label
                 htmlFor={`${ids}-auto-speak`}
-                className="flex min-h-11 cursor-pointer items-center justify-between gap-3 text-sm text-foreground"
+                className="flex min-h-11 cursor-pointer items-center justify-between gap-3 text-body text-foreground"
               >
                 <span className={rowLabelClass}>
                   <Trans>Read replies aloud</Trans>
@@ -687,7 +717,7 @@ export function BotSettings({
               {voices?.length ? (
                 <label
                   htmlFor={`${ids}-voice`}
-                  className="flex min-h-11 items-center justify-between gap-3 text-sm text-foreground"
+                  className="flex min-h-11 items-center justify-between gap-3 text-body text-foreground"
                 >
                   <Trans>Voice</Trans>
                   <NativeSelect
@@ -707,7 +737,21 @@ export function BotSettings({
               ) : null}
             </SettingsGroup>
             <SettingsGroup label={t`Permissions`}>
-              <div className="flex min-h-11 items-center justify-between gap-3 text-sm">
+              <div className="flex min-h-11 items-center justify-between gap-3 text-body">
+                <label htmlFor={`${ids}-daily-check-ins`} className={rowLabelClass}>
+                  <Trans>Daily check-ins on unfinished work</Trans>
+                </label>
+                <Switch
+                  id={`${ids}-daily-check-ins`}
+                  checked={dailyCheckIns}
+                  disabled={saving}
+                  onCheckedChange={(checked) => {
+                    setDailyCheckIns(checked);
+                    void enqueueSave({ dailyCheckIns: checked });
+                  }}
+                />
+              </div>
+              <div className="flex min-h-11 items-center justify-between gap-3 text-body">
                 <label htmlFor={`${ids}-cross-space`} className={rowLabelClass}>
                   <Trans>Allow cross-space bot communication</Trans>
                 </label>
@@ -721,9 +765,9 @@ export function BotSettings({
                   }}
                 />
               </div>
-              <div className="flex min-h-11 items-center justify-between gap-3 text-sm">
+              <div className="flex min-h-11 items-center justify-between gap-3 text-body">
                 <label htmlFor={`${ids}-fleet-management`} className={rowLabelClass}>
-                  <Trans>Manage the bots it creates</Trans>
+                  <Trans>Manage other bots</Trans>
                 </label>
                 <Switch
                   id={`${ids}-fleet-management`}
@@ -736,17 +780,18 @@ export function BotSettings({
                 />
               </div>
             </SettingsGroup>
-            <SettingsGroup label={t`Description`} plain>
+            <InstructionSettings key={bot.id} bot={bot} />
+            <SettingsGroup label={t`How other bots see it`} plain>
               <Textarea
                 id={`${ids}-description`}
-                aria-label={t`Description`}
+                aria-label={t`How other bots see it`}
                 value={description}
                 maxLength={BOT_DESCRIPTION_MAX_LENGTH}
                 onChange={(e) => setDescription(e.target.value)}
                 onBlur={() => void enqueueSave()}
                 placeholder={t`What this bot is for`}
                 rows={2}
-                className="min-h-16 resize-none field-sizing-content"
+                className="min-h-16 max-h-96 resize-none field-sizing-content"
               />
             </SettingsGroup>
             <SettingsGroup label={t`Tools`} plain>
@@ -773,7 +818,7 @@ export function BotSettings({
                   {disabledBuiltinTools.map((toolName) => (
                     <div
                       key={toolName}
-                      className="flex min-h-11 items-center justify-between gap-3 text-sm"
+                      className="flex min-h-11 items-center justify-between gap-3 text-body"
                     >
                       <span>{humanizeTool(toolName)}</span>
                       <Button
@@ -795,50 +840,46 @@ export function BotSettings({
                 </div>
               </section>
             </SettingsGroup>
-            <ErrorBoundary fallback={<SectionLoadFailed />}>
-              <Suspense fallback={null}>
-                <KnowledgeSection botId={bot.id} skillsOnly />
-              </Suspense>
-            </ErrorBoundary>
             <div className="overflow-hidden rounded-xl bg-muted/50 px-4">
               <button
                 type="button"
-                className="flex min-h-12 w-full items-center justify-between text-sm"
-                onClick={() => void onExport()}
+                className="flex min-h-12 w-full items-center justify-between text-body"
+                onClick={() => {
+                  setError(null);
+                  onExport().catch((err: unknown) => setError(errorText(err)));
+                }}
               >
                 <Trans>Export</Trans>
                 <Download className="size-4 text-muted-foreground" />
               </button>
               <button
                 type="button"
-                className="min-h-12 w-full border-t border-border text-start text-sm text-destructive"
+                className="min-h-12 w-full border-t border-border text-start text-body text-destructive"
                 onClick={onClear}
               >
                 <Trans>Clear conversation</Trans>
               </button>
-              {onUndoImport ? <AgentImportUndo botId={bot.id} onUndone={onUndoImport} /> : null}
             </div>
           </div>
-        </CollapsibleContent>
-      </Collapsible>
-      {error ? <p className="mt-2 text-[13px] text-destructive">{error}</p> : null}
-      {dirty ? (
-        <Button
-          className="sticky bottom-0 mt-5 w-full"
-          disabled={saving}
-          onClick={() => {
-            void enqueueSave({
-              name,
-              title,
-              description,
-              color,
-              notifyOnFinish,
-            });
-          }}
-        >
-          <Trans>Save</Trans>
-        </Button>
-      ) : null}
+          {dirty ? (
+            <Button
+              className="sticky bottom-0 mt-5 w-full"
+              disabled={saving}
+              onClick={() => {
+                void enqueueSave({
+                  name,
+                  description,
+                  color,
+                  notifyOnFinish,
+                });
+              }}
+            >
+              <Trans>Save</Trans>
+            </Button>
+          ) : null}
+        </TabsContent>
+      </Tabs>
+      {error ? <p className="mt-2 text-body-sm text-destructive">{error}</p> : null}
     </div>
   );
 }
@@ -863,7 +904,6 @@ function InlineProfileField({
   label,
   editLabel,
   value,
-  placeholder,
   maxLength,
   className,
   onCommit,
@@ -871,7 +911,6 @@ function InlineProfileField({
   label: string;
   editLabel: string;
   value: string;
-  placeholder?: string;
   maxLength: number;
   className: string;
   onCommit: (value: string) => void;
@@ -894,6 +933,10 @@ function InlineProfileField({
       onChange={(event) => setDraft(event.target.value)}
       onBlur={commit}
       onKeyDown={(event) => {
+        if (event.nativeEvent.isComposing || event.keyCode === 229) {
+          if (event.key === "Escape") event.stopPropagation();
+          return;
+        }
         if (event.key === "Enter") {
           event.preventDefault();
           commit();
@@ -915,7 +958,7 @@ function InlineProfileField({
         setEditing(true);
       }}
     >
-      {value || placeholder}
+      {value}
     </button>
   );
 }
@@ -932,7 +975,9 @@ function SettingsGroup({
 }) {
   return (
     <section>
-      <h3 className="mb-2 text-xs font-medium text-muted-foreground">{label}</h3>
+      <SectionHeading variant="label" className="mb-2">
+        {label}
+      </SectionHeading>
       <div className={`space-y-3 [&>*]:mt-0 ${plain ? "" : "rounded-xl bg-muted/50 p-4"}`}>
         {children}
       </div>

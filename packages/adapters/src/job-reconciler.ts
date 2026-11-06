@@ -10,6 +10,7 @@ import type { PoolClient } from "pg";
 import { returnBotMessageOutcome } from "./bot-messages.js";
 import { reconcileCallRequests } from "./call-request.js";
 import { scheduleComputerControlExpiry } from "./computer-control.js";
+import { findRunRecoveryBlockers } from "./run-recovery.js";
 import { reconcileStuckWork } from "./stuck-work.js";
 import { isLoopGuardStopText } from "./tool-loop.js";
 import { isUserProgressClientNonce } from "./user-progress.js";
@@ -114,9 +115,13 @@ export function createJobReconciler(
     leadership?: ReconciliationLeadership;
     reconcileComputerUpdates?: () => Promise<void>;
     reconcileCloudAgents?: () => Promise<void>;
+    reconcilePurchases?: () => Promise<void>;
+    reconcileMediaVideos?: () => Promise<void>;
     reconcileModelCredits?: () => Promise<void>;
     reconcileRoutineRetryNotices?: () => Promise<void>;
+    reconcileStrategicInitiatives?: () => Promise<void>;
     reconcileSecurityEventRetention?: () => Promise<void>;
+    reconcileAuditLog?: () => Promise<void>;
     reconcileHomeStorage?: () => Promise<void>;
     reconcileIdleComputers?: () => Promise<void>;
     reconcileDeadJobs?: () => Promise<void>;
@@ -139,6 +144,32 @@ export function createJobReconciler(
   let routineCursor: Cursor | undefined;
   let controlCursor: ControlCursor | undefined;
   let controlScanDeadline: Date | undefined;
+  // Housekeeping that waits on storage or another service runs beside the scans, never before
+  // them, so a hung call cannot hold back recovery. Each skips a tick while its last pass runs.
+  const housekeeping = [
+    deps.reconcileCloudAgents,
+    deps.reconcilePurchases,
+    deps.reconcileMediaVideos,
+    deps.reconcileModelCredits,
+    deps.reconcileComputerUpdates,
+    deps.reconcileRoutineRetryNotices,
+    deps.reconcileStrategicInitiatives,
+    deps.reconcileSecurityEventRetention,
+    deps.reconcileAuditLog,
+    deps.reconcileHomeStorage,
+    deps.reconcileIdleComputers,
+    deps.reconcileDeadJobs,
+  ].filter((reconcile) => reconcile !== undefined);
+  const housekeepingRunning = new Map<() => Promise<void>, Promise<void>>();
+  const startHousekeeping = () => {
+    for (const reconcile of housekeeping) {
+      if (housekeepingRunning.has(reconcile)) continue;
+      const pass = (async () => reconcile())()
+        .catch((error) => getLogger().error("auxiliary reconciliation", error))
+        .finally(() => housekeepingRunning.delete(reconcile));
+      housekeepingRunning.set(reconcile, pass);
+    }
+  };
 
   const reconcileOnce = async () => {
     if (reconciling) return reconciling;
@@ -146,20 +177,11 @@ export function createJobReconciler(
     reconciling = (async () => {
       if (deps.leadership && !(await deps.leadership.tryAcquire())) return;
 
-      const auxiliary = await Promise.allSettled(
-        [
-          () => reconcileCallRequests(deps),
-          () => reconcileComputerRuns(deps.prisma),
-          deps.reconcileCloudAgents,
-          deps.reconcileModelCredits,
-          deps.reconcileComputerUpdates,
-          deps.reconcileRoutineRetryNotices,
-          deps.reconcileSecurityEventRetention,
-          deps.reconcileHomeStorage,
-          deps.reconcileIdleComputers,
-          deps.reconcileDeadJobs,
-        ].map(async (reconcile) => reconcile?.()),
-      );
+      startHousekeeping();
+      const auxiliary = await Promise.allSettled([
+        reconcileCallRequests(deps),
+        reconcileComputerRuns(deps.prisma),
+      ]);
       for (const result of auxiliary) {
         if (result.status === "rejected")
           getLogger().error("auxiliary reconciliation", result.reason);
@@ -205,7 +227,13 @@ export function createJobReconciler(
           },
           orderBy: [{ updatedAt: "asc" }, { id: "asc" }],
           take: batchSize,
-          select: { id: true, status: true, updatedAt: true },
+          select: {
+            id: true,
+            status: true,
+            updatedAt: true,
+            botId: true,
+            bot: { select: { computerId: true } },
+          },
         }),
         deps.prisma.messagingOutbound.findFirst({
           where: {
@@ -300,15 +328,18 @@ export function createJobReconciler(
       // A locked job whose worker died is never unlocked, so it is replaced: any lock
       // for a run whose lease expired, and for a queued run only a lock older than
       // a lease, since a live worker finishing a failed attempt still holds it.
+      const blockers = await findRunRecoveryBlockers(deps.prisma, runs, now);
       const abandonedQueuedLockAt = new Date(now.getTime() - ABANDONED_QUEUED_LOCK_MS);
       await publishAll([
-        ...runs.map((run) =>
-          deps.jobs.enqueue({
-            ...runContinueJob(run.id),
-            keepExisting: true,
-            replaceLockedBefore: run.status === "queued" ? abandonedQueuedLockAt : now,
-          }),
-        ),
+        ...runs
+          .filter((run) => !blockers.has(run.id))
+          .map((run) =>
+            deps.jobs.enqueue({
+              ...runContinueJob(run.id),
+              keepExisting: true,
+              replaceLockedBefore: run.status === "queued" ? abandonedQueuedLockAt : now,
+            }),
+          ),
         ...(dueOutbound ? [deps.jobs.enqueue(messagingDeliverJob())] : []),
         ...unmirroredMessagingRuns.map((run) => deps.jobs.enqueue(messagingDeliverJob(run.id))),
       ]);
@@ -465,6 +496,8 @@ export function createJobReconciler(
       if (timer) clearInterval(timer);
       timer = undefined;
       await reconciling?.catch(() => undefined);
+      // Read only after the pass settles: one waiting on leadership starts housekeeping late.
+      await Promise.all(housekeepingRunning.values());
       await deps.leadership?.release();
     },
   };

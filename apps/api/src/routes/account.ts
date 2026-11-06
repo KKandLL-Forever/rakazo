@@ -1,29 +1,44 @@
 import { ORPCError } from "@orpc/server";
 import {
-  deploymentAutoReviewDefault,
+  changeUserTimezone,
   effectiveModelRole,
   hasHostedModelCredits,
   isAutoReviewCheckerConfigured,
+  loadUserIncomingCalls,
   PushSessionEndedError,
+  settleCallRequest,
 } from "@rakazo/adapters";
-import type { ActionApprovalRule, Actor, Me, SettingsScope } from "@rakazo/contracts";
-import { approvalModeFromPreference, approvalPreferenceFromMode } from "@rakazo/core";
+import type { ActionApprovalRule, Actor, ChatAlert, Me, SettingsScope } from "@rakazo/contracts";
 import {
+  approvalModeFromPreference,
+  approvalPreferenceFromMode,
+  callRequestClientNonce,
+} from "@rakazo/core";
+import { urlSite } from "@rakazo/core/egress";
+import {
+  auditLogOrganization,
+  commitBotUpdate,
   findAutoReviewPreference,
   findDefaultVoiceCredential,
   findModelCredential,
   findModelCredentialById,
   listApprovalRules,
+  listAuditEvents,
   listVoicePreferences,
   lockSpaceSettings,
   newestVoiceCredentialOrder,
   Prisma,
   removeApprovalRule,
+  runAsSystem,
+  runAsTenant,
   saveApprovalRule,
   saveAutoReviewPreference,
   selectVoicePreference,
   voicePreferenceTarget,
 } from "@rakazo/db";
+import { getLogger } from "@rakazo/logging";
+import { createAccessGrant, listAccessGrants, revokeAccessGrant } from "../access-grants.js";
+import { requireAdmin } from "../admins.js";
 import { aiConsentStatus, allowAiConsent } from "../ai-consent.js";
 import type { BillingService } from "../billing.js";
 import { firstModelConnectAnalytics } from "../model-connect-analytics.js";
@@ -44,7 +59,7 @@ import {
   voiceProviderFor,
 } from "../voice.js";
 import type { RouterContext } from "./context.js";
-import { meDto } from "./shared.js";
+import { HEARTBEAT_MS, meDto, SESSION_RECHECK_MS } from "./shared.js";
 
 export function accountRoutes(ctx: RouterContext) {
   const { deps, os, authed } = ctx;
@@ -82,7 +97,7 @@ export function accountRoutes(ctx: RouterContext) {
           const record = await firstModelConnectAnalytics(deps, context.actor, "credits");
           record(undefined, { name: "model_connect_started" });
         }
-        return billing.selectFunding(context.actor, input.funding);
+        return billing.selectFunding(context.actor, input.funding, input.client, input.interval);
       }),
       purchaseCredits: authed.billing.purchaseCredits.handler(async ({ context, input }) =>
         requireBilling(deps).purchaseCredits(context.actor, input),
@@ -90,23 +105,121 @@ export function accountRoutes(ctx: RouterContext) {
       setMonthlyCredits: authed.billing.setMonthlyCredits.handler(async ({ context, input }) =>
         requireBilling(deps).setMonthlyCredits(context.actor, input.amountCents),
       ),
-      status: authed.billing.status.handler(async ({ context }) =>
-        requireBilling(deps).status(context.actor),
+      status: authed.billing.status.handler(async ({ context, input }) => {
+        const billing = requireBilling(deps);
+        // A failed claim fails the request, so the client keeps the code and sends it again.
+        if (input?.referralCode) await billing.claimReferral(context.actor, input.referralCode);
+        return billing.status(context.actor);
+      }),
+      refresh: authed.billing.refresh.handler(async ({ context }) => {
+        const billing = requireBilling(deps);
+        await billing.syncForActor(context.actor);
+        return billing.status(context.actor);
+      }),
+      checkout: authed.billing.checkout.handler(async ({ context, input }) =>
+        requireBilling(deps).checkout(context.actor, input?.client, input?.interval, input?.tier),
       ),
-      checkout: authed.billing.checkout.handler(async ({ context }) =>
-        requireBilling(deps).checkout(context.actor),
+      portal: authed.billing.portal.handler(async ({ context, input }) =>
+        requireBilling(deps).portal(context.actor, input?.client),
       ),
-      portal: authed.billing.portal.handler(async ({ context }) =>
-        requireBilling(deps).portal(context.actor),
-      ),
+      endTrial: authed.billing.endTrial.handler(async ({ context }) => {
+        const billing = requireBilling(deps);
+        await billing.endTrial(context.actor);
+        return billing.status(context.actor);
+      }),
+      switchToYearly: authed.billing.switchToYearly.handler(async ({ context }) => {
+        const billing = requireBilling(deps);
+        await billing.switchToYearly(context.actor);
+        return billing.status(context.actor);
+      }),
+      changeTier: authed.billing.changeTier.handler(async ({ context, input }) => {
+        const billing = requireBilling(deps);
+        await billing.changeTier(context.actor, input.tier);
+        return billing.status(context.actor);
+      }),
+      claimReferral: authed.billing.claimReferral.handler(async ({ context, input }) => {
+        await requireBilling(deps).claimReferral(context.actor, input.code);
+        return { ok: true as const };
+      }),
+    },
+    accessGrants: {
+      list: authed.accessGrants.list.handler(async ({ context }) => {
+        await requireGrantAdmin(deps, context.actor);
+        return listAccessGrants(deps.prisma);
+      }),
+      create: authed.accessGrants.create.handler(async ({ context, input }) => {
+        await requireGrantAdmin(deps, context.actor);
+        return createAccessGrant(deps.prisma, context.actor.userId, input);
+      }),
+      revoke: authed.accessGrants.revoke.handler(async ({ context, input }) => {
+        await requireGrantAdmin(deps, context.actor);
+        return revokeAccessGrant(deps.prisma, input.id);
+      }),
     },
     preferences: {
       update: authed.preferences.update.handler(async ({ context, input }): Promise<Me> => {
-        await deps.prisma.user.update({
-          where: { id: context.actor.userId },
-          // An avatar style from an older app is accepted and ignored: there is only one.
-          data: input.timezone === undefined ? {} : { timezone: input.timezone },
-        });
+        const userId = context.actor.userId;
+        const botAvatarSet = input.botAvatarSet;
+        if (input.timezone !== undefined) {
+          // The routines that took the account zone keep their local schedule in the new
+          // one, and the other fields commit in the same save. The move's row lock still
+          // waits for any bot creation holding the user row, so no new bot is missed below.
+          await changeUserTimezone(deps, userId, input.timezone, {
+            ...(input.locale === undefined ? {} : { locale: input.locale }),
+            ...(botAvatarSet === undefined ? {} : { botAvatarSet }),
+          });
+        } else {
+          await deps.prisma.user.update({
+            where: { id: userId },
+            // An avatar style from an older app is accepted and ignored: there is only one.
+            data: {
+              ...(input.locale === undefined ? {} : { locale: input.locale }),
+              ...(botAvatarSet === undefined ? {} : { botAvatarSet }),
+            },
+          });
+        }
+        if (botAvatarSet !== undefined) {
+          // Every bot of this user not pinned to another set follows the new default, in every
+          // space they own bots in, announced like any edit so other devices redraw it.
+          const bots = await runAsSystem("restyle the user's own bots in all their spaces", () =>
+            deps.prisma.bot.findMany({
+              where: { userId, avatarSetPinned: false, avatarSet: { not: botAvatarSet } },
+              select: { id: true, spaceId: true, thread: { select: { id: true } } },
+            }),
+          );
+          for (const bot of bots) {
+            const threadId = bot.thread?.id;
+            if (!threadId) continue;
+            // A newer save changed the default again: its own pass owns the remaining bots.
+            const current = await deps.prisma.user.findUniqueOrThrow({
+              where: { id: userId },
+              select: { botAvatarSet: true },
+            });
+            if (current.botAvatarSet !== botAvatarSet) break;
+            // The default is saved; a bot that fails here keeps its style until the next save.
+            await runAsTenant({ spaceId: bot.spaceId, userId }, () =>
+              commitBotUpdate({
+                prisma: deps.prisma,
+                notify: (thread, seq) => deps.events.notify(thread, seq),
+                spaceId: bot.spaceId,
+                threadId,
+                botId: bot.id,
+                emitBotUpdated: true,
+                // Pinned since it was listed: leave the owner's choice alone.
+                expectedSettings: { avatarSetPinned: false },
+                // Re-read under lock inside the transaction: a newer save of the
+                // default that lands while this writes owns the bot instead.
+                expectedUserAvatarSet: { userId, botAvatarSet },
+                data: { avatarSet: botAvatarSet },
+              }),
+            ).catch((error) => {
+              if (
+                !(error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2025")
+              )
+                getLogger().error("bot style restyle", error);
+            });
+          }
+        }
         return meDto(deps, context.actor);
       }),
       adoptTimezone: authed.preferences.adoptTimezone.handler(
@@ -132,6 +245,15 @@ export function accountRoutes(ctx: RouterContext) {
     security: {
       events: authed.security.events.handler(() => {
         throw new ORPCError("FORBIDDEN");
+      }),
+    },
+    audit: {
+      events: authed.audit.events.handler(async ({ context, input }) => {
+        const organizationId = await auditLogOrganization(deps.prisma, context.actor);
+        if (!organizationId) throw new ORPCError("FORBIDDEN");
+        return runAsSystem("read the organization's audit log", () =>
+          listAuditEvents(deps.prisma, organizationId, input),
+        );
       }),
     },
     updater: {
@@ -163,6 +285,33 @@ export function accountRoutes(ctx: RouterContext) {
         return { ok: true as const };
       }),
     },
+    // The user's own list for the external-link prompt, kept apart from approval rules: a
+    // trusted link site never lets a bot fetch, and a site rule never skips the prompt.
+    trustedLinkSites: {
+      list: authed.trustedLinkSites.list.handler(async ({ context }) => {
+        const rows = await deps.prisma.trustedLinkSite.findMany({
+          where: { userId: context.actor.userId },
+          orderBy: { site: "asc" },
+        });
+        return rows.map((row) => row.site);
+      }),
+      trust: authed.trustedLinkSites.trust.handler(async ({ context, input }) => {
+        // The server names the site, so the list only ever holds sites.
+        const site = urlSite(input.url);
+        if (!site) throw new ORPCError("BAD_REQUEST", { message: "Not a web link." });
+        await deps.prisma.trustedLinkSite.createMany({
+          data: { userId: context.actor.userId, site },
+          skipDuplicates: true,
+        });
+        return { site };
+      }),
+      remove: authed.trustedLinkSites.remove.handler(async ({ context, input }) => {
+        await deps.prisma.trustedLinkSite.deleteMany({
+          where: { userId: context.actor.userId, site: input.site },
+        });
+        return { ok: true as const };
+      }),
+    },
     autoReview: {
       get: authed.autoReview.get.handler(async ({ context, input }) => {
         return loadAutoReviewSettings(deps, context.actor, input?.scope);
@@ -175,7 +324,7 @@ export function accountRoutes(ctx: RouterContext) {
             input.mode
               ? approvalPreferenceFromMode(input.mode)
               : { enabled: input.enabled, skipApprovals: input.skipApprovals },
-            { enabled: deploymentAutoReviewDefault(process.env), skipApprovals: false },
+            { enabled: true, skipApprovals: false },
             input.scope,
           ),
         );
@@ -183,11 +332,138 @@ export function accountRoutes(ctx: RouterContext) {
       }),
     },
     notifications: {
+      subscribe: authed.notifications.subscribe.handler(async function* ({ context }) {
+        if (!deps.events.followChatAlerts) throw new ORPCError("NOT_FOUND");
+        const { spaceId, userId } = context.actor;
+        const controller = new AbortController();
+        const signal = context.signal
+          ? AbortSignal.any([context.signal, controller.signal])
+          : controller.signal;
+        const alerts = deps.events.followChatAlerts(userId, spaceId, signal);
+        let pending: Promise<IteratorResult<ChatAlert>> | undefined;
+        let authorizedAt = Date.now();
+        try {
+          while (!context.signal?.aborted) {
+            pending ??= alerts.next();
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            const next = await Promise.race([
+              pending,
+              new Promise<"heartbeat">((resolve) => {
+                timer = setTimeout(() => resolve("heartbeat"), HEARTBEAT_MS);
+              }),
+            ]).finally(() => clearTimeout(timer));
+            if (context.stillAuthorized && Date.now() - authorizedAt >= SESSION_RECHECK_MS) {
+              if (!(await context.stillAuthorized())) throw new ORPCError("UNAUTHORIZED");
+              authorizedAt = Date.now();
+            }
+            if (next === "heartbeat") {
+              yield { type: "heartbeat" as const };
+              continue;
+            }
+            pending = undefined;
+            if (next.done) return;
+            if (next.value.spaceId !== spaceId) continue;
+            yield { type: "alert" as const, alert: next.value };
+          }
+        } finally {
+          controller.abort();
+          await alerts.return(undefined);
+        }
+      }),
+      subscribeCalls: authed.notifications.subscribeCalls.handler(async function* ({ context }) {
+        if (!deps.env?.phoneCallsEnabled || !deps.events.followIncomingCalls)
+          throw new ORPCError("NOT_FOUND");
+        const controller = new AbortController();
+        const signal = context.signal
+          ? AbortSignal.any([context.signal, controller.signal])
+          : controller.signal;
+        const signals = deps.events.followIncomingCalls(context.actor.userId, signal);
+        let pending: Promise<IteratorResult<void>> | undefined;
+        let authorizedAt = Date.now();
+        try {
+          while (!context.signal?.aborted) {
+            pending ??= signals.next();
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            const next = await Promise.race([
+              pending,
+              new Promise<"heartbeat">((resolve) => {
+                timer = setTimeout(() => resolve("heartbeat"), HEARTBEAT_MS);
+              }),
+            ]).finally(() => clearTimeout(timer));
+            if (context.stillAuthorized && Date.now() - authorizedAt >= SESSION_RECHECK_MS) {
+              if (!(await context.stillAuthorized())) throw new ORPCError("UNAUTHORIZED");
+              authorizedAt = Date.now();
+            }
+            if (next === "heartbeat") {
+              yield { type: "heartbeat" as const };
+              continue;
+            }
+            pending = undefined;
+            if (next.done) return;
+            yield {
+              type: "incoming.calls" as const,
+              payload: { calls: await loadUserIncomingCalls(deps.prisma, context.actor.userId) },
+            };
+          }
+        } finally {
+          controller.abort();
+          await signals.return(undefined);
+        }
+      }),
+      declineIncomingCall: authed.notifications.declineIncomingCall.handler(
+        async ({ context, input }) => {
+          if (!deps.env?.phoneCallsEnabled) throw new ORPCError("NOT_FOUND");
+          // A locked device has only the call id, and may be viewing a different Space.
+          const settled = await runAsSystem(
+            "decline the signed-in call owner's incoming call",
+            async () => {
+              const message = await deps.prisma.message.findFirst({
+                where: {
+                  clientNonce: callRequestClientNonce(input.callId),
+                  role: "bot",
+                  thread: {
+                    userId: context.actor.userId,
+                    groupId: null,
+                    bot: { userId: context.actor.userId },
+                  },
+                },
+                select: { threadId: true },
+              });
+              if (!message) throw new ORPCError("NOT_FOUND");
+              return settleCallRequest(deps, {
+                threadId: message.threadId,
+                callId: input.callId,
+                from: ["ringing"],
+                status: "declined",
+              });
+            },
+          );
+          if (settled?.status !== "declined") throw new ORPCError("CONFLICT");
+          return { ok: true as const };
+        },
+      ),
+      registerCallPush: authed.notifications.registerCallPush.handler(
+        async ({ context, input }) => {
+          if (!context.sessionId) throw new ORPCError("UNAUTHORIZED");
+          try {
+            await deps.pushTokens.saveDevice?.(context.actor.userId, input, context.sessionId);
+          } catch (error) {
+            if (error instanceof PushSessionEndedError) throw new ORPCError("UNAUTHORIZED");
+            throw error;
+          }
+          return { ok: true as const };
+        },
+      ),
       registerPush: authed.notifications.registerPush.handler(async ({ context, input }) => {
         const sessionId = context.sessionId;
         if (!sessionId) throw new ORPCError("UNAUTHORIZED");
         try {
-          await deps.pushTokens.save(context.actor.userId, input.token, sessionId);
+          await deps.pushTokens.save(
+            context.actor.userId,
+            input.token,
+            sessionId,
+            input.presentation,
+          );
         } catch (error) {
           if (error instanceof PushSessionEndedError) throw new ORPCError("UNAUTHORIZED");
           throw error;
@@ -195,6 +471,8 @@ export function accountRoutes(ctx: RouterContext) {
         return { ok: true as const };
       }),
       unregisterPush: authed.notifications.unregisterPush.handler(async ({ context }) => {
+        if (context.sessionId)
+          await deps.pushTokens.endSession(context.actor.userId, context.sessionId);
         await deps.pushTokens.remove(context.actor.userId);
         return { ok: true as const };
       }),
@@ -278,7 +556,7 @@ export function accountRoutes(ctx: RouterContext) {
           ? await loadVoiceCredential(deps, context.actor, input.provider, input.scope)
           : await loadDefaultVoiceCredential(deps, context.actor, input.scope);
         if (!row) return [];
-        return (await voiceProviderFor(deps, context.actor, row.cred.provider)).listVoices(
+        return (await voiceProviderFor(deps, row.cred.provider)).listVoices(
           row.apiKey,
           voiceContext(context.actor, context.signal),
         );
@@ -319,7 +597,7 @@ async function loadAutoReviewSettings(deps: RouterDeps, actor: Actor, scope?: Se
     findAutoReviewPreference(deps.prisma, actor, scope),
   ]);
   const stored = {
-    enabled: preference?.enabled ?? deploymentAutoReviewDefault(process.env),
+    enabled: preference?.enabled ?? true,
     skipApprovals: preference?.skipApprovals ?? false,
   };
   const settings = { ...stored, mode: approvalModeFromPreference(stored) };
@@ -366,4 +644,10 @@ async function loadAutoReviewSettings(deps: RouterDeps, actor: Actor, scope?: Se
 function requireBilling(deps: RouterDeps): BillingService {
   if (!deps.billing) throw new ORPCError("NOT_FOUND", { message: "Billing is not enabled" });
   return deps.billing;
+}
+
+async function requireGrantAdmin(deps: RouterDeps, actor: Actor) {
+  await requireAdmin(deps, actor.userId);
+  if (!deps.billing?.modelCreditsEnabled)
+    throw new ORPCError("NOT_FOUND", { message: "Model credits are not enabled" });
 }

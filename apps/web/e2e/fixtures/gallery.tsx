@@ -132,6 +132,19 @@ const questions: Scenario = {
         ],
       },
     ]),
+    bot([
+      {
+        kind: "ask",
+        text: "Where should we meet?",
+        status: "answered",
+        answer: "Paris",
+        actions: [
+          { id: "berlin", label: "Berlin" },
+          { id: "seoul", label: "Seoul" },
+        ],
+      },
+    ]),
+    user("Paris"),
     stale,
     bot([
       {
@@ -198,6 +211,38 @@ const approvals: Scenario = {
     ]),
     bot([
       {
+        // As the adapters' purchase card words a pay click, with the order lines the page lists.
+        kind: "ask",
+        approvalEffectId: "effect-6",
+        text: "Pay on freshcart.test?",
+        detail: [
+          'Button: "Place order"',
+          "Bananas × 6: $3.00",
+          "Oat milk 1L × 2: $8.40",
+          "Delivery: $6.00",
+          "Total on the page: $17.40",
+          "The button label, items and total are read from the page. The bot has not checked them.",
+        ].join("\n"),
+        detailFormat: "text",
+        receipt: {
+          button: "Place order",
+          items: [
+            { name: "Bananas × 6", amount: "$3.00" },
+            { name: "Oat milk 1L × 2", amount: "$8.40" },
+            { name: "Delivery", amount: "$6.00" },
+          ],
+          amount: "$17.40",
+          amountSource: "page",
+        },
+        status: "pending",
+        actions: [
+          { id: "allow", label: "Allow once" },
+          { id: "deny", label: "Deny" },
+        ],
+      },
+    ]),
+    bot([
+      {
         kind: "ask",
         approvalEffectId: "effect-3",
         text: "Create the space Marketing?",
@@ -223,7 +268,6 @@ const approvals: Scenario = {
         detail: instructionUpdateDiff(
           "Reply in English.",
           "Reply in English. Keep summaries to one paragraph.",
-          "You asked for shorter summaries.",
         ),
         detailFormat: "code",
         actions: [
@@ -244,6 +288,22 @@ const approvals: Scenario = {
           after: "Reply in English. Be brief.",
           reason: "You asked for brevity.",
           undoVersionId: "version-1",
+        },
+      },
+    ]),
+    bot([
+      {
+        kind: "ask",
+        text: "Settings updated",
+        status: "answered",
+        settingsUpdate: {
+          botId: BOT.botId,
+          before: { modelProvider: "anthropic", modelId: "claude-haiku-5.5", thinkingLevel: "low" },
+          after: {
+            modelProvider: "anthropic",
+            modelId: "claude-sonnet-5.5",
+            thinkingLevel: "high",
+          },
         },
       },
     ]),
@@ -294,6 +354,7 @@ const secrets: Scenario = {
           origin: "https://portal.example.test",
           auth: { type: "login" },
         },
+        loginFields: ["ID number", "Phone number", "PIN"],
         status: "pending",
       },
     ]),
@@ -398,7 +459,7 @@ const team: Scenario = {
         intent: "request",
       },
     ]),
-    bot([
+    message("user", [
       {
         kind: "bot_message_received",
         fromBotId: SCOUT.botId,
@@ -572,8 +633,34 @@ const calls: Scenario = {
   ],
 };
 
+// Every markdown style a reply can use, so type and weight changes can be judged in one place.
+const textStyles: Scenario = {
+  id: "text-styles",
+  label: "Text styles",
+  messages: [
+    user("Show me the text styles you can use."),
+    say(
+      [
+        "# Heading 1",
+        "## Heading 2",
+        "### Heading 3",
+        "A plain paragraph that runs long enough to wrap, so line height and measure show the way a real answer reads.",
+        "**Bold**, *italic*, ***bold italic***, ~~strikethrough~~, `inline code` and a [link](https://example.test).",
+        "> A blockquote that also runs long enough to wrap onto a second line.",
+        "- A bullet\n- Another bullet\n  - A nested bullet",
+        "1. **A bold lead-in:** then the rest of the item, long enough to wrap.\n2. A second item",
+        "| Plan | Price |\n| --- | --- |\n| Free | $0 |\n| Pro | $20 |",
+        '```\nconst greeting = "hello";\n```',
+        "---",
+        "A closing paragraph after a rule.",
+      ].join("\n\n"),
+    ),
+  ],
+};
+
 const SCENARIOS: Scenario[] = [
   conversation,
+  textStyles,
   questions,
   approvals,
   secrets,

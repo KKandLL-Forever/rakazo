@@ -9,15 +9,24 @@ import type {
   WebProvider,
 } from "@rakazo/adapter-kit";
 import type { ComputerMode, MessageBlock } from "@rakazo/contracts";
-import type { ToolCallStreak } from "@rakazo/core";
 import { createStreamingRedactor } from "@rakazo/core";
 import { toolEffectIdempotencyKey } from "@rakazo/core/node/approval-effect-key";
 import type { Bot, Computer, effectiveMemoryScope, Run, Task, Thread } from "@rakazo/db";
 import { dropRunTurnCheckpoint, saveRunTurnCheckpoint } from "@rakazo/db";
 import { getLogger } from "@rakazo/logging";
-import type { ApprovalPausedToolResult, ApprovedEffectReplayQueue } from "./approval-effect.js";
-import { approvalPausedToolResult, approvedEffectOccurrence } from "./approval-effect.js";
+import type {
+  ApprovalPausedToolResult,
+  ApprovedEffectReplayQueue,
+  TerminatingToolResult,
+} from "./approval-effect.js";
+import {
+  approvalPausedToolResult,
+  approvedEffectOccurrence,
+  OWNER_SETTINGS_REFUSAL_REPLY,
+  terminatingToolResult,
+} from "./approval-effect.js";
 import type { loadBotMessageContext } from "./bot-messages.js";
+import { partitionTools } from "./builtin-tool-bridge.js";
 import type { ComputerExecutionLease } from "./computer-lifecycle.js";
 import type { UnchangedVisualStreak } from "./computer-tools.js";
 import type { selectRunConnections } from "./connection-context.js";
@@ -31,6 +40,7 @@ import { subagentMarksUnread } from "./run-notifications.js";
 import { secretPausedToolResult } from "./run-secret.js";
 import type { createRunTrustLoaders } from "./run-trust.js";
 import type { inferScript } from "./scripted-runtime.js";
+import type { LoopGuardStreak } from "./tool-loop.js";
 import { restoreTurnCheckpoint, unresolvedTurnCheckpointCalls } from "./turn-checkpoint.js";
 
 export type RunningHelper = Omit<Extract<MessageBlock, { kind: "subagent" }>, "kind">;
@@ -39,7 +49,6 @@ export type ScreenRelease = { computer: ComputerRef; context: AdapterContext; ke
 
 export type EffectOccurrence = { executionId: string; fingerprint: string; occurrence: number };
 
-/** Lease and computer bookkeeping the attempt's heartbeat and cleanup read. */
 export interface RunLeaseState {
   valid: boolean;
   /** The run reached a final state; the heartbeat stops renewing. */
@@ -56,7 +65,6 @@ export interface RunComputerUseState {
   screenRelease: ScreenRelease | undefined;
 }
 
-/** The reply being streamed and what this attempt already showed in the thread. */
 export interface ReplyState {
   assembled: string;
   currentTextSegment: string;
@@ -84,6 +92,25 @@ export interface ReplyState {
   midTurnUserTexts: string[];
   midTurnProgressCount: number;
   turnStartedAtMs: number;
+  /** A message from the person mid-task starts a fresh budget from here (see "steered"). */
+  progressBudgetStart: number;
+  /** The first interim message after one may answer the person at once. */
+  steeringReplyPending: boolean;
+  /** The bot called a browser or desktop tool, so it may say at once that this will take a while. */
+  computerTaskStarted: boolean;
+  steeringResets: number;
+  lastSteeringResetAt: number;
+  /**
+   * Notes on steps since the last interim message, in order; they come back as the reply when
+   * nothing follows the last step.
+   */
+  workingNotes: string[];
+  /** Text taken out before steps so far, joined as written, so a secret split across two is hidden. */
+  narrationSoFar: string;
+  /** What the bot wrote since its last step: empty means nothing follows the last step. */
+  textSinceLastStep: string;
+  /** The working line shows a note; tool status lines wait until the bot writes again. */
+  narrationStatusShowing: boolean;
   /**
    * Tool calls that land mid-sentence wait here until the narration catches up to a
    * sentence boundary, so the step chips never render in the middle of a clause.
@@ -106,8 +133,6 @@ export interface ApprovalState {
   pausePending: boolean;
   /** The first card of parallel calls that need approval; the others wait for it. */
   request: Promise<ApprovalPausedToolResult> | undefined;
-  /** Runtimes may dispatch parallel calls; a run can open only one proposal at a time. */
-  proposalInFlight: boolean;
 }
 
 /** Which occurrence of an identical effect each tool call claims, across pauses. */
@@ -141,25 +166,51 @@ export interface RunState {
   approval: ApprovalState;
   effects: EffectState;
   screen: ScreenState;
-  toolCallStreak: ToolCallStreak;
+  toolCallStreak: LoopGuardStreak;
+  /** Result fingerprints of finished calls, read when the next call is tracked. */
+  toolResults: Map<string, string>;
+  /** Consecutive `computer_act`/`browser_act` batches over the action limit, this one included. */
+  overLimitActionCalls: number;
   /**
    * Whether outside content has entered the run. A run someone else started begins tainted,
    * and so does a later attempt, including one with restored untrusted tool results.
    */
   tainted: boolean;
+  /**
+   * The taint refusal for owner settings was returned in this attempt. A model that calls
+   * again gets the turn ended instead of the same error a second time.
+   */
+  ownerSettingsRefused: boolean;
+  /**
+   * The instructions this attempt's model works from: the attempt-start snapshot its prompt
+   * was built with, restored from the turn checkpoint on resume, and advanced only after a
+   * successful own-instruction write in this attempt. Own instruction writes guard on it, so
+   * a change that landed since the model last saw the text conflicts instead of being
+   * overwritten. Undefined when an older checkpoint predates the baseline: such a resumed
+   * attempt refuses own instruction writes rather than guessing.
+   */
+  ownInstructionsBaseline: string | undefined;
   earlierAttempt: Promise<boolean> | undefined;
+  /**
+   * Hosts of the sites this run typed an approved wallet purchase into (fill_card, fill_pay_token):
+   * the wallet owner approved paying there, so the pay click there asks nothing more.
+   */
+  walletHosts: Set<string>;
   handedOff: boolean;
   terminalCheckpointComplete: boolean;
 }
 
-/** The computer this run may use and how. */
 export interface RunComputerContext {
   stored: Computer;
+  /** Where the computer starts this run, which can differ from `stored` before it provisions. */
+  kind?: string;
   mode: ComputerMode;
   lease: ComputerExecutionLease | null;
   lazy: ReturnType<typeof lazyRunComputer>;
   /** Starts the computer on first use and copies the turn's files before each tool. */
   get: (reason: "tool" | "takeover" | "script", tool?: string) => Promise<ComputerRef>;
+  /** Queue files from earlier messages; `get` copies them before the next computer tool. */
+  copyEarlierFiles: (files: Array<Extract<MessageBlock, { kind: "file" | "image" }>>) => void;
   checkpoint: ReturnType<typeof createRunWorkspaceCheckpoint>;
   hostEnvironment: Awaited<ReturnType<NonNullable<SandboxProvider["environment"]>>> | undefined;
   graphical: boolean;
@@ -169,12 +220,13 @@ export interface RunComputerContext {
   heldForTakeover: boolean;
 }
 
-/** Facts about who started the run and where it replies. */
 export interface RunSource {
   ownerStartedRun: boolean;
   messagingChannelRun: boolean;
   channelId: string | undefined;
   historySearchBeforeSeq: number;
+  /** See historyMyChatsAllowed; claimed outside steering still revokes it per call. */
+  myChatsAllowed: boolean;
   voiceCall: boolean;
   callEndRun: boolean;
   callClientNonce: string | null;
@@ -223,10 +275,11 @@ export interface RunContext {
   /** Provider context for this run's calls; aborting the run aborts its signal. */
   context: AdapterContext;
   abortController: AbortController;
+  /** Stops the model and its next tool calls; the run's own signal stays live to save and finish. */
+  runtimeAbortController: AbortController;
   fleetRun: FleetRun;
   /** Every value redacted from what this run shows or stores. Grows during the run. */
   secrets: string[];
-  agentEnvironment: Record<string, string>;
   source: RunSource;
   computer: RunComputerContext;
   tools: RunTools;
@@ -238,6 +291,8 @@ export interface RunContext {
   scripted: boolean;
   script: ReturnType<typeof inferScript> | undefined;
   allowSilentEmptyRun: boolean;
+  /** A group message that named no member: this member may end without replying. */
+  groupReplyOptional: boolean;
   emptyResponseText: string | undefined;
   state: RunState;
   settleRunningHelpers: () => Promise<void>;
@@ -294,6 +349,27 @@ export function pauseForSecret(ctx: RunContext) {
   return secretPausedToolResult();
 }
 
+/** The owner chose Never ask for this space. */
+export async function neverAsks(ctx: RunContext) {
+  return (await ctx.trust.loadAutoReviewPreference()).skipApprovals;
+}
+
+/**
+ * Refuse an owner-settings change in a run that read outside content. The first refusal
+ * explains the block; a repeat ends the turn, because a model that ignored the explanation
+ * would otherwise retry the same call without a bound.
+ */
+export function refuseOwnerSettingsChange(
+  ctx: RunContext,
+  error: string,
+): { error: string } | TerminatingToolResult {
+  if (ctx.state.ownerSettingsRefused) {
+    return terminatingToolResult(OWNER_SETTINGS_REFUSAL_REPLY, { refused: "owner-settings" });
+  }
+  ctx.state.ownerSettingsRefused = true;
+  return { error };
+}
+
 export async function isRunTainted(ctx: RunContext) {
   const { state } = ctx;
   if (state.tainted) return true;
@@ -304,6 +380,14 @@ export async function isRunTainted(ctx: RunContext) {
     state.tainted = true;
   return state.tainted;
 }
+
+/** A change landed after this attempt's snapshot; only a fresh run can apply the rewrite. */
+export const OWN_INSTRUCTIONS_CHANGED_ERROR =
+  "Instructions changed since this run started, so your instructions were not saved. Ask the user to send their request again so a new run starts from the current instructions.";
+
+/** An older checkpoint predates the baseline; a resumed attempt must not guess. */
+export const OWN_INSTRUCTIONS_BASELINE_UNKNOWN_ERROR =
+  "This resumed run cannot safely change its own instructions. Ask the user to send their request again so a new run starts from the current instructions.";
 
 export function nextMutatingEffectOccurrence(
   ctx: RunContext,
@@ -335,6 +419,7 @@ export async function persistTurnCheckpoint(ctx: RunContext, executionId?: strin
   if (capture) {
     const saved = JSON.parse(capture());
     saved.effectOccurrences = effects.occurrences;
+    saved.ownInstructionsBaseline = ctx.state.ownInstructionsBaseline;
     await saveRunTurnCheckpoint(deps.prisma, run, workerId, fence, JSON.stringify(saved));
     effects.storedTurnCheckpoint = true;
   } else if (effects.storedTurnCheckpoint) {
@@ -353,13 +438,26 @@ export function restoreTurnCheckpointEffects(
   ctx: RunContext,
   turnCheckpoint: string,
   model: { provider: string; id: string },
+  computerMode?: "main" | "computer",
 ): string | undefined {
   const effects = ctx.state.effects;
   try {
     const saved = restoreTurnCheckpoint(turnCheckpoint, model);
     const unresolved = new Set(unresolvedTurnCheckpointCalls(saved.messages));
-    const namedTools = namedAgentTools(ctx.tools.offered);
+    const namedTools = namedAgentTools(partitionTools(ctx.tools.offered).listed);
     const available = new Set(namedTools.map((tool) => tool.name));
+    if (computerMode) {
+      // Only the authenticated saved role authorizes a runtime transition. Do not
+      // add it to the executor's tool table or mask a connector wire-name collision.
+      if (
+        saved.computerMode?.version !== 1 ||
+        saved.computerMode.mode !== computerMode ||
+        available.has("enter_computer_mode") ||
+        available.has("leave_computer_mode")
+      )
+        return undefined;
+      available.add(computerMode === "main" ? "enter_computer_mode" : "leave_computer_mode");
+    }
     if (
       saved.messages.some(
         (message) =>
@@ -397,7 +495,9 @@ export function restoreTurnCheckpointEffects(
         for (const call of message.content) {
           if (call.type !== "toolCall" || unresolved.has(call)) continue;
           const tool = namedTools.find((tool) => tool.name === call.name)?.tool;
-          if (tool && tool.name !== "request_secret" && tool.name !== "connect_app")
+          // A code request counts like any tool: each one is its own card.
+          const single = tool?.name === "connect_app" || tool?.name === "request_secret";
+          if (tool && (!single || call.arguments.oneTimeCode !== undefined))
             nextMutatingEffectOccurrence(
               ctx,
               tool.name,
@@ -407,6 +507,10 @@ export function restoreTurnCheckpointEffects(
         }
       }
     }
+    // The restored system prompt still carries the instructions it was built from; the
+    // baseline must match it, not the current row. Checkpoints without one (older saves)
+    // leave it undefined, which refuses own instruction writes in this attempt.
+    ctx.state.ownInstructionsBaseline = saved.ownInstructionsBaseline;
     return turnCheckpoint;
   } catch {
     // Incompatible transcripts use the existing canonical approval replay.

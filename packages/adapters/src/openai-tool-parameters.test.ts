@@ -469,7 +469,9 @@ describe("parametersFor OpenAI wire fidelity", () => {
     expect(Object.keys(wire.properties as object).sort()).toEqual([
       "connectionId",
       "credential",
+      "fields",
       "label",
+      "oneTimeCode",
       "purpose",
       "replace",
     ]);

@@ -144,6 +144,7 @@ describe("command variables stay out of HTTP and page fills", () => {
     await save(db, "cli-token", "fake-cli-token-1");
     expect(
       await resolveLoginFill({
+        runId: "run-1",
         prisma: db.prisma,
         secretStore,
         scope,
@@ -164,7 +165,7 @@ describe("list_secrets", () => {
       origin: "https://api.example.test",
       auth: { type: "bearer" },
     });
-    const listed = await listBotSecrets(db.prisma, scope);
+    const listed = await listBotSecrets(db.prisma, secretStore, scope);
     expect(listed).toEqual([
       expect.objectContaining({ name: "api", origin: "https://api.example.test" }),
       { name: "netbird-setup-key", auth: command, variable: "NETBIRD_SETUP_KEY" },
@@ -195,7 +196,7 @@ describe("list_secrets", () => {
         ciphertext: "unused",
       },
     });
-    const listed = await listBotSecrets(db.prisma, scope);
+    const listed = await listBotSecrets(db.prisma, secretStore, scope);
     expect(listed).toEqual([
       {
         name: longName,
@@ -212,10 +213,10 @@ describe("list_secrets", () => {
 });
 
 describe("shell command environment", () => {
-  // Mirrors the executor's shell tool: run secrets start with the space variables, each command
-  // builds its environment through shellCommandEnvironment, and its output is redacted with them.
-  function commandRunner(db: ReturnType<typeof fakeDatabase>, space: Record<string, string>) {
-    const runSecrets = [...Object.values(space)];
+  // Mirrors the executor's shell tool: each command builds its environment through
+  // shellCommandEnvironment, and its output is redacted with the values it registered.
+  function commandRunner(db: ReturnType<typeof fakeDatabase>) {
+    const runSecrets: string[] = [];
     const registerRedactions = (values: string[]) => {
       runSecrets.push(...values.filter((value) => !runSecrets.includes(value)));
     };
@@ -224,7 +225,6 @@ describe("shell command environment", () => {
         prisma: db.prisma,
         secretStore,
         scope: runScope,
-        spaceEnvironment: space,
         registerRedactions,
       });
       // A fake sandbox whose command prints its whole environment.
@@ -239,18 +239,13 @@ describe("shell command environment", () => {
     };
   }
 
-  it("exports the bot's variables over space variables and redacts them from output", async () => {
+  it("exports the vault's variables and redacts them from output", async () => {
     const db = fakeDatabase();
     await save(db, "netbird-setup-key", "fake-bot-setup-key");
-    const runCommand = commandRunner(db, {
-      NETBIRD_SETUP_KEY: "fake-space-setup-key",
-      SPACE_ONLY: "fake-space-only",
-    });
-    const { env, output } = await runCommand();
-    expect(env).toEqual({ NETBIRD_SETUP_KEY: "fake-bot-setup-key", SPACE_ONLY: "fake-space-only" });
+    const { env, output } = await commandRunner(db)();
+    expect(env).toEqual({ NETBIRD_SETUP_KEY: "fake-bot-setup-key" });
     expect(output.stdout).toContain("NETBIRD_SETUP_KEY=");
     expect(`${output.stdout}${output.stderr}`).not.toContain("fake-bot-setup-key");
-    expect(`${output.stdout}${output.stderr}`).not.toContain("fake-space-only");
   });
 
   it("does not let one unencodable stored value abort the shell environment", async () => {
@@ -279,7 +274,6 @@ describe("shell command environment", () => {
       prisma: db.prisma,
       secretStore: store,
       scope,
-      spaceEnvironment: {},
       registerRedactions: (values) => redactions.push(...values),
     });
     expect(env).toEqual({ BAD_TOKEN: bad, GOOD_TOKEN: "fake-good-token" });
@@ -293,11 +287,10 @@ describe("shell command environment", () => {
     );
   });
 
-  it("leaves an unreadable bot variable unset instead of using the space credential", async () => {
+  it("leaves an unreadable variable unset and reports it", async () => {
     const db = fakeDatabase();
     await save(db, "cli-token", "fake-bot-token");
     await save(db, "good-token", "fake-good-token");
-    const spaceEnvironment = { CLI_TOKEN: "fake-space-token", SPACE_ONLY: "fake-space-only" };
     const registerRedactions = vi.fn();
     const { env, unsetEnv } = await shellCommandEnvironment({
       prisma: db.prisma,
@@ -310,13 +303,10 @@ describe("shell command environment", () => {
         },
       },
       scope,
-      spaceEnvironment,
       registerRedactions,
     });
-    expect(env).toEqual({ SPACE_ONLY: "fake-space-only", GOOD_TOKEN: "fake-good-token" });
+    expect(env).toEqual({ GOOD_TOKEN: "fake-good-token" });
     expect(unsetEnv).toEqual(["CLI_TOKEN"]);
-    expect(Object.hasOwn(env, "CLI_TOKEN")).toBe(false);
-    expect(spaceEnvironment.CLI_TOKEN).toBe("fake-space-token");
     expect(registerRedactions).toHaveBeenCalledExactlyOnceWith(
       commandCredentialRedactions({ GOOD_TOKEN: "fake-good-token" }),
     );
@@ -333,7 +323,6 @@ describe("shell command environment", () => {
         },
       },
       scope,
-      spaceEnvironment: { CLI_TOKEN: "fake-space-token" },
       registerRedactions: vi.fn(),
     });
     const root = mkdtempSync(path.join(tmpdir(), "rakazo-command-env-"));
@@ -390,7 +379,6 @@ describe("shell command environment", () => {
       prisma: db.prisma,
       secretStore,
       scope,
-      spaceEnvironment: {},
       registerRedactions: (values) => runSecrets.push(...values),
     });
     const encoded = [Buffer.from(value).toString("base64"), encodeURIComponent(value)];
@@ -401,7 +389,7 @@ describe("shell command environment", () => {
 
   it("applies a variable added, replaced, or removed between two commands", async () => {
     const db = fakeDatabase();
-    const runCommand = commandRunner(db, {});
+    const runCommand = commandRunner(db);
     expect((await runCommand()).env).toEqual({});
 
     await save(db, "later-token", "fake-later-token-1");

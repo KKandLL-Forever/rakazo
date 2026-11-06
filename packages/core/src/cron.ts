@@ -19,9 +19,6 @@ export function isOneShotRoutineCron(cron: string): boolean {
   return cron.trim() === ONCE_ROUTINE_CRON;
 }
 
-// A routine is one-shot only when it has exactly one schedule and that
-// schedule is @once — a mix of @once plus recurring schedules doesn't make
-// sense (the one-shot slot would never get a "next run" to compute).
 export function isOneShotRoutineCrons(crons: string[]): boolean {
   return crons.length === 1 && isOneShotRoutineCron(crons[0] ?? "");
 }
@@ -253,6 +250,27 @@ export function russianInterval(value: number, unit: CronUnit): { lead: string; 
   };
 }
 
+/** Polish cardinal categories without depending on Intl.PluralRules on native runtimes. */
+export function polishPluralCategory(count: number): "one" | "few" | "many" | "other" {
+  const absolute = Math.abs(count);
+  if (!Number.isInteger(absolute)) return "other";
+  if (absolute === 1) return "one";
+  const mod10 = absolute % 10;
+  const mod100 = absolute % 100;
+  return mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14) ? "few" : "many";
+}
+
+/** Polish intervals use the accusative singular and counted plural case forms. */
+export function polishInterval(value: number, unit: CronUnit): { lead: string; detail: string } {
+  const forms = {
+    minutes: { one: "minutę", few: "minuty", many: "minut", other: "minuty" },
+    hours: { one: "godzinę", few: "godziny", many: "godzin", other: "godziny" },
+    days: { one: "dzień", few: "dni", many: "dni", other: "dnia" },
+  } as const;
+  const form = forms[unit][polishPluralCategory(value)];
+  return { lead: "Co", detail: value === 1 ? form : `${value} ${form}` };
+}
+
 export function describeCronPreset(
   preset: CronPreset,
   labels: CronLabels = ENGLISH_CRON_LABELS,
@@ -480,10 +498,8 @@ export function nextCronDateAcross(crons: string[], from: Date, timezone = "UTC"
   return earliest;
 }
 
-// Same as nextCronDateAcross, but throws on the first malformed recurring
-// cron instead of silently skipping it. Use this before persisting a
-// routine's crons — a partially-invalid array should be rejected outright,
-// not saved with the bad entry quietly never firing.
+// Throws on the first malformed recurring cron instead of skipping it, so a persisted
+// routine never keeps a bad entry that silently never fires.
 export function nextCronDateAcrossStrict(
   crons: string[],
   from: Date,
@@ -528,7 +544,8 @@ export function zonedDateTime(value: string, timezone = "UTC"): Date | null {
     return null;
   }
   if (wall[8]) {
-    const instant = new Date(text);
+    // Date only parses an offset with minutes; ISO 8601 also allows hours alone (+05).
+    const instant = new Date(/^[+-]\d{2}$/.test(wall[8]) ? `${text}:00` : text);
     return Number.isFinite(instant.getTime()) ? instant : null;
   }
   const local = new CronDate(new Date(), validTimezoneOrUtc(timezone));
@@ -566,6 +583,25 @@ function parseClock(time: string): { hour: number; minute: number } {
   if (/pm/i.test(time) && hour < 12) hour += 12;
   if (/am/i.test(time) && hour === 12) hour = 0;
   return { hour, minute };
+}
+
+/**
+ * A schedule time ("9:00 PM") the way `locale` writes clock times ("21:00"). Presets keep
+ * the English form as their value.
+ */
+export function localizedClock(time: string, locale: string): string {
+  if (!/^\d{1,2}:\d{2}(?:\s[AP]M)?$/i.test(time)) return time;
+  const { hour, minute } = parseClock(time);
+  const rawHour = Number(time.split(":")[0]);
+  if (minute > 59 || hour > 23 || (/[AP]M/i.test(time) && (rawHour < 1 || rawHour > 12)))
+    return time;
+  try {
+    return new Intl.DateTimeFormat(locale, { hour: "numeric", minute: "2-digit" }).format(
+      new Date(2000, 0, 1, hour, minute),
+    );
+  } catch {
+    return time;
+  }
 }
 
 function formatClock(hour: number, minute: number): string {

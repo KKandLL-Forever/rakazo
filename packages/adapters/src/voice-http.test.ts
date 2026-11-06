@@ -7,6 +7,7 @@ import {
   verifyVoiceHttpGet,
   voiceAccountIssue,
   voiceDeadline,
+  voiceLanguageHint,
   voiceRequestError,
 } from "./voice-http.js";
 
@@ -223,5 +224,33 @@ describe("voiceAccountIssue", () => {
     expect(voiceRequestError(503, "Fish Audio", "speaking", null)).not.toBeInstanceOf(
       VoiceAccountError,
     );
+  });
+
+  it("raises other refusals of the account without a code and keeps the provider message", () => {
+    const permission = "The API key you used is missing the permission text_to_speech.";
+    const error = voiceRequestError(401, "ElevenLabs", "speaking", {
+      detail: { status: "missing_permissions", message: permission },
+    });
+    expect(error).toBeInstanceOf(VoiceAccountError);
+    expect(error).toMatchObject({ code: undefined, message: permission });
+    expect(voiceRequestError(400, "ElevenLabs", "speaking", null)).not.toBeInstanceOf(
+      VoiceAccountError,
+    );
+  });
+});
+
+describe("voiceLanguageHint", () => {
+  it("keeps the lowercase primary subtag of a valid language tag", () => {
+    expect(voiceLanguageHint("pl")).toBe("pl");
+    expect(voiceLanguageHint("es-ES")).toBe("es");
+    expect(voiceLanguageHint(" PT-br ")).toBe("pt");
+    expect(voiceLanguageHint("zh-Hant-TW")).toBe("zh");
+  });
+
+  it("omits values that are not language tags", () => {
+    expect(voiceLanguageHint(undefined)).toBeUndefined();
+    expect(voiceLanguageHint("")).toBeUndefined();
+    expect(voiceLanguageHint("english")).toBeUndefined();
+    expect(voiceLanguageHint("es_ES")).toBeUndefined();
   });
 });

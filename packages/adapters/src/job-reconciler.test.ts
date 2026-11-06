@@ -20,7 +20,14 @@ function publisher() {
 }
 
 function fakePrisma(
-  runs: Array<{ id: string; status: string; updatedAt: Date }> = [],
+  runs: Array<{
+    id: string;
+    status: string;
+    updatedAt: Date;
+    wakeAt?: Date | null;
+    botId?: string;
+    bot?: { computerId: string | null };
+  }> = [],
   routines: Array<{ id: string; nextRunAt: Date | null }> = [],
   controls: Array<{
     id: string;
@@ -31,6 +38,7 @@ function fakePrisma(
   }> = [],
 ) {
   return {
+    computerExecutionLease: { findMany: vi.fn(async () => []) },
     message: { findMany: vi.fn(async () => []) },
     run: { findMany: vi.fn(async () => runs) },
     routine: { findMany: vi.fn(async () => routines) },
@@ -72,6 +80,66 @@ describe("createJobReconciler", () => {
     expect(prisma.routine.findMany).toHaveBeenCalled();
     expect(prisma.computer.findMany).toHaveBeenCalled();
     expect(prisma.messagingOutbound.findFirst).toHaveBeenCalled();
+  });
+
+  it("keeps recovering due work while an auxiliary reconciler hangs", async () => {
+    const prisma = fakePrisma([], [{ id: "routine-due", nextRunAt: new Date() }]);
+    const { jobs, enqueue } = publisher();
+    const storage = deferred();
+    const reconcileHomeStorage = vi.fn(() => storage.promise);
+    const reconciler = createJobReconciler({ prisma, jobs, reconcileHomeStorage });
+
+    await reconciler.reconcileOnce();
+    await reconciler.reconcileOnce();
+
+    const wakeups = enqueue.mock.calls.filter(([job]) => job.name === "routine.wakeup");
+    expect(wakeups).toHaveLength(2);
+    // A pass still running is not started again.
+    expect(reconcileHomeStorage).toHaveBeenCalledOnce();
+    let stopped = false;
+    const stopping = reconciler.stop().then(() => {
+      stopped = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(stopped).toBe(false);
+    storage.resolve();
+    await stopping;
+  });
+
+  it("waits for housekeeping a pass starts after stop was called", async () => {
+    const { jobs } = publisher();
+    const acquired = deferred();
+    const storage = deferred();
+    const leadership: ReconciliationLeadership = {
+      tryAcquire: vi.fn(async () => {
+        await acquired.promise;
+        return true;
+      }),
+      release: vi.fn(async () => undefined),
+    };
+    const reconcileHomeStorage = vi.fn(() => storage.promise);
+    const reconciler = createJobReconciler({
+      prisma: fakePrisma(),
+      jobs,
+      leadership,
+      reconcileHomeStorage,
+    });
+
+    const pass = reconciler.reconcileOnce();
+    let stopped = false;
+    const stopping = reconciler.stop().then(() => {
+      stopped = true;
+    });
+    acquired.resolve();
+    await pass;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(reconcileHomeStorage).toHaveBeenCalledOnce();
+    expect(stopped).toBe(false);
+    expect(leadership.release).not.toHaveBeenCalled();
+    storage.resolve();
+    await stopping;
+    expect(leadership.release).toHaveBeenCalledOnce();
   });
 
   it("restores a due pending messaging outbox drain", async () => {
@@ -174,6 +242,124 @@ describe("createJobReconciler", () => {
         orderBy: [{ controlLeaseExpiresAt: "asc" }, { id: "asc" }],
       }),
     );
+  });
+
+  it("leaves queued resource waits untouched and recovers them after release", async () => {
+    const run = {
+      id: "run-waiting",
+      status: "queued",
+      wakeAt: null,
+      updatedAt: new Date(Date.now() - 60_000),
+      botId: "bot-1",
+      bot: { computerId: "computer-1" },
+    };
+    const prisma = fakePrisma([run]);
+    vi.mocked(prisma.computerExecutionLease.findMany).mockResolvedValue([
+      {
+        computerId: "computer-1",
+        botId: "bot-1",
+        runId: "run-holder",
+        expiresAt: new Date(Date.now() + 60_000),
+      },
+    ] as never);
+    const { jobs, enqueue } = publisher();
+    const reconciler = createJobReconciler({ prisma, jobs });
+
+    await reconciler.reconcileOnce();
+
+    expect(enqueue).not.toHaveBeenCalledWith(expect.objectContaining({ name: "run.continue" }));
+    expect(prisma.computerExecutionLease.findMany).toHaveBeenCalledWith({
+      where: { botId: { in: ["bot-1"] }, expiresAt: { gt: expect.any(Date) } },
+      select: { computerId: true, botId: true, runId: true, expiresAt: true },
+    });
+
+    vi.mocked(prisma.computerExecutionLease.findMany).mockResolvedValue([]);
+    await reconciler.reconcileOnce();
+
+    expect(enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: "run.continue",
+        payload: { runId: run.id },
+        keepExisting: true,
+      }),
+    );
+  });
+
+  it.each([
+    { computerId: "computer-1", botId: "bot-1", runId: "run-lost" },
+    { computerId: "old-computer", botId: "bot-1", runId: "run-holder" },
+    { computerId: "computer-1", botId: "other-bot", runId: "run-holder" },
+  ])("recovers a lost queued run with a nonblocking lease %j", async (lease) => {
+    const prisma = fakePrisma([
+      {
+        id: "run-lost",
+        status: "queued",
+        wakeAt: null,
+        updatedAt: new Date(),
+        botId: "bot-1",
+        bot: { computerId: "computer-1" },
+      },
+    ]);
+    vi.mocked(prisma.computerExecutionLease.findMany).mockResolvedValue([
+      { ...lease, expiresAt: new Date(Date.now() + 60_000) },
+    ] as never);
+    const { jobs, enqueue } = publisher();
+
+    await createJobReconciler({ prisma, jobs }).reconcileOnce();
+
+    expect(enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: "run.continue",
+        payload: { runId: "run-lost" },
+        keepExisting: true,
+      }),
+    );
+  });
+
+  it.each([
+    { holder: [], blocks: false },
+    { holder: [{ id: "run-holder", status: "cancelled" }], blocks: false },
+    { holder: [{ id: "run-holder", status: "waiting_takeover" }], blocks: true },
+  ])("frees a takeover hold only once its run is gone or ended %j", async ({ holder, blocks }) => {
+    const waiting = {
+      id: "run-waiting",
+      status: "queued",
+      wakeAt: null,
+      updatedAt: new Date(Date.now() - 60_000),
+      botId: "bot-1",
+      bot: { computerId: "computer-1" },
+    };
+    const prisma = fakePrisma([waiting]);
+    vi.mocked(prisma.run.findMany).mockImplementation((async (args: { where: { id?: unknown } }) =>
+      args.where.id ? holder : [waiting]) as never);
+    vi.mocked(prisma.computerExecutionLease.findMany).mockResolvedValue([
+      {
+        computerId: "computer-1",
+        botId: "bot-1",
+        runId: "run-holder",
+        expiresAt: new Date(Date.now() + 24 * 60 * 60_000),
+      },
+    ] as never);
+    const updateMany = vi.fn(async () => ({ count: 1 }));
+    Object.assign(prisma.computerExecutionLease, { updateMany });
+    const { jobs, enqueue } = publisher();
+
+    await createJobReconciler({ prisma, jobs }).reconcileOnce();
+
+    const recovered = expect.objectContaining({
+      name: "run.continue",
+      payload: { runId: waiting.id },
+    });
+    if (blocks) {
+      expect(updateMany).not.toHaveBeenCalled();
+      expect(enqueue).not.toHaveBeenCalledWith(recovered);
+    } else {
+      expect(updateMany).toHaveBeenCalledWith({
+        where: { runId: { in: ["run-holder"] }, expiresAt: { gt: expect.any(Date) } },
+        data: { expiresAt: new Date(0) },
+      });
+      expect(enqueue).toHaveBeenCalledWith(recovered);
+    }
   });
 
   it("replaces any lock for an expired lease but only an old lock for a queued run", async () => {
@@ -316,8 +502,8 @@ describe("createJobReconciler", () => {
     let runPage = 0;
     const runFindMany = vi.fn(async (args: { where?: Record<string, unknown> } = {}) => {
       if (args.where?.messagingMirroredAt === null) return [];
-      const status = args.where?.status as { in?: string[] } | undefined;
-      if (status?.in?.includes("waiting_takeover")) return [];
+      // The stuck-work scan is the only run query that looks at takeover waits.
+      if (JSON.stringify(args.where).includes("waiting_takeover")) return [];
       return runPages[runPage++] ?? [];
     });
     const routineFindMany = vi
@@ -326,6 +512,7 @@ describe("createJobReconciler", () => {
       .mockResolvedValueOnce(routines.slice(2, 4))
       .mockResolvedValueOnce(routines.slice(4));
     const prisma = {
+      computerExecutionLease: { findMany: vi.fn(async () => []) },
       run: { findMany: runFindMany },
       routine: { findMany: routineFindMany },
       computer: { findMany: vi.fn(async () => []) },
@@ -652,7 +839,7 @@ describe("createJobReconciler", () => {
       error: null,
       bot: { name: "Researcher" },
     };
-    const stuckText = loopGuardStopText("search", 8);
+    const stuckText = loopGuardStopText("search", { key: undefined, count: 8 });
     const prisma = {
       run: {
         findMany: vi.fn(async (args: { where?: Record<string, unknown> } = {}) =>

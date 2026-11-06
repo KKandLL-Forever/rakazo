@@ -1,7 +1,7 @@
 import { Trans, useLingui } from "@lingui/react/macro";
 import type { ScratchpadItem } from "@rakazo/contracts";
 import { fetchFresh, writeSaved } from "@rakazo/core/query";
-import { Button, Checkbox, Input } from "@rakazo/ui-web";
+import { Button, Checkbox, Input, SectionHeading } from "@rakazo/ui-web";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Plus, X } from "lucide-react";
 import { useState } from "react";
@@ -99,7 +99,7 @@ export function ScratchpadSection({ botId }: { botId: string }) {
 
   return (
     <div className="mt-6" data-testid="bot-scratchpad">
-      <h3 className="mb-2 flex items-center justify-between text-xs font-medium text-muted-foreground pe-1">
+      <SectionHeading variant="label" className="mb-2 flex items-center justify-between pe-1">
         <Trans>Open work</Trans>
         <Button
           variant="ghost"
@@ -110,7 +110,7 @@ export function ScratchpadSection({ botId }: { botId: string }) {
         >
           <Plus className="size-4" />
         </Button>
-      </h3>
+      </SectionHeading>
       <div className="rounded-xl bg-muted/50 p-4">
         {(showAll ? items : items.slice(0, 5)).map((item) => (
           <div
@@ -126,13 +126,13 @@ export function ScratchpadSection({ botId }: { botId: string }) {
             />
             <div className="min-w-0 flex-1">
               <div
-                className={`text-start text-[14.5px] ${item.status === "done" ? "text-muted-foreground/80 line-through" : "text-foreground"}`}
+                className={`text-start text-body-lg ${item.status === "done" ? "text-muted-foreground/80 line-through" : "text-foreground"}`}
                 dir="auto"
               >
                 {item.title}
               </div>
               {item.notes ? (
-                <div className="mt-0.5 text-[12.5px] text-muted-foreground/80" dir="auto">
+                <div className="mt-0.5 text-body-sm text-muted-foreground/80" dir="auto">
                   {item.notes}
                 </div>
               ) : null}
@@ -186,7 +186,7 @@ export function ScratchpadSection({ botId }: { botId: string }) {
           </form>
         ) : null}
       </div>
-      {error ? <div className="mt-2 text-[13px] text-destructive">{error}</div> : null}
+      {error ? <div className="mt-2 text-body-sm text-destructive">{error}</div> : null}
     </div>
   );
 }

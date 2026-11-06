@@ -3,16 +3,18 @@ import {
   contentKeyProviderFromEnv,
   createAgentHomeStore,
   ObjectAgentHomeStore,
+  unwrapEnvFromKeyManager,
 } from "@rakazo/adapters";
 import { loadRootEnv } from "@rakazo/core/node/load-root-env";
 import { createDb } from "@rakazo/db";
 
 loadRootEnv();
+await unwrapEnvFromKeyManager();
 
 const USAGE = `Usage: home-storage migrate [--dry-run]
   migrate   Upload homes that exist only under DATA_DIR/homes to object storage and verify
             each upload. Homes already stored are skipped, so it can be rerun. Local copies
-            are kept; see docs/self-host.md#bot-homes-in-object-storage to remove them.`;
+            are kept; see docs/self-host-storage.md#bot-homes-in-object-storage to remove them.`;
 
 function parseCommand() {
   try {
@@ -41,8 +43,12 @@ const { prisma, pool } = createDb(process.env.DATABASE_URL, {
 });
 const write = (line: string) => process.stdout.write(`${line}\n`);
 let stopping = false;
-process.once("SIGINT", () => (stopping = true));
-process.once("SIGTERM", () => (stopping = true));
+const stop = () => {
+  stopping = true;
+  process.exitCode = 1;
+};
+process.once("SIGINT", stop);
+process.once("SIGTERM", stop);
 
 try {
   const home = createAgentHomeStore(process.env.DATA_DIR ?? "./data", prisma);

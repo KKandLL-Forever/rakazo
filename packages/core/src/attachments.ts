@@ -1,6 +1,8 @@
 import type { AttachmentMimeType, MessageBlock } from "@rakazo/contracts";
 import {
+  ATTACHMENT_COUNT_CEILING,
   ATTACHMENT_MAX_BYTES,
+  ATTACHMENT_MAX_COUNT,
   attachmentSizeLabel,
   isAllowedAttachmentMimeType,
   isAttachmentImageMimeType,
@@ -14,15 +16,10 @@ export class AttachmentValidationError extends Error {
 }
 
 /**
- * Validates base64 without a grouped-repetition regex over the whole string.
- * `/^(?:[A-Za-z0-9+/]{4})*(...)?$/` stack-overflows V8's regex engine on
- * inputs in the megabytes-of-characters range — reproduced directly: a 5 MiB
- * string throws `RangeError: Maximum call stack size exceeded` on `.test()`.
- * At the current 10 MiB attachment limit, base64 expansion (4/3) puts any
- * attachment over ~3.75 MiB squarely in that range, so this crashes on a
- * routine, non-malicious upload. A flat, ungrouped `[chars]*` quantifier does
- * not have this problem; padding is checked separately since it can only
- * ever be the trailing 0-2 characters.
+ * Validates base64 without a grouped-repetition regex over the whole string:
+ * `/^(?:[A-Za-z0-9+/]{4})*(...)?$/` overflows V8's regex stack on multi-megabyte
+ * inputs, which ordinary attachments reach. A flat `[chars]*` quantifier does not;
+ * padding is checked separately since it can only be the trailing 0-2 characters.
  */
 function isWellFormedBase64(value: string): boolean {
   const paddingMatch = /={1,2}$/.exec(value);
@@ -30,6 +27,23 @@ function isWellFormedBase64(value: string): boolean {
   const body = paddingLength > 0 ? value.slice(0, value.length - paddingLength) : value;
   if (body.includes("=")) return false;
   return /^[A-Za-z0-9+/]*$/.test(body);
+}
+
+export function attachmentCountFromEnv(source: { MAX_ATTACHMENTS_PER_MESSAGE?: string }): number {
+  const value = source.MAX_ATTACHMENTS_PER_MESSAGE?.trim();
+  if (!value) return ATTACHMENT_MAX_COUNT;
+  const count = Number(value);
+  if (
+    !/^\d+$/.test(value) ||
+    !Number.isInteger(count) ||
+    count < 1 ||
+    count > ATTACHMENT_COUNT_CEILING
+  ) {
+    throw new Error(
+      `MAX_ATTACHMENTS_PER_MESSAGE must be an integer from 1 to ${ATTACHMENT_COUNT_CEILING}`,
+    );
+  }
+  return count;
 }
 
 export function uploadSizeFromEnv(source: { MAX_UPLOAD_SIZE_MB?: string }): number {
@@ -112,17 +126,41 @@ export function messageBlockForArtifact(artifact: {
   };
 }
 
+/** Untrusted transcript text is bounded before it reaches a prompt. */
+const VOICE_TRANSCRIPT_MAX_CHARS = 4000;
+
+/** Keeps tabs and newlines, drops C0, DEL and C1 control characters, trims and bounds the text. */
+export function normalizeVoiceTranscript(value: string | null | undefined): string {
+  if (!value) return "";
+  const printable = Array.from(value)
+    .filter((char) => {
+      const code = char.codePointAt(0) ?? 0;
+      if (code === 9 || code === 10) return true;
+      return code >= 32 && !(code >= 0x7f && code <= 0x9f);
+    })
+    .join("");
+  return printable.trim().slice(0, VOICE_TRANSCRIPT_MAX_CHARS);
+}
+
 export function promptTextForAttachments(
   text: string | undefined,
-  artifacts: Array<{ name: string; mimeType: string; size: number }>,
+  artifacts: Array<{
+    name: string;
+    mimeType: string;
+    size: number;
+    /** Normalized words transcribed from an inbound audio attachment. */
+    transcript?: string;
+  }>,
 ): string {
   const caption = text?.trim() ?? "";
   const notes = artifacts
     .filter((artifact) => !isAttachmentImageMimeType(artifact.mimeType))
-    .map(
-      (artifact) =>
-        `User attached file ${JSON.stringify(artifact.name)} (${artifact.mimeType}, ${artifact.size} bytes).`,
-    );
+    .map((artifact) => {
+      const note = `User attached file ${JSON.stringify(artifact.name)} (${artifact.mimeType}, ${artifact.size} bytes).`;
+      return artifact.transcript
+        ? `${note}\n[voice note transcript: ${artifact.transcript}]`
+        : note;
+    });
   return [caption, ...notes].filter(Boolean).join("\n\n") || "See attached files.";
 }
 
@@ -131,7 +169,12 @@ export function blocksToAgentHistoryText(blocks: MessageBlock[]): string {
     .map((block) => {
       if (block.kind === "text") return block.text;
       if (block.kind === "chart") return `[chart: ${block.name}]`;
+      if (block.kind === "app") return `[app: ${block.server} showed ${block.tool}]`;
       if (block.kind === "image") return `[image: ${block.name}]`;
+      // The id lets a later turn, or another chat, update this page instead of making a new one.
+      if (block.kind === "page") {
+        return `[page: ${block.title} (pageId ${block.pageId}, version ${block.version})]`;
+      }
       if (block.kind === "file") {
         return `[file: ${block.name} (${block.mimeType}, ${block.size} bytes)]`;
       }
@@ -139,6 +182,7 @@ export function blocksToAgentHistoryText(blocks: MessageBlock[]): string {
       // which lines came from another bot rather than the user.
       if (block.kind === "bot_message_received") return `[from ${block.fromBotName}] ${block.text}`;
       if (block.kind === "bot_message_sent") return `[to ${block.toBotName}] ${block.text}`;
+      if (block.kind === "channel_message") return `[from ${block.fromLabel}] ${block.text}`;
       if (block.kind === "handoff") {
         return `[handoff ${block.fromBotId} -> ${block.toBotId}] ${block.text}`;
       }
@@ -181,6 +225,8 @@ const EXTENSION_MIME_TYPES: Record<string, AttachmentMimeType> = {
   ".md": "text/markdown",
   ".markdown": "text/markdown",
   ".csv": "text/csv",
+  ".xls": "application/vnd.ms-excel",
+  ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
   ".html": "text/html",
   ".htm": "text/html",
   ".json": "application/json",
@@ -201,10 +247,20 @@ const MIME_TYPE_EXTENSIONS: Record<AttachmentMimeType, string> = {
   "text/plain": ".txt",
   "text/markdown": ".md",
   "text/csv": ".csv",
+  "application/vnd.ms-excel": ".xls",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
   "text/html": ".html",
   "application/json": ".json",
   "application/zip": ".zip",
 };
+
+/** Short file-type badge, as a file's extension reads ("TXT", "MD", "PDF"). */
+export function artifactTypeLabel(mimeType: string): string {
+  const extension = attachmentExtensionForMimeType(mimeType);
+  if (extension) return extension.slice(1).toUpperCase();
+  const slash = mimeType.indexOf("/");
+  return (slash === -1 ? mimeType : mimeType.slice(slash + 1)).toUpperCase().slice(0, 6);
+}
 
 export function inferAttachmentMimeType(
   name: string,
@@ -233,12 +289,21 @@ export function inferAttachmentMimeType(
   if (extensionType === "text/markdown" && (!reportedType || reportedType === "text/plain")) {
     return extensionType;
   }
+  // Windows reports .csv as an Excel file when Excel is installed.
+  if (extensionType === "text/csv" && reportedType === "application/vnd.ms-excel") {
+    return extensionType;
+  }
   if (reportedType && isAllowedAttachmentMimeType(reportedType)) return reportedType;
   return extensionType ?? null;
 }
 
 export function attachmentExtensionForMimeType(mimeType: string): string {
   return isAllowedAttachmentMimeType(mimeType) ? MIME_TYPE_EXTENSIONS[mimeType] : "";
+}
+
+/** Where a run copies an attached file in the bot's workspace; history tools report the same path. */
+export function attachmentComputerPath(artifactId: string, mimeType: string): string {
+  return `attachments/${artifactId}${attachmentExtensionForMimeType(mimeType)}`;
 }
 
 export function attachmentsForThread<T extends { threadKey: string }>(
@@ -257,9 +322,23 @@ export function attachmentsForBot<T extends { botId: string }>(
   return attachments.filter((attachment) => attachment.botId === botId);
 }
 
+/**
+ * The message whose attachments this run receives: a person's message, or a message or
+ * handoff another bot delivered, whose files arrive the same way.
+ */
 export function userTurnMessageForRun<
   T extends { id?: string; role: string; runId?: string | null; blocks: MessageBlock[] },
 >(trigger: string, runId: string, messages: T[], sourceMessageId?: string | null): T | undefined {
+  if (trigger === "bot_message" || trigger === "follow_up") {
+    if (!sourceMessageId) return undefined;
+    return messages.find(
+      (message) =>
+        message.id === sourceMessageId &&
+        message.blocks.some(
+          (block) => block.kind === "bot_message_received" || block.kind === "handoff",
+        ),
+    );
+  }
   if (trigger !== "user" && trigger !== "messaging" && trigger !== "reaction") return undefined;
   return messages.find(
     (message) =>

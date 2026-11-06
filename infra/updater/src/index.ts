@@ -55,8 +55,10 @@ const STEP_TIMEOUT_MS: Record<string, number> = {
   checkout: 60_000,
   merge: 60_000,
   pull: 600_000,
-  recreate: 1_800_000,
-  recover: 1_800_000,
+  // A recreate can build, wait up to the worker's 50-minute stop_grace_period for its running
+  // jobs, and then wait for the new services to become healthy.
+  recreate: 5_400_000,
+  recover: 5_400_000,
 };
 const DEFAULT_TIMEOUT_MS = 120_000;
 
@@ -104,14 +106,9 @@ export function commandEnvironment(
     const value = source[key];
     if (value !== undefined) env[key] = value;
   }
-  // The sidecar runs as root against a bind-mounted checkout that a non-root deploy user owns,
-  // which is the layout docs/self-host.md tells operators to use. Git refuses that with "detected
-  // dubious ownership" and exits 128, so every git call fails before it can read the current sha.
-  //
-  // Declaring the one directory safe here rather than in the Compose file is deliberate: this
-  // allowlist rebuilds the child environment from scratch, so anything set on the service is
-  // dropped before git ever runs. The value is the deployment directory the sidecar already
-  // trusts, and it is applied after `overrides` so a caller cannot widen it.
+  // Root against a checkout the deploy user owns makes git exit 128 with "detected dubious
+  // ownership". It is declared here, not in Compose, because this allowlist drops the service
+  // environment; it is applied after `overrides` so a caller cannot widen it.
   const deployDir = source.RAKAZO_DEPLOY_DIR?.trim();
   const gitOwnership =
     deployDir === undefined || deployDir === ""
@@ -271,10 +268,10 @@ export function createUpdaterApp(
           upToDate: target.imageTag === tags.currentTag,
           checkout,
         };
-      })();
-      planInFlight = work.finally(() => {
+      })().finally(() => {
         planInFlight = null;
       });
+      planInFlight = work;
       return c.json(await work);
     } catch (error) {
       return refusal(c, error);
@@ -807,8 +804,8 @@ export function createUpdaterApp(
   }
 }
 
-function startUpdater() {
-  const logger = createRootLogger(SERVICE_NAMES.updater);
+async function startUpdater() {
+  const logger = await createRootLogger(SERVICE_NAMES.updater);
   const config = resolveUpdaterConfig(process.env);
   const app = createUpdaterApp(config, { logger });
   const server = serve({ fetch: app.fetch, hostname: config.host, port: config.port }, () => {
@@ -856,5 +853,6 @@ export function restoreCheckoutArgv(fromBranch: string | null, fromCommit: strin
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
-  startUpdater();
+  // A rejected startup keeps Node's default: the error is printed and the process exits.
+  void startUpdater();
 }

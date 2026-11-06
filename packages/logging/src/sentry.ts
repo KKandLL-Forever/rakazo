@@ -1,4 +1,4 @@
-import * as Sentry from "@sentry/node";
+import type * as SentrySdk from "@sentry/node";
 import { CORRELATION_TAG_KEYS } from "./monitoring.js";
 import { isMonitoringUserId, monitoringPseudonymSecret, monitoringUserId } from "./pseudonym.js";
 import { redactSensitiveText } from "./redaction.js";
@@ -53,11 +53,15 @@ export function isValidDsn(dsn: string): boolean {
   }
 }
 
-export function createSentrySink(
+// The SDK loads only when a sink is built (SENTRY_DSN set), so unconfigured installs never
+// import it; a dynamic import of this module alone would not keep it lazy, because the
+// server bundle inlines this file.
+export async function createSentrySink(
   service: string,
   config: SentryConfig,
-  transport?: Sentry.NodeOptions["transport"],
-): LogSink {
+  transport?: SentrySdk.NodeOptions["transport"],
+): Promise<LogSink> {
+  const Sentry = await import("@sentry/node");
   Sentry.init({
     dsn: config.dsn,
     environment: config.environment,
@@ -114,7 +118,7 @@ export function createSentrySink(
     write(event: LogEvent) {
       if (event.level !== "error" || event["error.report"] === false) return;
       const { "service.name": service, error } = event;
-      const message = redactSensitiveText(event.message);
+      const message = redactSensitiveText(reportTitle(event));
       Sentry.withScope((scope) => {
         scope.setTag("service", service);
         for (const key of TAG_KEYS) {
@@ -140,15 +144,22 @@ export function createSentrySink(
   };
 }
 
-export function createSentrySinkFromEnv(
+export async function createSentrySinkFromEnv(
   service: string,
   source: NodeJS.ProcessEnv = process.env,
-): {
+): Promise<{
   sink?: LogSink;
   warning?: string;
-} {
+}> {
   const { config, warning } = sentryConfigFromEnv(source);
-  return config ? { sink: createSentrySink(service, config) } : { warning };
+  return config ? { sink: await createSentrySink(service, config) } : { warning };
+}
+
+/** A failed request with nothing else logged groups by what answered it, not as one issue. */
+function reportTitle(event: LogEvent): string {
+  const route = event["http.route"];
+  if (typeof route !== "string") return event.message;
+  return `${event.message} ${event["http.method"]} ${route} ${event["http.status"]}`;
 }
 
 function releaseFromGitSha(sha: string | undefined): string | undefined {
@@ -168,7 +179,7 @@ function rebuildError(serialized: SerializedError): Error {
   return error;
 }
 
-function redactEvent(event: Sentry.ErrorEvent): Sentry.ErrorEvent {
+function redactEvent(event: SentrySdk.ErrorEvent): SentrySdk.ErrorEvent {
   delete event.request;
   const userId = event.user?.id;
   event.user = isMonitoringUserId(userId) ? { id: userId, ip_address: null } : { ip_address: null };

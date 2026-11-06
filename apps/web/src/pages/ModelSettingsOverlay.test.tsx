@@ -119,14 +119,33 @@ vi.mock("@rakazo/ui-web", async (importOriginal) => {
       maxTokens?: string;
       maxTokensLabel?: string;
       onMaxTokensChange?: (value: string) => void;
+      thinkingLevel?: string | null;
+      thinkingLevelLabel?: string;
+      thinkingLevelOptions?: { value: string; label: string }[];
+      onThinkingLevelChange?: (value: string) => void;
     }) =>
-      props.onMaxTokensChange ? (
+      props.onMaxTokensChange || props.onThinkingLevelChange ? (
         <>
-          <input
-            aria-label={props.maxTokensLabel}
-            value={props.maxTokens ?? ""}
-            onChange={(event) => props.onMaxTokensChange?.(event.target.value)}
-          />
+          {props.onMaxTokensChange ? (
+            <input
+              aria-label={props.maxTokensLabel}
+              value={props.maxTokens ?? ""}
+              onChange={(event) => props.onMaxTokensChange?.(event.target.value)}
+            />
+          ) : null}
+          {props.onThinkingLevelChange ? (
+            <select
+              aria-label={props.thinkingLevelLabel}
+              value={props.thinkingLevel ?? ""}
+              onChange={(event) => props.onThinkingLevelChange?.(event.target.value)}
+            >
+              {(props.thinkingLevelOptions ?? []).map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          ) : null}
           {props.children}
         </>
       ) : null,
@@ -183,6 +202,7 @@ function account(provider: string, modelId: string) {
     name: "Ada",
     spaceId: "space-1",
     isDeploymentOwner: false,
+    isAdmin: false,
     needsModel: false,
     defaultProvider: provider,
     defaultModel: modelId,
@@ -460,6 +480,45 @@ it("saves an edited output limit without sending a half-typed replacement key", 
     expect(input).not.toHaveProperty("apiKey");
     // A limits-only save keeps the dialog and the half-typed key.
     expect(keyField(view.container).value).toBe("sk-ab");
+  } finally {
+    await view.unmount();
+  }
+});
+
+it("renaming a connection keeps unsaved form fields", async () => {
+  models.credentials.mockResolvedValue([deepseekCredential]);
+  models.rename.mockResolvedValue(undefined);
+
+  const view = await renderSettings();
+  try {
+    await manage();
+    const limit = view.container.querySelector<HTMLInputElement>(
+      'input[aria-label="Maximum output tokens"]',
+    );
+    if (!limit) throw new Error("Missing output limit field");
+    await typeInto(limit, "8192");
+    const nameLabel = [...view.container.querySelectorAll("label")].find(
+      (entry) => entry.textContent === "Name",
+    );
+    const nameInput = nameLabel?.htmlFor
+      ? view.container.querySelector<HTMLInputElement>(`#${CSS.escape(nameLabel.htmlFor)}`)
+      : null;
+    if (!nameInput) throw new Error("Missing connection name field");
+    await typeInto(nameInput, "Renamed");
+    models.credentials.mockResolvedValue([{ ...deepseekCredential, label: "Renamed" }]);
+    const nameForm = nameInput.closest("form");
+    const nameSave = nameForm?.querySelector('button[type="submit"]');
+    if (!(nameSave instanceof HTMLButtonElement)) throw new Error("Missing name save button");
+    await click(nameSave);
+    await act(async () => {
+      for (let index = 0; index < 5; index += 1) await new Promise((done) => setTimeout(done, 0));
+    });
+    expect(models.rename).toHaveBeenCalledWith({
+      credentialId: "cred-deepseek",
+      label: "Renamed",
+    });
+    expect(titles(view.container)).toEqual(["DeepSeek (Renamed)"]);
+    expect(limit.value).toBe("8192");
   } finally {
     await view.unmount();
   }
@@ -815,6 +874,31 @@ it("keeps the default model checked and disabled", async () => {
   }
 });
 
+it("filters the models a probe found and keeps a hidden tick", async () => {
+  const probed = Array.from({ length: 12 }, (_, index) => `model-${index + 1}`);
+  const view = await renderCompatibleWithProbe(probed);
+  try {
+    const rowNames = () =>
+      [
+        ...(view.container
+          .querySelector('[data-testid="compatible-model-rows"]')
+          ?.querySelectorAll("[role='checkbox']") ?? []),
+      ].map(accessibleName);
+    const search = view.container.querySelector("input[aria-label='Search models']");
+    if (!(search instanceof HTMLInputElement)) throw new Error("Missing model search");
+    expect(rowNames()).toHaveLength(13);
+    await act(async () => {
+      modelCheckbox(view.container, "model-7").click();
+    });
+    await typeInto(search, "model-1");
+    expect(rowNames()).toEqual(["model-1", "model-10", "model-11", "model-12"]);
+    await typeInto(search, "");
+    expect(modelCheckbox(view.container, "model-7").checked).toBe(true);
+  } finally {
+    await view.unmount();
+  }
+});
+
 it("lists saved models as checked rows before the server is probed", async () => {
   const view = await renderCompatible({
     ...compatibleCredential,
@@ -876,7 +960,7 @@ it("lists not-connected providers by name alone", async () => {
   const view = await renderSettings();
   try {
     await openPicker("Change Main model");
-    expect(pickerOptions()).toEqual(["DeepSeek", "OpenAI-compatible", "Ollama Cloud"]);
+    expect(pickerOptions()).toEqual(["DeepSeek", "Ollama Cloud", "OpenAI-compatible"]);
     expect(document.querySelectorAll("[cmdk-group-heading]")).toHaveLength(0);
   } finally {
     await view.unmount();
@@ -937,8 +1021,105 @@ it("probes with the editing credential id without sending saved header values", 
       baseUrl: compatibleCredential.baseUrl,
       apiKey: undefined,
       headers: undefined,
+      apiProtocol: "chat-completions",
       credentialId: compatibleCredential.id,
     });
+  } finally {
+    await view.unmount();
+  }
+});
+
+function protocolField(container: HTMLElement) {
+  const select = container.querySelector('select[aria-label="Protocol"]');
+  if (!(select instanceof HTMLSelectElement)) throw new Error("Missing protocol select");
+  return select;
+}
+
+async function chooseProtocol(container: HTMLElement, value: string) {
+  await selectValue(protocolField(container), value);
+}
+
+async function selectValue(select: HTMLSelectElement, value: string) {
+  await act(async () => {
+    const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value")?.set;
+    setter?.call(select, value);
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+}
+
+function effortField(container: HTMLElement) {
+  const select = container.querySelector('select[aria-label="Reasoning effort"]');
+  if (!(select instanceof HTMLSelectElement)) throw new Error("Missing effort select");
+  return select;
+}
+
+it("offers the three wire protocols only on a custom endpoint, keeping the saved choice", async () => {
+  const view = await renderCompatible({
+    ...compatibleCredential,
+    apiProtocol: "anthropic-messages",
+  });
+  try {
+    const select = protocolField(view.container);
+    expect([...select.options].map((option) => option.value)).toEqual([
+      "chat-completions",
+      "responses",
+      "anthropic-messages",
+    ]);
+    expect(select.value).toBe("anthropic-messages");
+    await chooseProtocol(view.container, "responses");
+    await click(buttons(view.container, "Save")[0]);
+    expect(models.connect).toHaveBeenLastCalledWith(
+      expect.objectContaining({ apiProtocol: "responses" }),
+    );
+  } finally {
+    await view.unmount();
+  }
+
+  // A catalog provider's connection has no protocol choice.
+  vi.mocked(rpc.me).mockResolvedValue(account("deepseek", "deepseek-chat"));
+  models.list.mockResolvedValue([deepseekEntry]);
+  models.credentials.mockResolvedValue([deepseekCredential]);
+  const catalog = await renderSettings();
+  try {
+    await manage();
+    expect(catalog.container.querySelector('select[aria-label="Protocol"]')).toBeNull();
+  } finally {
+    await catalog.unmount();
+  }
+});
+
+it("keeps the chosen protocol when the endpoint changes and probes with it", async () => {
+  models.probeOpenAiCompatible.mockResolvedValue({ models: ["model-a"] });
+  const view = await renderCompatible({
+    ...compatibleCredential,
+    apiProtocol: "anthropic-messages",
+  });
+  try {
+    await typeInto(baseUrlField(view.container), "http://127.0.0.1:9000/v1");
+    expect(protocolField(view.container).value).toBe("anthropic-messages");
+    await click(buttons(view.container, "Find models")[0]);
+    expect(models.probeOpenAiCompatible).toHaveBeenLastCalledWith(
+      expect.objectContaining({ apiProtocol: "anthropic-messages" }),
+    );
+  } finally {
+    await view.unmount();
+  }
+});
+
+it("clamps a staged effort when the protocol switch drops the level", async () => {
+  const view = await renderCompatible({
+    ...compatibleCredential,
+    reasoning: true,
+    thinkingLevel: "max",
+  });
+  try {
+    expect(effortField(view.container).value).toBe("max");
+    await chooseProtocol(view.container, "anthropic-messages");
+    expect(effortField(view.container).value).toBe("high");
+    await click(buttons(view.container, "Save")[0]);
+    expect(models.connect).toHaveBeenLastCalledWith(
+      expect.objectContaining({ apiProtocol: "anthropic-messages", thinkingLevel: "high" }),
+    );
   } finally {
     await view.unmount();
   }
@@ -1217,6 +1398,51 @@ it.each([undefined, "api_key", "oauth"])(
     }
   },
 );
+
+it("tests the selected subscription connection when another connection has the same model", async () => {
+  vi.mocked(rpc.me).mockResolvedValue(account("anthropic", "claude-fixture"));
+  models.list.mockResolvedValue([
+    {
+      provider: "anthropic",
+      providerName: "Anthropic",
+      id: "claude-fixture",
+      label: "Claude fixture",
+      billing: "",
+      signIn: "auth-url",
+    },
+  ]);
+  models.credentials.mockResolvedValue([
+    {
+      id: "api",
+      label: "API",
+      provider: "anthropic",
+      modelId: "claude-fixture",
+      authKind: "api_key",
+    },
+    {
+      id: "oauth",
+      label: "Subscription",
+      provider: "anthropic",
+      modelId: "claude-fixture",
+      authKind: "oauth",
+    },
+  ]);
+  models.role.mockImplementation(async ({ role }: { role: string }) => ({
+    primary:
+      role === "main"
+        ? { provider: "anthropic", modelId: "claude-fixture", credentialId: "oauth" }
+        : null,
+    backups: [],
+  }));
+  const view = await renderSettings();
+  try {
+    await manage();
+    await click(buttons(view.container, "Test connection")[0]);
+    expect(view.container.textContent).toContain("A subscription credential is stored securely.");
+  } finally {
+    await view.unmount();
+  }
+});
 
 it("folds the key form behind Or paste an API key once a subscription is signed in", async () => {
   vi.mocked(rpc.me).mockResolvedValue(account("anthropic", "claude-fixture"));

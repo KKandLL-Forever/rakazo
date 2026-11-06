@@ -150,7 +150,6 @@ describePostgres("group sidebar previews (PostgreSQL)", () => {
     return runAsTenant(who, async () => {
       const created = await createRepos(prisma).createBot(who, {
         name,
-        title: "",
         description: "",
         instructions: "",
         notifyOnFinish: true,
@@ -277,7 +276,7 @@ describePostgres("group sidebar previews (PostgreSQL)", () => {
     const groups = createGroupRepos(prisma);
     const { result: listed, rowCount } = await messageRowsDuring("listSpaceGroupsForSpaces", () =>
       runAsSystem("cross-space group previews", () =>
-        groups.listSpaceGroupsForSpaces(actor, [otherSpaceId]),
+        groups.listSpaceGroupsForSpaces([otherSpaceId]),
       ),
     );
     expect(

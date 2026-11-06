@@ -1,4 +1,4 @@
-import { MODEL_CONTEXT_TOO_SMALL_ERROR } from "@rakazo/core";
+import { MODEL_CONTEXT_TOO_SMALL_ERROR, VERBATIM_TOOL_RESULT_TOO_LARGE_ERROR } from "@rakazo/core";
 import { describe, expect, it } from "vitest";
 import {
   ContextBudgetError,
@@ -85,6 +85,59 @@ describe("bounded context selection", () => {
     expect(() =>
       selectContext([call, result, result, user("steering")], { budget, strategy: "retrieval" }),
     ).toThrow("Duplicate tool result");
+  });
+  it("keeps an opted-in MCP result whole and fails when that result cannot fit", () => {
+    const link = "https://sessions.example.test/join/abc";
+    const body = `${"before ".repeat(800)}${link}${" after".repeat(800)}`;
+    const call = {
+      role: "assistant",
+      content: [
+        {
+          type: "toolCall",
+          id: "call",
+          name: "connectors_execute_tool",
+          arguments: { id: "srv_mail:get_message" },
+        },
+      ],
+    };
+    const result = {
+      role: "toolResult",
+      toolCallId: "call",
+      toolName: "connectors_execute_tool",
+      content: body,
+    };
+    const options = {
+      budget,
+      strategy: "retrieval" as const,
+      protectedIndexes: [0],
+      verbatimMcpServers: { ids: ["srv_mail"], slugs: ["mail"] },
+    };
+    expect(() => selectContext([call, result, user("steering")], options)).toThrow(
+      VERBATIM_TOOL_RESULT_TOO_LARGE_ERROR,
+    );
+    expect(result.content).toContain(link);
+    const fitting = selectContext([call, result, user("steering")], {
+      ...options,
+      budget: { ...budget, contextWindow: 20_000 },
+    });
+    expect(JSON.stringify(fitting.messages)).toContain(link);
+    expect(JSON.stringify(fitting.messages)).not.toContain("Tool result truncated");
+  });
+  it("blames a whole MCP result only when shortening it would make the turn fit", () => {
+    const call = {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "call", name: "mcp__mail__get_message", arguments: {} }],
+    };
+    const result = { role: "toolResult", toolCallId: "call", content: "x ".repeat(2_000) };
+    const huge = user("y ".repeat(20_000));
+    expect(() =>
+      selectContext([call, result, huge], {
+        budget,
+        strategy: "retrieval",
+        protectedIndexes: [0, 2],
+        verbatimMcpServers: { ids: [], slugs: ["mail"] },
+      }),
+    ).toThrow("Required context exceeds the model context budget");
   });
   it("keeps and shortens the unread tool step after steering", () => {
     const oldCall = {
@@ -244,6 +297,20 @@ describe("bounded context selection", () => {
       expect(unread).not.toContain("Earlier result shortened");
     }
   });
+  it("shortens a large connector result without stalling", () => {
+    const messages = Array.from({ length: 1000 }, (_, index) => ({
+      messageId: `m${index}`,
+      subject: `subject ${index} `.repeat(20),
+      messageText: `body ${index} `.repeat(400),
+    }));
+    const startedAt = performance.now();
+    const shortened = shortenToolResultText(JSON.stringify({ data: { messages } }), 12_000);
+    expect(performance.now() - startedAt).toBeLessThan(3_000);
+    const parsed = JSON.parse(shortened);
+    expect(parsed.data.messages).toHaveLength(1000);
+    expect(parsed.data.messages[999].messageId).toBe("m999");
+    expect(parsed.data.messages[0].messageText).toContain("omitted evidence is unavailable");
+  });
   it("marks a protected result as read when an assistant reply follows it", () => {
     const selected = selectContext(
       [
@@ -265,6 +332,65 @@ describe("bounded context selection", () => {
     const read = JSON.stringify(selected.messages[2]!.content);
     expect(read).toContain("Earlier result shortened after you read it");
     expect(read).not.toContain("unavailable");
+  });
+  it("keeps history snapshot topic and outcome within whole Unicode characters", () => {
+    const payload = {
+      untrusted: true,
+      messages: [],
+      snapshots: [{ topic: `${"a".repeat(79)}😀tail`, outcome: `${"b".repeat(79)}😀tail` }],
+    };
+    const result = JSON.parse(
+      shortenToolResultText(JSON.stringify(payload), 1000, { name: "read_history" }),
+    );
+    expect(result.snapshots[0].topic).toBe("a".repeat(79));
+    expect(result.snapshots[0].outcome).toBe("b".repeat(79));
+  });
+  it("keeps history reference truncation and continuation on a Unicode boundary", () => {
+    const ref = { text: "aaa😀bbb", textOffset: 7, nextTextOffset: null, truncated: false };
+    for (const payload of [
+      { untrusted: true, messages: [ref], runs: [] },
+      { untrusted: true, messages: [], runs: [{ outcomes: [ref] }] },
+    ]) {
+      const size = JSON.stringify({ ...payload, contextTruncated: true }).length - 1;
+      const result = JSON.parse(
+        shortenToolResultText(JSON.stringify(payload), size, { name: "read_history" }),
+      );
+      const shortened = result.messages[0] ?? result.runs[0].outcomes[0];
+      expect(shortened.text).toBe("aaa");
+      expect(shortened.nextTextOffset).toBe(10);
+      expect(shortened.truncated).toBe(true);
+    }
+  });
+  it("shortens another reference when a single emoji cannot be shortened", () => {
+    const ref = (text: string) => ({ text, textOffset: 4, nextTextOffset: null, truncated: false });
+    const payload = { untrusted: true, messages: [ref("😀"), ref("ab")] };
+    const size = JSON.stringify({ ...payload, contextTruncated: true }).length - 1;
+    const result = JSON.parse(
+      shortenToolResultText(JSON.stringify(payload), size, { name: "search_history" }),
+    );
+    expect(result.messages[0].text).toBe("😀");
+    expect(result.messages[1]).toMatchObject({ text: "a", nextTextOffset: 5, truncated: true });
+  });
+  it("can shorten an emoji followed by another character and retries if nothing can shrink", () => {
+    const ref = { text: "😀a", textOffset: 4, nextTextOffset: null, truncated: false };
+    const payload = { untrusted: true, messages: [ref] };
+    const size = JSON.stringify({ ...payload, contextTruncated: true }).length - 1;
+    const result = JSON.parse(
+      shortenToolResultText(JSON.stringify(payload), size, { name: "read_history" }),
+    );
+    expect(result.messages[0]).toMatchObject({ text: "😀", nextTextOffset: 6, truncated: true });
+    const retry = JSON.parse(
+      shortenToolResultText(JSON.stringify(payload), 1, {
+        name: "read_history",
+        arguments: { messageId: "example" },
+      }),
+    );
+    expect(retry).toMatchObject({
+      untrusted: true,
+      contextTruncated: true,
+      needsRetry: true,
+      retry: { messageId: "example", limit: 1 },
+    });
   });
   it("shortens history JSON evidence while preserving exact original offsets and pagination", () => {
     const original = 'Quoted "value" and newline\n'.repeat(500);

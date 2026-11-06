@@ -1,6 +1,7 @@
 import type { MessageBlock, ThreadMessage } from "@rakazo/contracts";
 import { cloudAgentBlockFromPayload } from "./cloud-agent.js";
 import { preserveIdentitySource } from "./identity-source.js";
+import { payloadAuthor } from "./message-replies.js";
 import { modelFallbackFailure, parseModelFallbackFailure } from "./run-error.js";
 
 export function projectMessages(
@@ -81,6 +82,7 @@ export function projectMessages(
         role,
         blocks,
         botId: event.botId ?? undefined,
+        ...payloadAuthor(payload),
         runId: event.runId ?? undefined,
         createdAt,
       });
@@ -301,9 +303,19 @@ export type LiveMessageUpdate =
   | { type: "tool"; name: string };
 
 export function reduceLiveMessageBlocks(
-  blocks: readonly MessageBlock[],
+  current: readonly MessageBlock[],
   update: LiveMessageUpdate,
 ): MessageBlock[] {
+  // A reset drops the text streamed so far (it will not be in the reply) and keeps the steps,
+  // including tools still waiting on that text to finish its sentence.
+  let blocks = current;
+  if (update.type === "progress" && update.payload?.reset === true) {
+    const waiting = current.at(-1)?.kind === "progress" ? current.at(-1) : undefined;
+    blocks = current.filter((block) => block.kind !== "text" && block.kind !== "progress");
+    for (const name of waiting?.kind === "progress" ? (waiting.pendingToolNames ?? []) : []) {
+      blocks = appendToolCallSegment(blocks, name);
+    }
+  }
   const tail = blocks.at(-1);
   const segments = tail?.kind === "progress" ? blocks.slice(0, -1) : blocks;
   const priorText = liveMessageText(blocks);
@@ -371,18 +383,61 @@ export function liveActivityLine(
   return (tail?.kind === "progress" && tail.activity && tail.text.trim()) || undefined;
 }
 
-export type ToolStep = { label: string; count: number };
+export type ToolStep = { label: string; count: number; note?: string };
 
 export function appendToolStep(steps: readonly ToolStep[], toolName: string): ToolStep[] {
   const label = humanizeToolName(toolName);
   const last = steps.at(-1);
   if (last && last.label === label) {
-    return [...steps.slice(0, -1), { label, count: last.count + 1 }];
+    return [...steps.slice(0, -1), { ...last, count: last.count + 1 }];
   }
   return [...steps, { label, count: 1 }];
 }
 
-export type ToolCallStreak = { key: string | undefined; count: number };
+/** Puts a note on the newest step, splitting it off a run of the same step so it stays in order. */
+export function noteLastToolStep(segments: readonly MessageBlock[], note: string): MessageBlock[] {
+  const index = segments.findLastIndex((block) => block.kind === "steps");
+  const block = segments[index];
+  const last = block?.kind === "steps" ? block.steps.at(-1) : undefined;
+  if (block?.kind !== "steps" || !last) return [...segments];
+  const steps = block.steps.slice(0, -1);
+  if (last.count > 1)
+    steps.push({ ...last, count: last.count - 1 }, { label: last.label, count: 1, note });
+  else steps.push({ ...last, note: last.note ? `${last.note}\n\n${note}` : note });
+  const next = [...segments];
+  next[index] = { ...block, steps };
+  return next;
+}
+
+/** Removes the newest `count` notes from the steps. */
+export function withoutLastToolStepNotes(
+  segments: readonly MessageBlock[],
+  count: number,
+): MessageBlock[] {
+  let left = count;
+  const next = [...segments];
+  for (let index = next.length - 1; index >= 0 && left > 0; index -= 1) {
+    const block = next[index];
+    if (block?.kind !== "steps") continue;
+    const steps = [...block.steps];
+    for (let step = steps.length - 1; step >= 0 && left > 0; step -= 1) {
+      const { note, ...rest } = steps[step]!;
+      if (note === undefined) continue;
+      steps[step] = rest;
+      left -= 1;
+    }
+    next[index] = { ...block, steps };
+  }
+  return next;
+}
+
+/** `shape` is the call with the digits in its text arguments blanked, so `echo n-1`, `echo n-2` match. */
+export type ToolCallStreak = {
+  key: string | undefined;
+  count: number;
+  shape?: string;
+  shapeCount?: number;
+};
 
 export function trackToolCallStreak(
   streak: ToolCallStreak,
@@ -390,7 +445,13 @@ export function trackToolCallStreak(
   args: unknown,
 ): ToolCallStreak {
   const key = `${name}:${JSON.stringify(args)}`;
-  return key === streak.key ? { key, count: streak.count + 1 } : { key, count: 1 };
+  const shape = `${name}:${JSON.stringify(args, (_, value) => (typeof value === "string" ? value.replace(/\d+/g, "#") : value))}`;
+  return {
+    key,
+    count: key === streak.key ? streak.count + 1 : 1,
+    shape,
+    shapeCount: shape === streak.shape ? (streak.shapeCount ?? 0) + 1 : 1,
+  };
 }
 
 export type ToolNameStreak = { name: string | undefined; count: number };
@@ -433,6 +494,11 @@ export function humanizeToolName(name: string): string {
   if (!spaced) return name;
   const lower = spaced.toLowerCase();
   return lower.charAt(0).toUpperCase() + lower.slice(1);
+}
+
+/** Reverses humanizeToolName for a typed name; rules match tool names ignoring case. */
+export function toolNameFromLabel(label: string): string {
+  return label.trim().replace(/\s+/g, "_");
 }
 
 export function progressMessageText(
@@ -519,11 +585,24 @@ function redactedRanges(value: string, secrets: Iterable<string>): Array<[number
   return ranges;
 }
 
-export function redactSecrets(value: string, secrets: string[]): string {
+export function redactSecrets(value: string, secrets: readonly string[]): string {
   let output = "";
   let offset = 0;
   for (const [start, end] of redactedRanges(value, secrets)) {
     output += `${value.slice(offset, start)}[redacted]`;
+    offset = end;
+  }
+  return output + value.slice(offset);
+}
+
+/** Redacts `text` as the continuation of `before`, so a value split across the two is hidden too. */
+export function redactSecretsAfter(before: string, text: string, secrets: string[]): string {
+  const value = before + text;
+  let output = "";
+  let offset = before.length;
+  for (const [start, end] of redactedRanges(value, secrets)) {
+    if (end <= offset) continue;
+    output += `${value.slice(offset, Math.max(start, offset))}[redacted]`;
     offset = end;
   }
   return output + value.slice(offset);
@@ -651,6 +730,13 @@ export function createStreamingRedactor(secrets: string[]) {
     },
     finish() {
       return drain(true);
+    },
+    /**
+     * Drops what is held back without showing it, but keeps matching against it, so a value
+     * split between the dropped text and the next chunk is still hidden.
+     */
+    skip() {
+      covered = buffer.length;
     },
   };
 }

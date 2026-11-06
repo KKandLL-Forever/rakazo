@@ -1,19 +1,22 @@
 import { randomBytes } from "node:crypto";
 import { ORPCError } from "@orpc/server";
-import { runContinueJob, runJobKey } from "@rakazo/adapter-kit";
-import type { getBotSecretMetadata } from "@rakazo/adapters";
+import { runContinueJob } from "@rakazo/adapter-kit";
 import {
   archiveBot,
-  cancelComputerRunWork,
   checkpointAndStopComputer,
+  defaultVaultItemTitle,
   forgetBotSecret,
+  forgetPageShareSecrets,
   hasActiveComputerControl,
-  listBotSecretMetadata,
+  isSecretAlreadySaved,
+  listVaultItems,
+  newVaultItemName,
   normalizeSecretDestination,
   pageUrlOrigin,
+  relabelVaultItem,
   revealBotSecret,
   SPACE_VAULT_NOT_IN_USE,
-  screenLeaseIdForRun,
+  stopCancelledGroupRuns,
   storeBotSecret,
   toComputerRef,
   validateBotModelChange,
@@ -25,7 +28,7 @@ import type {
   SettingsScope,
   VaultPutInput,
 } from "@rakazo/contracts";
-import { BotSecretAuth } from "@rakazo/contracts";
+import { BotSecretAuth, resolveBotAvatarSet } from "@rakazo/contracts";
 import { ACTIVE_RUN_STATUSES, displayName } from "@rakazo/core";
 import type { Prisma } from "@rakazo/db";
 import {
@@ -33,6 +36,7 @@ import {
   botProfileLabelsChanged,
   ComputerLimitError,
   commitBotUpdate,
+  expireComputerExecutionLeases,
   InstructionConflictError,
   IsolationError,
   recordComputerRunEnd,
@@ -40,22 +44,23 @@ import {
   restoreBotUnderComputerQuota,
   SpaceDeletionInProgressError,
   settingsTarget,
+  THREAD_LOCK_TRANSACTION_OPTIONS,
 } from "@rakazo/db";
 import { getLogger } from "@rakazo/logging";
 import type { AgentImportServices } from "../agent-import.js";
-import {
-  agentImportInfo,
-  agentImportSetupState,
-  createImportedBot,
-  previewAgentImport,
-  undoAgentImport,
-} from "../agent-import.js";
+import { agentImportSetupState, createImportedBot, previewAgentImport } from "../agent-import.js";
 import { deleteAgentSecret, listAgentSecrets, putAgentSecret } from "../agent-secrets.js";
+import { changedBotSettings } from "../bot-setting-analytics.js";
 import { requireIdentityConfirmation } from "../identity-confirmation.js";
 import type { RouterDeps } from "../router.js";
 import { loadMessagePage } from "../thread-message-pages.js";
 import type { RouterContext } from "./context.js";
-import { computerContext, modelSetup, THREAD_MESSAGE_PAGE_SIZE } from "./shared.js";
+import {
+  computerContext,
+  isRecordNotFound,
+  modelSetup,
+  THREAD_MESSAGE_PAGE_SIZE,
+} from "./shared.js";
 
 /** Surface a Space deletion race as a retryable conflict instead of a generic failure. */
 function mapSpaceLifecycleError(error: unknown): unknown {
@@ -74,6 +79,8 @@ const BOT_SECRET_INPUT_ERRORS = [
   "Credential cannot be used with this authentication method",
   "Remove the existing credential before changing its destination",
   "Credential limit reached",
+  "Invalid card",
+  "Invalid contact",
   SPACE_VAULT_NOT_IN_USE,
 ];
 
@@ -96,7 +103,7 @@ function mapBotSecretStoreError(error: unknown): unknown {
   // Login decoding failures: a JSON parse message can quote the submitted value, so never forward it.
   if (error instanceof SyntaxError || (error instanceof Error && error.name === "ZodError")) {
     return new ORPCError("BAD_REQUEST", {
-      message: "A website login needs a username and password",
+      message: "A website login needs a label and a value for every field",
     });
   }
   return error;
@@ -106,37 +113,78 @@ function vaultScope(actor: Actor, vault?: SettingsScope) {
   return { userId: actor.userId, spaceId: actor.spaceId, vault };
 }
 
+/**
+ * Save a vault item. One without a name is new and gets a free name from its title. One already
+ * saved under the name keeps its value when none is given, so its title or note can change alone.
+ */
 async function saveVaultCredential(
   deps: RouterDeps,
   scope: ReturnType<typeof vaultScope>,
-  input: Pick<VaultPutInput, "destination" | "value">,
+  input: Pick<VaultPutInput, "destination" | "value" | "title" | "note">,
 ) {
+  const { name } = input.destination;
+  if (input.value === undefined) {
+    if (!name) throw new ORPCError("BAD_REQUEST", { message: "A new item needs its value" });
+    try {
+      const labels = { title: input.title, note: input.note };
+      if (!(await relabelVaultItem(deps.prisma, scope, name, labels))) {
+        throw new ORPCError("NOT_FOUND", { message: "Credential not found" });
+      }
+    } catch (error) {
+      throw mapBotSecretStoreError(error);
+    }
+    return vaultItemDto(deps, scope, name);
+  }
+  const { value } = input;
   // A pasted page URL is saved under its site. One with a username or password is left
   // as typed, so the origin rule turns it down and the person can fix it.
   const site = pageUrlOrigin(input.destination.origin, { allowUserinfo: false, maxLength: 2048 });
-  let row: Awaited<ReturnType<typeof getBotSecretMetadata>>;
-  try {
-    row = await storeBotSecret({
+  const store = (itemName: string, createOnly: boolean) =>
+    storeBotSecret({
       prisma: deps.prisma,
       secretStore: deps.secrets,
       scope,
-      destination: site ? { ...input.destination, origin: site } : input.destination,
-      plaintext: input.value,
+      destination: { ...input.destination, name: itemName, ...(site ? { origin: site } : {}) },
+      plaintext: value,
+      title: input.title,
+      note: input.note,
+      createOnly,
     });
+  try {
+    if (name) {
+      await store(name, false);
+      return vaultItemDto(deps, scope, name);
+    }
+    // A new item is named from its title. It is only ever created, so another save that took
+    // the same name a moment earlier is never replaced; this one takes the next free name.
+    const base = input.title || defaultVaultItemTitle(input.destination, value);
+    for (let attempt = 0; ; attempt++) {
+      const fresh = await newVaultItemName(deps.prisma, scope, base, input.destination.auth.type);
+      try {
+        await store(fresh, true);
+        return vaultItemDto(deps, scope, fresh);
+      } catch (error) {
+        if (attempt >= 2 || !isSecretAlreadySaved(error)) throw error;
+      }
+    }
   } catch (error) {
     throw mapBotSecretStoreError(error);
   }
+}
+
+async function vaultItemDto(
+  deps: RouterDeps,
+  scope: ReturnType<typeof vaultScope>,
+  name: string,
+): Promise<BotSecretMetadata> {
+  const [row] = await listVaultItems(deps.prisma, deps.secrets, scope, name);
   if (!row) throw new ORPCError("CONFLICT", { message: "Credential was not saved" });
   return botSecretMetadataDto(row);
 }
 
-function botSecretMetadataDto(row: {
-  name: string;
-  origin: string;
-  auth: unknown;
-  createdAt: Date;
-  updatedAt: Date;
-}): BotSecretMetadata {
+function botSecretMetadataDto(
+  row: Awaited<ReturnType<typeof listVaultItems>>[number],
+): BotSecretMetadata {
   // Unreadable or no-longer-storable destinations become auth:null so the owner UI stays remove-only.
   const parsed = BotSecretAuth.safeParse(row.auth);
   let auth: BotSecretMetadata["auth"] = null;
@@ -152,6 +200,9 @@ function botSecretMetadataDto(row: {
     name: row.name,
     origin: row.origin,
     auth,
+    title: row.title,
+    note: row.note,
+    ...(row.preview ? { preview: row.preview } : {}),
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
   };
@@ -166,7 +217,7 @@ export function botIntroPrompt(input: {
   const canAsk = !input.disabledBuiltinTools.includes("ask_user");
   const canUpdate = !input.disabledBuiltinTools.includes("update_bot");
   const options =
-    "two to four short options that fit your name, anything your title, description or instructions already say, and what you know about them, never a stock list";
+    "two to four short options that fit your name, anything your description or instructions already say, and what you know about them, never a stock list";
   return [
     [
       "You were just created.",
@@ -175,14 +226,13 @@ export function botIntroPrompt(input: {
     ]
       .filter(Boolean)
       .join(" "),
-    // Text streamed before ask_user is not kept once the run pauses, so the greeting
-    // goes in the question itself.
+    // The greeting goes in the question itself, so the card stands on its own.
     canAsk
       ? `Call ask_user right away, with no text before it. Its question greets them by first name in a few words and asks what they want you for, with ${options}. They can also type their own answer.`
       : `Greet them by first name in a few words and ask in one sentence what they want you for, suggesting ${options}.`,
     "If your profile already makes that clear, say in one line what you will do instead of asking.",
     canUpdate
-      ? "Once you know what you are for, use update_bot to set your title to a short role and your description to one line. Leave them unset if the answer is too vague, and keep your name and look."
+      ? 'Once you know what you are for, use update_bot to set what is already clear: a one-line description of what you do, your instructions on how you do it, and a short name if yours is still a placeholder like "New Bot". Leave anything vague unset to fill in later as the work becomes clearer, and otherwise keep your name and look.'
       : undefined,
     "Then get started, asking one follow-up only if you cannot start without it.",
   ]
@@ -191,18 +241,15 @@ export function botIntroPrompt(input: {
 }
 
 /**
- * Creating a bot asks only for a name and a look, so the bot finds out what it
- * is for itself. Queue one hidden-prompt turn (like a routine or skill test
- * run) that greets the user and asks. The executor limits the "created"
- * trigger to that question and the bot's own profile (see executor.ts), and
- * answering resumes the run as the user's turn.
+ * Creating a bot asks only for a name and a look, so one hidden-prompt turn greets the user and
+ * asks what the bot is for. The executor limits the "created" trigger to that question and the
+ * bot's own profile, and answering resumes the run as the user's turn.
  */
 export async function enqueueBotIntroRun(deps: RouterDeps, actor: Actor, bot: Bot): Promise<void> {
   const threadId = bot.threadId;
   if (!threadId) return;
-  // Scripted is the deterministic test/eval runtime, not a real deployment: an
-  // extra automatic run there competes with whatever response a test or eval
-  // harness queued next, for a bot it doesn't otherwise get to opt out of.
+  // In the scripted test/eval runtime an automatic run would compete with the harness's next
+  // queued response.
   if (deps.env.agentRuntime === "scripted") return;
   if ((await modelSetup(deps, actor)).needsModel) return;
   const [user, space] = await Promise.all([
@@ -243,7 +290,7 @@ export async function enqueueBotIntroRun(deps: RouterDeps, actor: Actor, bot: Bo
       },
       select: { id: true },
     });
-  });
+  }, THREAD_LOCK_TRANSACTION_OPTIONS);
   if (run) await deps.jobs.enqueue(runContinueJob(run.id));
 }
 
@@ -264,7 +311,9 @@ export function botsRoutes(ctx: RouterContext) {
       create: authed.bots.create.handler(async ({ context, input }) => {
         let bot: Bot;
         try {
-          bot = await repos.createBot(context.actor, input);
+          // Older apps always send Original, which would pin every new bot to it.
+          const { avatarSet: _ignored, ...request } = input;
+          bot = await repos.createBot(context.actor, request);
         } catch (error) {
           throw mapSpaceLifecycleError(error);
         }
@@ -286,25 +335,21 @@ export function botsRoutes(ctx: RouterContext) {
         // An imported bot starts inert: no intro run, paused routines, unapproved servers.
         return bot;
       }),
-      importInfo: authed.bots.importInfo.handler(async ({ context, input }) =>
-        agentImportInfo(agentImportServices as AgentImportServices, context.actor, input.botId),
-      ),
       importSetupState: authed.bots.importSetupState.handler(async ({ context, input }) =>
         agentImportSetupState(agentImportServices as AgentImportServices, context.actor, input),
-      ),
-      importUndo: authed.bots.importUndo.handler(async ({ context, input }) =>
-        undoAgentImport(agentImportServices as AgentImportServices, context.actor, input),
       ),
       duplicate: authed.bots.duplicate.handler(async ({ context, input }) => {
         const source = await repos.getBot(context.actor, input.botId);
         const duplicate = await repos
           .createBot(context.actor, {
             name: duplicateBotName(source.name),
-            title: source.title,
             description: source.description,
             instructions: source.instructions,
             notifyOnFinish: source.notifyOnFinish,
+            dailyCheckIns: source.dailyCheckIns,
             color: source.color,
+            avatarSet: resolveBotAvatarSet(source.avatarSet),
+            avatarSetPinned: source.avatarSetPinned,
             computerMode: source.computer?.scope === "dedicated" ? "dedicated" : "team",
             modelProvider: source.modelProvider,
             modelId: source.modelId,
@@ -346,7 +391,6 @@ export function botsRoutes(ctx: RouterContext) {
             where: {
               id: input.sectionId,
               spaceId: context.actor.spaceId,
-              userId: context.actor.userId,
             },
             select: { id: true },
           });
@@ -364,22 +408,36 @@ export function botsRoutes(ctx: RouterContext) {
         if (!modelChange.ok) throw new ORPCError("BAD_REQUEST", { message: modelChange.error });
         const thinkingLevel = input.thinkingLevel;
         if (!existing.thread) throw new IsolationError();
+        // Picking a set on one bot pins it unless it is the owner's default, which unpins it.
+        const avatarSetPinned =
+          input.avatarSet === undefined
+            ? undefined
+            : await deps.prisma.user
+                .findUniqueOrThrow({
+                  where: { id: context.actor.userId },
+                  select: { botAvatarSet: true },
+                })
+                .then((user) => input.avatarSet !== resolveBotAvatarSet(user.botAvatarSet));
         await commitBotUpdate({
           prisma: deps.prisma,
           notify: (threadId, seq) => deps.events.notify(threadId, seq),
           spaceId: context.actor.spaceId,
           threadId: existing.thread.id,
           botId: input.botId,
-          emitBotUpdated: botProfileLabelsChanged(input),
+          emitBotUpdated:
+            botProfileLabelsChanged(input) ||
+            input.expectedSettings !== undefined ||
+            input.dailyCheckIns !== undefined,
           expectedInstructions: input.expectedInstructions,
+          expectedSettings: input.expectedSettings,
           data: {
             name: input.name,
-            title: input.title,
             description: input.description,
             instructions: input.instructions,
-            selfUpdateInstructions: input.selfUpdateInstructions,
             notifyOnFinish: input.notifyOnFinish,
             color: input.color,
+            avatarSet: input.avatarSet,
+            avatarSetPinned,
             pinned: input.pinned,
             memoryScope: input.memoryScope,
             sectionId: input.sectionId,
@@ -396,6 +454,7 @@ export function botsRoutes(ctx: RouterContext) {
             ...(input.crossSpaceCommunication !== undefined
               ? { crossSpaceCommunication: input.crossSpaceCommunication }
               : {}),
+            ...(input.dailyCheckIns !== undefined ? { dailyCheckIns: input.dailyCheckIns } : {}),
             ...(input.fleetManagement !== undefined
               ? { fleetManagement: input.fleetManagement }
               : {}),
@@ -404,9 +463,16 @@ export function botsRoutes(ctx: RouterContext) {
               : {}),
           },
         }).catch((error) => {
+          if (input.expectedSettings && isRecordNotFound(error))
+            throw new ORPCError("CONFLICT", {
+              message: "Settings changed; review the current settings first.",
+            });
           if (!(error instanceof InstructionConflictError)) throw error;
           throw new ORPCError("CONFLICT", { message: error.message });
         });
+        for (const setting of changedBotSettings(existing, input)) {
+          deps.analytics?.capture(context.actor.userId, { name: "bot_setting_changed", setting });
+        }
         const bots = await repos.listBots(context.actor);
         const bot = bots.find((b) => b.id === input.botId);
         if (!bot) throw new IsolationError();
@@ -469,8 +535,9 @@ export function botsRoutes(ctx: RouterContext) {
             if (bot.computer.state === "running") {
               await checkpointAndStopComputer(deps, bot.computer, ref, ctx);
             }
-            await deps.prisma.computerExecutionLease.deleteMany({
-              where: { computerId: bot.computer.id, botId: bot.id },
+            await expireComputerExecutionLeases(deps.prisma, {
+              computerId: bot.computer.id,
+              botId: bot.id,
             });
             await deps.prisma.computer.update({
               where: { id: bot.computer.id },
@@ -478,6 +545,7 @@ export function botsRoutes(ctx: RouterContext) {
                 state: "stopped",
                 controlHolder: "none",
                 controlLeaseId: null,
+                controlUserId: null,
                 controlLeaseExpiresAt: null,
                 controlBotId: null,
                 controlRunId: null,
@@ -488,7 +556,12 @@ export function botsRoutes(ctx: RouterContext) {
             });
             await recordComputerRunEnd(deps.prisma, bot.computer, "stopped");
           }
-          return await repos.setBotComputer(context.actor, bot.id, input.mode);
+          const updated = await repos.setBotComputer(context.actor, bot.id, input.mode);
+          deps.analytics?.capture(context.actor.userId, {
+            name: "bot_setting_changed",
+            setting: "computer",
+          });
+          return updated;
         } catch (error) {
           throw mapSpaceLifecycleError(error);
         } finally {
@@ -519,8 +592,9 @@ export function botsRoutes(ctx: RouterContext) {
         if (!bot.archivedAt) return { ok: true as const };
         try {
           if (bot.computer) {
+            // The limit is the computer's owner's: a shared Team Computer is the space owner's.
             await restoreBotUnderComputerQuota(deps.prisma, {
-              userId: context.actor.userId,
+              userId: bot.computer.userId,
               botId: bot.id,
               computerId: bot.computer.id,
             });
@@ -538,6 +612,8 @@ export function botsRoutes(ctx: RouterContext) {
       }),
       rotateWebhookSecret: authed.bots.rotateWebhookSecret.handler(async ({ context, input }) => {
         const bot = await repos.getBot(context.actor, input.botId);
+        // Webhook runs act as the bot's creator, so only the creator can issue its secret.
+        if (bot.userId !== context.actor.userId) throw new ORPCError("FORBIDDEN");
         const plaintext = randomBytes(32).toString("base64url");
         const stored = await deps.secrets.put(plaintext, {
           operationId: "bots.rotateWebhookSecret",
@@ -622,58 +698,18 @@ export function botsRoutes(ctx: RouterContext) {
             where: {
               id: input.sectionId,
               spaceId: context.actor.spaceId,
-              userId: context.actor.userId,
             },
             select: { id: true },
           });
           if (!section) throw new IsolationError();
         }
         const updated = await groupRepos.updateGroup(context.actor, input);
-        await Promise.all(
-          updated.cancelledRunIds.map((runId) =>
-            deps.jobs.cancel(runJobKey(runId)).catch(() => undefined),
-          ),
-        );
+        await stopCancelledGroupRuns(deps, context.actor, updated);
         return updated.group;
       }),
       archive: authed.groups.archive.handler(async ({ context, input }) => {
         const archived = await groupRepos.archiveGroup(context.actor, input.groupId);
-        await Promise.all(
-          archived.cancelledRunIds.map((runId) =>
-            deps.jobs.cancel(runJobKey(runId)).catch(() => undefined),
-          ),
-        );
-        await Promise.all(
-          archived.computers.map(async (computer) => {
-            if (!computer.providerRef) return;
-            const adapterContext = {
-              operationId: "stop",
-              traceId: "stop",
-              spaceId: context.actor.spaceId,
-              userId: context.actor.userId,
-              botId: computer.botId,
-              runId: computer.runId,
-              screenLeaseId: screenLeaseIdForRun(
-                { runId: computer.runId, fence: computer.fence },
-                computer.runId,
-              ),
-              cancelRunWork: true,
-              signal: new AbortController().signal,
-            };
-            const ref = toComputerRef(computer);
-            await cancelComputerRunWork(
-              deps.sandbox,
-              ref,
-              computer.id,
-              computer.runId,
-              adapterContext,
-            );
-            await deps.sandbox.releaseScreen?.(ref, adapterContext).catch(() => undefined);
-          }),
-        );
-        // Expire the leases only after teardown: while they were live, no other run could claim
-        // these screens.
-        await groupRepos.releaseArchivedRunLeases(archived.cancelledRunIds);
+        await stopCancelledGroupRuns(deps, context.actor, archived);
         return { ok: true as const };
       }),
       restore: authed.groups.restore.handler(async ({ context, input }) => {
@@ -686,17 +722,27 @@ export function botsRoutes(ctx: RouterContext) {
       }),
       remove: authed.groups.remove.handler(async ({ context, input }) => {
         const removed = await groupRepos.removeGroup(context.actor, input.groupId);
-        const cleanup = await Promise.allSettled(
-          removed.artifactStorageKeys.map((storageKey) =>
-            deps.artifacts.remove(
-              storageKey,
-              computerContext(context.actor, removed.contextBotId, `group-remove:${input.groupId}`),
+        try {
+          await stopCancelledGroupRuns(deps, context.actor, removed);
+        } finally {
+          // The group row is already gone, so a retry could no longer find these.
+          const cleanup = await Promise.allSettled(
+            removed.artifactStorageKeys.map((storageKey) =>
+              deps.artifacts.remove(
+                storageKey,
+                computerContext(
+                  context.actor,
+                  removed.contextBotId,
+                  `group-remove:${input.groupId}`,
+                ),
+              ),
             ),
-          ),
-        );
-        for (const result of cleanup) {
-          if (result.status === "rejected")
-            getLogger().error("group artifact cleanup", result.reason);
+          );
+          for (const result of cleanup) {
+            if (result.status === "rejected")
+              getLogger().error("group artifact cleanup", result.reason);
+          }
+          await forgetPageShareSecrets(deps.secrets, removed.pageShareSecrets);
         }
         return { ok: true as const };
       }),
@@ -706,7 +752,9 @@ export function botsRoutes(ctx: RouterContext) {
         repos.listBotSections(context.actor),
       ),
       create: authed.botSections.create.handler(async ({ context, input }) =>
-        repos.createBotSection(context.actor, input),
+        repos.createBotSection(context.actor, input).catch((error: unknown) => {
+          throw mapSpaceLifecycleError(error);
+        }),
       ),
       update: authed.botSections.update.handler(async ({ context, input }) => {
         try {
@@ -726,13 +774,8 @@ export function botsRoutes(ctx: RouterContext) {
       list: authed.agentSecrets.list.handler(async ({ context }) =>
         listAgentSecrets({ prisma: deps.prisma, secrets: deps.secrets }, context.actor),
       ),
-      put: authed.agentSecrets.put.handler(async ({ context, input, signal }) =>
-        putAgentSecret(
-          { prisma: deps.prisma, secrets: deps.secrets },
-          context.actor,
-          input,
-          signal,
-        ),
+      put: authed.agentSecrets.put.handler(async ({ context, input }) =>
+        putAgentSecret({ prisma: deps.prisma, secrets: deps.secrets }, context.actor, input),
       ),
       remove: authed.agentSecrets.remove.handler(async ({ context, input }) =>
         deleteAgentSecret({ prisma: deps.prisma, secrets: deps.secrets }, context.actor, input.id),
@@ -740,8 +783,9 @@ export function botsRoutes(ctx: RouterContext) {
     },
     vault: {
       list: authed.vault.list.handler(async ({ context, input }) => {
-        const rows = await listBotSecretMetadata(
+        const rows = await listVaultItems(
           deps.prisma,
+          deps.secrets,
           vaultScope(context.actor, input?.scope),
         );
         return rows.map(botSecretMetadataDto);
@@ -781,7 +825,7 @@ export function botsRoutes(ctx: RouterContext) {
     botSecrets: {
       list: authed.botSecrets.list.handler(async ({ context, input }) => {
         await repos.getBot(context.actor, input.botId);
-        const rows = await listBotSecretMetadata(deps.prisma, vaultScope(context.actor));
+        const rows = await listVaultItems(deps.prisma, deps.secrets, vaultScope(context.actor));
         return rows.map(botSecretMetadataDto);
       }),
       put: authed.botSecrets.put.handler(async ({ context, input }) => {

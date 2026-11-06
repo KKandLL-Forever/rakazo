@@ -1,11 +1,13 @@
 import { useLingui } from "@lingui/react/macro";
 import type { Bot } from "@rakazo/contracts";
+import { nextIncomingCall, respondToIncomingCall } from "@rakazo/core";
 import { BotAvatar, Button, defaultBotAvatarValue } from "@rakazo/ui-web";
 import { Phone, PhoneOff } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
-import { startCall, useCallSession } from "../../lib/call-session";
-import { rpc } from "../../lib/rpc";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { isLeavingSession, startCall, useCallSession } from "../../lib/call-session";
+import { rpc, selectedSpaceId } from "../../lib/rpc";
 import { errorText } from "../../lib/user-error";
+import { CallWindow } from "./CallWindow";
 
 /** Two short rising tones every two seconds: an incoming ring, unlike the outgoing ringback. */
 function startRingtone(): () => void {
@@ -68,23 +70,30 @@ export function IncomingCall({
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const notified = useRef(new Set<string>());
+  /** Leaving the shell, switching space or a lazy route hiding the shell all clear this, so a late
+   * answer must not start the call. A layout effect, because Suspense hides without passive cleanup. */
+  const mounted = useRef(true);
+  useLayoutEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
 
   const currentNow = Math.max(now, Date.now());
-  const bot = onCall
-    ? undefined
-    : bots.find((bot) => {
-        const call = bot.incomingCall;
-        return call && !handled.has(call.callId) && Date.parse(call.expiresAt) > currentNow;
-      });
+  const bot = onCall ? undefined : nextIncomingCall(bots, handled, currentNow);
   const call = bot?.incomingCall;
   const callId = call?.callId;
 
   useEffect(() => {
     if (!callId) return;
     setNow(Date.now());
-    const timer = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(timer);
-  }, [callId]);
+    const timer = setTimeout(
+      () => setNow(Date.now()),
+      Math.max(0, Date.parse(call.expiresAt) - Date.now()),
+    );
+    return () => clearTimeout(timer);
+  }, [callId, call?.expiresAt]);
 
   useEffect(() => {
     if (!callId) return;
@@ -101,46 +110,71 @@ export function IncomingCall({
   }, [callId]);
 
   useEffect(() => {
-    if (!bot || !call || notified.current.has(call.callId)) return;
-    if (document.visibilityState === "visible" || typeof Notification === "undefined") return;
-    if (Notification.permission !== "granted") return;
-    const notice = new Notification(t`${bot.name} is calling you`, {
-      tag: `call:${call.callId}`,
-      requireInteraction: true,
-    });
-    notification.current = notice;
-    notified.current.add(call.callId);
-    notice.onclick = () => {
-      window.focus();
-      notice.close();
+    const notify = () => {
+      if (!bot || !call || notified.current.has(call.callId)) return;
+      if (document.visibilityState === "visible" || typeof Notification === "undefined") return;
+      if (Notification.permission !== "granted") return;
+      const notice = new Notification(t`${bot.name} is calling you`, {
+        tag: `call:${call.callId}`,
+        requireInteraction: true,
+      });
+      notification.current = notice;
+      notified.current.add(call.callId);
+      notice.onclick = () => {
+        window.focus();
+        notice.close();
+      };
     };
+    notify();
+    document.addEventListener("visibilitychange", notify);
+    return () => document.removeEventListener("visibilitychange", notify);
   }, [bot, call, t]);
 
   if (!bot || !call) return null;
 
   const settle = async () => {
+    // The page reloads for another session: its cookie may belong to someone else now.
+    if (isLeavingSession()) return;
     setBusy(true);
     setError(null);
     try {
-      await rpc.threads.declineCall({ botId: bot.id, callId: call.callId, outcome: "declined" });
+      await respondToIncomingCall(call, () =>
+        rpc.notifications.declineIncomingCall({ callId: call.callId }),
+      );
       setHandled((current) => new Set(current).add(call.callId));
     } catch (cause) {
-      setError(errorText(cause, t`Could not send that`));
+      // Already answered elsewhere or rung out: there is nothing left to decline.
+      if ((cause as { code?: string } | null)?.code === "CONFLICT")
+        setHandled((current) => new Set(current).add(call.callId));
+      else setError(errorText(cause, t`Could not send that`));
     } finally {
       setBusy(false);
     }
   };
 
   const answer = async () => {
+    if (isLeavingSession()) return;
     setBusy(true);
     setError(null);
+    const target = { botId: bot.id, callId: call.callId };
+    const context = { spaceId: selectedSpaceId() };
     try {
-      const answered = await rpc.threads.answerCall({ botId: bot.id, callId: call.callId });
+      const answered = await respondToIncomingCall(call, () =>
+        rpc.threads.answerCall(target, { context }),
+      );
+      // The page reloads for another session: a hang-up now would carry that session's cookie.
+      if (isLeavingSession()) return;
+      if (!mounted.current) {
+        // Nobody is left to talk to: hang up the call the server now holds as answered.
+        void rpc.threads.endCall(target, { context }).catch(() => undefined);
+        return;
+      }
       setHandled((current) => new Set(current).add(call.callId));
       startCall({
         botId: bot.id,
         botName: bot.name,
         botColor: bot.color,
+        botAvatarSet: bot.avatarSet,
         transcribe,
         answered: { callId: call.callId, opening: answered.opening },
       });
@@ -156,7 +190,7 @@ export function IncomingCall({
   };
 
   return (
-    <div
+    <CallWindow
       data-testid="incoming-call"
       role="alertdialog"
       aria-label={t`${bot.name} is calling you`}
@@ -170,33 +204,33 @@ export function IncomingCall({
             style={{ borderColor: defaultBotAvatarValue(bot.color) }}
           />
           <span className="md:hidden">
-            <BotAvatar color={bot.color} identity={bot.id} size={120} />
+            <BotAvatar avatarSet={bot.avatarSet} color={bot.color} identity={bot.id} size={120} />
           </span>
           <span className="hidden md:block">
-            <BotAvatar color={bot.color} identity={bot.id} size={52} />
+            <BotAvatar avatarSet={bot.avatarSet} color={bot.color} identity={bot.id} size={52} />
           </span>
         </span>
         <span className="flex flex-col items-center gap-1 md:items-start">
-          <span className="text-2xl font-semibold text-foreground md:text-lg" dir="auto">
+          <span className="text-heading1 font-semibold text-foreground md:text-heading3" dir="auto">
             {bot.name}
           </span>
         </span>
       </div>
       <p
-        className="my-4 max-w-80 rounded-xl bg-muted px-3 py-2 text-sm text-foreground md:my-0 md:max-w-none"
+        className="my-4 max-w-80 rounded-xl bg-muted px-3 py-2 text-body text-foreground md:my-0 md:max-w-none"
         dir="auto"
       >
         {call.reason}
       </p>
       {error ? (
-        <p role="alert" className="mb-4 text-center text-sm text-destructive md:mb-0">
+        <p role="alert" className="mb-4 text-center text-body text-destructive md:mb-0">
           {error}
         </p>
       ) : null}
       <div className="grid w-full max-w-80 grid-cols-2 gap-3 md:max-w-none">
         <Button
           variant="destructive"
-          className="h-14 text-sm md:h-11"
+          className="h-14 text-body md:h-11"
           disabled={busy}
           onClick={() => void settle()}
         >
@@ -205,13 +239,13 @@ export function IncomingCall({
         </Button>
         <Button
           disabled={busy}
-          className="h-14 bg-success text-sm text-background hover:bg-success/90 md:h-11"
+          className="h-14 bg-success text-body text-background hover:bg-success/90 md:h-11"
           onClick={() => void answer()}
         >
           <Phone className="size-5" aria-hidden="true" />
           {t({ message: "Answer", context: "incoming call" })}
         </Button>
       </div>
-    </div>
+    </CallWindow>
   );
 }

@@ -49,11 +49,17 @@ function pendingTimerFixture(reuse = true) {
     computer: { findMany: vi.fn(async () => []) },
     routine: {
       updateMany: vi.fn(async () => ({ count: 1 })),
-      findUnique: vi.fn(async () => ({ modelProvider: null, modelId: null, thinkingLevel: null })),
+      findUnique: vi.fn(async () => ({
+        prompt: "check current work",
+        modelProvider: null,
+        modelId: null,
+        thinkingLevel: null,
+      })),
     },
     run: {
       findMany: vi.fn(async () => (reuse ? [pending] : [])),
       updateMany: vi.fn(async () => ({ count: 1 })),
+      findUnique: vi.fn(async (): Promise<{ id: string } | null> => null),
       create: vi.fn(async () => ({ id: "new-1", taskId: "task-1" })),
       deleteMany: vi.fn(async () => ({ count: 1 })),
     },
@@ -63,6 +69,7 @@ function pendingTimerFixture(reuse = true) {
     },
   };
   const prisma = {
+    user: { findUnique: vi.fn(async () => null) },
     routine: { findUnique: vi.fn(async () => routine) },
     bot: { findUnique: vi.fn(async () => ({ id: "bot-1", thread: { id: "thread-1" } })) },
     agentSkill: { findMany: vi.fn(async () => []) },
@@ -114,5 +121,16 @@ describe("recurring routine catch-up", () => {
       expect.objectContaining({ type: "routine.fired", runId: "new-1" }),
     );
     expect(enqueue).toHaveBeenLastCalledWith(expect.objectContaining({ name: "routine.wakeup" }));
+  });
+  it("advances past an occurrence that already fired instead of firing it again", async () => {
+    const { executor, tx, enqueue, append, scheduledAt } = pendingTimerFixture(false);
+    tx.run.findUnique.mockResolvedValueOnce({ id: "fired-1" });
+    await executor.wakeRoutine("routine-1", scheduledAt.toISOString());
+    expect(tx.routine.updateMany).toHaveBeenCalledTimes(1);
+    expect(tx.run.create).not.toHaveBeenCalled();
+    expect(tx.task.create).not.toHaveBeenCalled();
+    expect(append).not.toHaveBeenCalled();
+    expect(enqueue).toHaveBeenCalledOnce();
+    expect(enqueue).toHaveBeenCalledWith(expect.objectContaining({ name: "routine.wakeup" }));
   });
 });

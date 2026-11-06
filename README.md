@@ -5,13 +5,13 @@
 [![GitHub stars](https://img.shields.io/github/stars/elie222/rakazo?labelColor=black&style=for-the-badge&color=2563EB)](https://github.com/elie222/rakazo/stargazers)
 [![Discord](https://img.shields.io/badge/Discord-Join%20the%20community-5865F2?labelColor=black&style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/RWwKa2Sn7h)
 [![Download on the App Store](https://img.shields.io/badge/App%20Store-Download%20for%20iPhone-black?labelColor=black&style=for-the-badge&logo=apple&logoColor=white)](https://apps.apple.com/app/rakazo/id6801531099)
-[![Download the Android APK](https://img.shields.io/badge/Android-Download%20APK-black?labelColor=black&style=for-the-badge&logo=android&logoColor=white)](https://github.com/elie222/rakazo/releases/download/android/rakazo.apk)
+[![Get Android on Google Play](https://img.shields.io/badge/Google%20Play-Get%20the%20app-black?labelColor=black&style=for-the-badge&logo=googleplay&logoColor=white)](https://play.google.com/store/apps/details?id=com.rakazo.app)
 
 ![Rakazo — AI teammates you actually own](./docs/readme-hero.png)
 
 Rakazo is an open source AI agent for persistent teammates, and a self-hosted AI assistant you
 can run on your own machine. It is available on the web, as an Electron desktop app, and on
-[iPhone](https://apps.apple.com/app/rakazo/id6801531099) and [Android](https://github.com/elie222/rakazo/releases/download/android/rakazo.apk). Bring your own model
+[iPhone](https://apps.apple.com/app/rakazo/id6801531099) and [Android](https://play.google.com/store/apps/details?id=com.rakazo.app). Bring your own model
 and computer provider, or run the complete stack locally.
 
 It is an open source, self-hosted alternative to Grok Bot, Meta Muse, OpenAI Dots, Instinct,
@@ -22,7 +22,7 @@ Rakazo is in beta. Learn more at [rakazo.com](https://rakazo.com).
 ## Features
 
 - Persistent bots with their own conversations, memory, routines, and history
-- Voice mode: speak replies, dictate, and call a bot. Bring your own ElevenLabs, OpenAI, Cartesia, or Fish Audio key
+- Voice mode: speak replies, dictate, and call a bot. Bring your own ElevenLabs, OpenAI, Cartesia, or Fish Audio key, or use a Mac server's installed voices
 - Shared Team Computers and isolated Private computers
 - Browser, terminal, file, and graphical desktop access
 - Bots that can delegate to peer bots or short-lived subagents
@@ -38,9 +38,11 @@ https://github.com/user-attachments/assets/dccdeddb-2134-4a56-8eed-b2e591736b1c
 
 - [PromptLayer](https://promptlayer.com/?utm_source=github&utm_medium=referral&utm_campaign=rakazo_readme)
 - [Inbox Zero](https://getinboxzero.com/?utm_source=github&utm_medium=referral&utm_campaign=rakazo_readme)
+- [ConnectorMap](https://connectormap.luinbytes.dev/?utm_source=github&utm_medium=referral&utm_campaign=rakazo_readme)
 - [CodeRabbit](https://www.coderabbit.ai/?utm_source=github&utm_medium=referral&utm_campaign=rakazo_readme)
 - [Greptile](https://www.greptile.com/?utm_source=github&utm_medium=referral&utm_campaign=rakazo_readme)
 - [Snyk](https://snyk.io/?utm_source=github&utm_medium=referral&utm_campaign=rakazo_readme)
+- [Incredibuild](https://www.incredibuild.com/?utm_source=github&utm_medium=referral&utm_campaign=rakazo_readme)
 
 ## Stack
 
@@ -69,7 +71,7 @@ The installer downloads the Compose files, creates `.env` with random secrets, a
 It preserves an existing `.env` when rerun.
 
 Open [http://127.0.0.1:5173](http://127.0.0.1:5173), create an account, and connect a model.
-Local Docker computers are on by default. Optional remote providers: `e2b`, `daytona`, `createos`, `boat`, or `railway`
+Local Docker computers are on by default. Optional remote providers: `e2b`, `novita`, `daytona`, `createos`, `boat`, `boxd`, or `railway`
 with the matching API key.
 
 Default image tag is `edge` (main builds, `linux/amd64` + `linux/arm64`). Details and tags:
@@ -93,7 +95,7 @@ bash install-images.sh --prepare-only
 bash install-images.sh
 ```
 
-Put HTTPS in front of port 5173; [docs/self-host.md](./docs/self-host.md#public-single-vm-deployment)
+Put HTTPS in front of port 5173; [docs/self-host-production.md](./docs/self-host-production.md#public-single-vm-deployment)
 covers the Caddy setup and host hardening. In the desktop app choose **Existing instance** and enter
 the `https://` address.
 
@@ -113,7 +115,7 @@ cp .env.example .env
 Set `POSTGRES_PASSWORD` and `POSTGRES_APP_PASSWORD` to two values from `openssl rand -hex 16`,
 then put them in `DATABASE_MIGRATION_URL` and `DATABASE_URL`. The app connects as its own
 `rakazo_app` login, which row-level security applies to; migrations run as the owner
-([database roles](docs/self-host.md#database-roles)). Set `BETTER_AUTH_SECRET`, `ENCRYPTION_KEY`, and `SCREEN_PROXY_SECRET` to
+([database roles](docs/self-host-configuration.md#database-roles)). Set `BETTER_AUTH_SECRET`, `ENCRYPTION_KEY`, and `SCREEN_PROXY_SECRET` to
 independent long random values. Docker sandboxes also need a dedicated
 `SANDBOX_SUPERVISOR_TOKEN`. You can also set `OPENROUTER_API_KEY`, or connect a supported
 model provider during onboarding.
@@ -146,6 +148,12 @@ so unmerged schema changes stay out of it. When the default ports are taken, for
 another git worktree, it moves to the next free block and prints the URL. Set `WEB_PORT` and
 `API_PORT` to choose ports yourself.
 
+To try a checkout from your phone or another computer, install [Tailscale](https://tailscale.com)
+on each device and set `RAKAZO_DEV_TAILNET=1` in `.env`. `pnpm dev` then serves the web app over
+HTTPS at `https://<machine>.<tailnet>.ts.net:<web port>`, reachable only from devices on your
+tailnet, and stops serving it when you quit. Sign in at that URL on every device, including the
+one running it. The first run may ask you to turn on HTTPS certificates for your tailnet.
+
 To run Postgres from the Compose file instead, start it with the `postgres-host` overlay, which
 publishes loopback `127.0.0.1:5433`, and point `DATABASE_URL` and `DATABASE_MIGRATION_URL` at it:
 
@@ -165,7 +173,8 @@ Open the printed URL ([http://127.0.0.1:5173](http://127.0.0.1:5173) by default)
 your first bot.
 
 For deployment, provider selection, backups, and upgrades, see the
-[self-hosting guide](./docs/self-host.md).
+[self-hosting guide](./docs/self-host.md), [production deployment](./docs/self-host-production.md),
+[backup and restore](./docs/self-host-backups.md), and [upgrading](./docs/self-host-upgrading.md).
 
 To use CreateOS, set `SANDBOX_PROVIDER=createos` and `CREATEOS_SANDBOX_API_KEY`.
 Optional `CREATEOS_SANDBOX_BASE_URL`, `CREATEOS_SANDBOX_SHAPE`, and
@@ -237,14 +246,14 @@ Mobile build and release instructions live in [docs/mobile-release.md](./docs/mo
 ## UI language
 
 The web (and Electron-hosted) UI supports English, Deutsch, 한국어, Türkçe, हिन्दी,
-Português (Brasil), 简体中文, 繁體中文, Español, Русский, Français, עברית, Nederlands, and 日本語 under
+Português (Brasil), 简体中文, 繁體中文, Español, Русский, Français, עברית, Nederlands, 日本語, and Polski under
 **Settings → Language**. The Expo app ships English, 简体中文, 繁體中文, Русский, Deutsch,
-Nederlands, and 日本語 catalogs, and **Account → Language** lists all seven. A device language or
+Nederlands, 日本語, Español, and Polski catalogs, and **Account → Language** lists all nine. A device language or
 `EXPO_PUBLIC_DEFAULT_UI_LOCALE` still selects the starting catalog before a saved choice.
-The marketing
-homepage (`apps/www`) is available in en/de/ko/zh/ja via footer language links (`/`, `/de/`,
-`/ko/`, `/zh/`, `/ja/`); other marketing pages stay English. The Russian marketing homepage and
-native Electron setup/menu remain separate follow-up work.
+Native Electron setup and menus also support the web UI's languages, following the saved app
+choice or, on first launch, the system language. The marketing homepage (`apps/www`) offers all
+15 languages through footer links, including `/zh/` and `/zh-tw/`; other marketing pages remain
+primarily English.
 
 ## Development
 
@@ -269,13 +278,30 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md) for the development workflow and test m
 
 ## Documentation
 
+Chinese guides cover [self-hosting](./docs/zh-CN/self-host.md), [models](./docs/zh-CN/self-host-models.md),
+[backups](./docs/zh-CN/self-host-backups.md), [upgrading](./docs/zh-CN/self-host-upgrading.md), and
+[restricted networks](./docs/zh-CN/self-host-restricted-network.md).
+
 - [Self-hosting](./docs/self-host.md)
+- [Self-host configuration](./docs/self-host-configuration.md)
 - [Self-host secrets](./docs/self-host-secrets.md)
+- [Sign-in and accounts](./docs/self-host-accounts.md)
+- [Models](./docs/self-host-models.md)
+- [Tools and integrations](./docs/self-host-integrations.md)
+- [Computer providers](./docs/self-host-sandbox-providers.md)
+- [Docker computers](./docs/self-host-docker-computers.md)
+- [Storage and encryption](./docs/self-host-storage.md)
+- [Production deployment](./docs/self-host-production.md)
+- [Backup and restore](./docs/self-host-backups.md)
+- [Upgrading](./docs/self-host-upgrading.md)
+- [Logs and monitoring](./docs/self-host-observability.md)
+- [Apps and clients](./docs/self-host-clients.md)
+- [Billing](./docs/self-host-billing.md)
 - [Computer runtime and isolation](./docs/computer-runtime.md)
 - [Desktop releases](./docs/desktop-release.md)
 - [Mobile releases](./docs/mobile-release.md)
 - [Performance testing](./docs/performance.md)
-- [Manage the bots it creates](./docs/fleet-management.md)
+- [Bots that manage bots](./docs/fleet-management.md)
 
 ## How Rakazo compares
 

@@ -33,7 +33,7 @@ describe("Android mobile platform contract", () => {
     const allowlist = readFileSync(resolve(nativeRoot, "EndpointAllowlist.kt"), "utf8");
     expect(service).toContain("android.requestPromotedOngoing");
     expect(service).toContain("liveStatusIcon(primary, avatarStyle)");
-    expect(service).toContain('rpc(endpoint, token, spaceId, "me"');
+    expect(service).toContain('rpc(endpoint, token, spaceId, headers, "me"');
     expect(service).not.toContain("showStarting");
     expect(service).not.toContain("catch (_: IOException) {\n        stop()");
     expect(service).toContain("Expo push owns background completion and attention delivery");
@@ -70,7 +70,7 @@ describe("Android mobile platform contract", () => {
       /waiting_input[\s\S]*filter \{ it\.notificationsEnabled \}[\s\S]*alertedAttention\.add/,
     );
     expect(service).toContain(
-      "if (openThreadId != null) openThreadId == run.threadId else openBotId == run.botId",
+      "if (openThreadId != null) openThreadId == threadId else openBotId == botId",
     );
     expect(service).toContain("manager.notify(run.threadId.hashCode(), notification)");
     expect(service).toContain("THREAD_NOTIFICATION_IDS");

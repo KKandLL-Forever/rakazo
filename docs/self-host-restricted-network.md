@@ -10,6 +10,8 @@ These settings change downloads; model and remote-computer providers still need 
 | Cannot pull app or computer images | `RAKAZO_IMAGE`, `RAKAZO_IMAGE_TAG`, `RAKAZO_COMPUTER_IMAGE`, `RAKAZO_COMPUTER_IMAGE_TAG` |
 | Cannot pull Postgres or busybox | `POSTGRES_IMAGE`, `BUSYBOX_IMAGE`, or Docker daemon `registry-mirrors` |
 
+English | [简体中文](./zh-CN/self-host-restricted-network.md)
+
 ## Installer script
 
 When raw GitHub is unreachable, download the installer from your mirror:
@@ -64,7 +66,7 @@ startup path and print a warning when that flag is unavailable.
 To install restricted computer egress rules offline, also copy `restrict-computer-egress.sh`
 into the working directory. If that optional script is missing, the installer records open
 egress and warns instead of downloading it. An explicit `SANDBOX_COMPUTER_EGRESS` setting
-remains unchanged. See [restricted computer egress](./self-host.md#restricted-computer-egress)
+remains unchanged. See [restricted computer egress](./self-host-docker-computers.md#restricted-computer-egress)
 for host requirements.
 
 ## Container images
@@ -83,7 +85,7 @@ BUSYBOX_IMAGE=registry.example.com/library/busybox@sha256:<trusted-busybox-diges
 ```
 
 Mirror both app and computer images and pair their tags to the same published version. Arm64
-hosts need multi-architecture tags; see [published images and tags](./self-host.md#published-images-and-tags).
+hosts need multi-architecture tags; see [published images and tags](./self-host-upgrading.md#published-images-and-tags).
 Image overrides are defined in [docker-compose.images.yml](../infra/compose/docker-compose.images.yml).
 
 For Docker Hub images, you can instead merge `registry-mirrors` into the Docker daemon's existing
@@ -107,7 +109,23 @@ starting containers.
 Treat a mirror as a transport, not as the source of truth. Obtain the expected `postgres:16` and
 `busybox:1` digests from a trusted upstream or an out-of-band trusted workstation. Put the digest in
 each mirrored image reference, then pull, compare the local repository digests, and start without
-pulling again. Replace every example value below before running it:
+pulling again.
+
+Direct Compose startup below does not run the installer's computer-egress setup. On Linux Docker
+Engine with the iptables firewall backend, first copy a trusted `restrict-computer-egress.sh` into
+the installation directory and run `sudo bash ./restrict-computer-egress.sh` to install the host
+rules without starting containers.
+
+After it succeeds, set `SANDBOX_COMPUTER_EGRESS=restricted` in `.env` and make sure the shell does
+not override it with another value. The supervisor then refuses to start computers if it cannot
+verify the rules, rather than falling back to open egress. Docker Desktop, rootless Docker and the
+nftables backend cannot use these rules; use a supported host if you need this isolation. Choosing
+`SANDBOX_COMPUTER_EGRESS=open` instead lets computers reach the host, LAN and cloud metadata. Do not
+rely on the default `auto` for isolation: it can use open egress when rules are absent. See
+[restricted computer egress](./self-host-docker-computers.md#restricted-computer-egress) for older
+Docker and custom DNS requirements.
+
+Replace every example value below before running it:
 
 ```bash
 (
@@ -142,4 +160,4 @@ mirror tags. After startup, follow the health checks in [the setup prompt](../SE
 
 Once downloads work, continue with [published-image setup](./self-host.md#published-images-no-checkout).
 For hosts without external provider access, use local Docker computers and an operator-controlled
-model endpoint; see the [self-hosting guide](./self-host.md).
+model endpoint; see [local models](./self-host-models.md#local-models).

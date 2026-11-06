@@ -1,3 +1,4 @@
+import type { ComputerSize } from "@rakazo/contracts";
 import type {
   AdapterContext,
   AdapterDescriptor,
@@ -11,6 +12,7 @@ import type {
   BackgroundJob,
   BackgroundJobHandlers,
   BillingByokCheckoutRequest,
+  BillingByokPlan,
   BillingCheckoutRequest,
   BillingCreditCheckoutRequest,
   BillingCreditPurchase,
@@ -21,6 +23,8 @@ import type {
   BrowserCapabilities,
   BrowserNavigateRequest,
   BrowserNavigateResult,
+  BrowserPurchaseCheckRequest,
+  BrowserPurchaseCheckResult,
   BrowserSnapshotRequest,
   BrowserSnapshotResult,
   CloudAgentCapabilities,
@@ -95,8 +99,12 @@ import type {
 } from "./types.js";
 
 export interface SandboxProvider {
+  /** Providers tied to one external desktop reject references belonging to another connection. */
+  ownsReference?(computer: Pick<ComputerRef, "kind" | "providerRef">): boolean;
   /** True when every running minute is billed, so the active-lifetime cap applies. */
-  billsWhileRunning?(computer: ComputerRef): boolean;
+  billsWhileRunning?(computer: Pick<ComputerRef, "kind">): boolean;
+  /** Whether the provider running this computer keeps its disk when it stops. */
+  keepsHome?(computer: ComputerRef): Promise<boolean>;
   describe(): AdapterDescriptor<SandboxCapabilities>;
   /** Workspace directory operations for hosts without the standard Unix command tools. */
   workspaceDirectories?(
@@ -128,15 +136,26 @@ export interface SandboxProvider {
        * reports it gone instead, so the newer save wins.
        */
       savedAt?: Date;
+      /**
+       * The size to start at. A computer already running keeps its size; without one, a stopped
+       * computer resumes at its current size and a new one starts at the standard size. A size
+       * the provider cannot move to throws `SandboxSizeUnavailableError`.
+       */
+      size?: ComputerSize;
     },
     context: AdapterContext,
   ): Promise<ComputerRef>;
   /**
    * The kind provision() would return now, without starting anything. Only providers that
-   * choose between kinds at provision time implement it.
+   * choose between kinds at provision time implement it. `homeKey` names the computer when the
+   * choice can depend on whose it is.
    */
-  provisionKind?(): Promise<ComputerRef["kind"]>;
-  /** Read-only probe: true only when this exact reference is already running. */
+  provisionKind?(homeKey?: string): Promise<ComputerRef["kind"]>;
+  /**
+   * Read-only probe that never starts or resumes anything. Resolves true only when the provider
+   * reports this exact reference running, and false only when it reports it not running or gone;
+   * throws when it cannot tell.
+   */
   isRunning?(computer: ComputerRef, context: AdapterContext): Promise<boolean>;
   /**
    * Read-only probe: true only when the provider already holds this reference stopped with its
@@ -242,6 +261,9 @@ export interface ConnectorProvider {
     context: AdapterContext,
   ): Promise<{ call: ConnectorCall; tool: ConnectorTool } | undefined>;
   execute(call: ConnectorCall, context: AdapterContext): AsyncIterable<ConnectorEvent>;
+  /** Release run-scoped state (open sessions) of a run that ended for good on
+   * this worker. A run that ended elsewhere is bounded by the provider itself. */
+  endRun?(runId: string): void;
 }
 
 export interface ConnectionAuthProvider {
@@ -267,6 +289,22 @@ export interface ManagedConnectorProvider
   listReconnectRefs?(context: AdapterContext): Promise<string[]>;
   connectionReady(context: AdapterContext, externalId: string): Promise<boolean>;
   warmDirectory?(): Promise<void>;
+  /** Map a begin() state or stored ref to the concrete remote account id, skipping excluded ids. */
+  resolveConnectedAccountId?(
+    userId: string,
+    slug: string,
+    currentRef: string | null | undefined,
+    excludeIds?: string[],
+    spaceId?: string,
+  ): Promise<string | undefined>;
+  /** Invalidate an unfinished browser authorization by its request id. */
+  cancelAuthorizationRequest?(requestId: string, context: AdapterContext): Promise<void>;
+  /** Delete remote accounts for `slug` that no local row still references. */
+  revokeUnreferencedAccounts?(
+    slug: string,
+    keepAccountIds: string[],
+    context: AdapterContext,
+  ): Promise<void>;
 }
 
 export interface MemoryStore {
@@ -429,9 +467,19 @@ export interface RealtimeFanout {
   close(): Promise<void>;
 }
 
+export type IncomingCallNotification = {
+  callId: string;
+  botId: string;
+  botName: string;
+  expiresAt: string;
+  /** Stops a ring that is still going on Android devices for a call settled elsewhere. */
+  ended?: true;
+};
+
 export interface NotificationProvider {
   describe(): AdapterDescriptor<{ push: boolean; email: boolean }>;
   send(message: NotificationMessage, context: AdapterContext): Promise<void>;
+  incomingCall?(userId: string, call: IncomingCallNotification): Promise<void>;
 }
 
 /** Outbound account and security email. Product code owns content; adapters own delivery. */
@@ -453,8 +501,27 @@ export interface BillingProvider {
   setMonthlyCredits?(customerId: string, amountCents: number): Promise<void>;
   /** Flat monthly own-key plan: access without credits. */
   createByokCheckout?(input: BillingByokCheckoutRequest): Promise<{ url: string }>;
+  /** Ends the customer's running trial now and bills the first period; a no-op without one. */
+  endTrial?(customerId: string): Promise<void>;
+  /**
+   * Moves the customer's own-key subscription `subscriptionId` from plan `from` to plan `to`,
+   * billing the prorated difference now: a change of interval restarts the period today, crediting
+   * its unused part. A failed payment leaves the plan unchanged. Returns false without charging
+   * when that subscription is no longer an active or trialing `from` plan, is set to cancel, or
+   * monthly credits have started.
+   */
+  changeByokPlan?(
+    customerId: string,
+    subscriptionId: string,
+    change: { from: BillingByokPlan; to: BillingByokPlan },
+  ): Promise<boolean>;
   /** Ends every live own-key plan at its period end. */
   endByokPlans?(customerId: string): Promise<void>;
+  /**
+   * Credits the customer's account; future invoices draw it down before charging. Idempotent per
+   * `referenceId`, so a retry after an unknown outcome never credits twice.
+   */
+  grantBalanceCredit?(customerId: string, amountCents: number, referenceId: string): Promise<void>;
   describe(): AdapterDescriptor<{ trials: boolean; portal: boolean; modelCredits?: boolean }>;
   getPrice(): Promise<BillingPrice>;
   createCustomer(input: { email: string; organizationId: string }): Promise<{ customerId: string }>;
@@ -522,12 +589,8 @@ export interface MessagingSurface {
     context: AdapterContext,
   ): Promise<MessagingInboundMessage[]>;
   /**
-   * Start the surface eagerly instead of waiting for the first inbound
-   * webhook or outbound send to touch it. Needed for adapters that pull
-   * updates themselves (e.g. Telegram in "auto"/"polling" mode, used when
-   * no public webhook URL is reachable): without an explicit call here,
-   * nothing kicks off that pull loop until something else happens to
-   * initialize the adapter first.
+   * Start eagerly. Adapters that pull updates themselves (Telegram polling when no public
+   * webhook URL is reachable) otherwise never start until a webhook or send touches them.
    */
   initialize?(): Promise<void>;
   /**
@@ -562,11 +625,8 @@ export interface WebProvider extends WebSearchProvider, WebFetchProvider {
 }
 
 /**
- * Provider-neutral page browser on the bot computer. Builtin browser_* tools
- * route here so backends (in-process page session, CDP against the computer's
- * Chrome, future adapters) can swap without changing tool names. Not a second
- * hosted browser product. Prefer this for web pages; use computer_act when the
- * page tool cannot operate or the task needs the desktop itself.
+ * Provider-neutral page browser on the bot computer, not a hosted browser product. Prefer it
+ * for web pages; use computer_act when the page tool cannot operate or the task needs the desktop.
  */
 export interface BrowserProvider {
   describe(): AdapterDescriptor<BrowserCapabilities>;
@@ -585,6 +645,15 @@ export interface BrowserProvider {
     request: BrowserActRequest,
     context: AdapterContext,
   ): Promise<BrowserActResult>;
+  /**
+   * Whether these clicks, or a click or key on the screen, would complete a purchase, without acting.
+   * A browser that cannot tell, such as an older computer image, answers none.
+   */
+  purchaseCheck?(
+    computer: ComputerRef,
+    request: BrowserPurchaseCheckRequest,
+    context: AdapterContext,
+  ): Promise<BrowserPurchaseCheckResult>;
 }
 
 /**
@@ -605,8 +674,8 @@ export interface CloudAgentProvider {
 }
 
 /**
- * Provider-neutral "is this tool call safe to auto-allow?" check. First used by
- * Auto Review; swap vendors without changing approval UX (pass → run, ask → card).
+ * Provider-neutral "is this tool call safe to auto-allow?" check. Swap vendors
+ * without changing approval UX (pass → run, ask → card).
  * Core runs with none configured and falls back to the LLM adapter.
  */
 export interface AutoReviewProvider {

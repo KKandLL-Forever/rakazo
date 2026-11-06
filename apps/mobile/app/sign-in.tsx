@@ -1,4 +1,9 @@
-import { credentialIssue, MAX_PASSWORD_LENGTH, PASSWORD_RULES } from "@rakazo/core";
+import {
+  credentialIssue,
+  MAX_PASSWORD_LENGTH,
+  PASSWORD_RULES,
+  suggestEmailCorrection,
+} from "@rakazo/core";
 import { Redirect, useFocusEffect, useLocalSearchParams, useRouter } from "expo-router";
 import { useCallback, useEffect, useState } from "react";
 import {
@@ -16,6 +21,7 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { NativeActionButton } from "../components/native-action-button";
+import { FORM_COLUMN_WIDTH } from "../lib/adaptive-layout";
 import type { PasswordResetCapabilities } from "../lib/api";
 import {
   currentApiBase,
@@ -33,6 +39,7 @@ import {
 import type { AuthMode } from "../lib/auth-routing";
 import { initialAuthMode } from "../lib/auth-routing";
 import { useI18n } from "../lib/i18n";
+import { hasIncomingShare } from "../lib/incoming-share";
 import { useMobileTokens } from "../lib/native";
 import { passkeysAvailable, signInWithPasskey } from "../lib/passkey";
 import { continueWithSso } from "../lib/sso";
@@ -48,6 +55,9 @@ export default function SignIn() {
   const [mode, setMode] = useState<AuthMode>(() => initialAuthMode(requestedMode));
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
+  const [emailBlurred, setEmailBlurred] = useState(false);
+  const [warnedEmail, setWarnedEmail] = useState<string | null>(null);
+  const emailSuggestion = mode === "up" ? suggestEmailCorrection(email) : null;
   const [password, setPassword] = useState("");
   const [passwordVisible, setPasswordVisible] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -128,7 +138,7 @@ export default function SignIn() {
       </View>
     );
   }
-  if (hasSession) return <Redirect href="/" />;
+  if (hasSession) return <Redirect href={hasIncomingShare() ? "/share" : "/"} />;
 
   const codeFlow = Boolean(reset?.passwordAuth && reset.emailCode && mode !== "forgot");
   // A blank password asks for an emailed code, so code-only accounts need no toggle.
@@ -143,6 +153,14 @@ export default function SignIn() {
     });
     if (issue) {
       setError(credentialIssueText(issue));
+      return;
+    }
+    if (emailSuggestion && warnedEmail !== email) {
+      setWarnedEmail(email);
+      setEmailBlurred(true);
+      AccessibilityInfo.announceForAccessibility(
+        t("Did you mean {email}?", { email: emailSuggestion }),
+      );
       return;
     }
     // An unfinished code would spend one of the code's three attempts.
@@ -198,6 +216,7 @@ export default function SignIn() {
 
   // Any sign-in can create the account (a code, SSO), so ask the server rather than the form.
   async function openApp() {
+    if (hasIncomingShare()) return router.replace("/share");
     const me = await rpc("me").catch(() => null);
     router.replace(me?.needsSignupSurvey ? "/signup-survey" : "/");
   }
@@ -228,6 +247,9 @@ export default function SignIn() {
               contentContainerStyle={{
                 flexGrow: 1,
                 justifyContent: "center",
+                width: "100%",
+                maxWidth: FORM_COLUMN_WIDTH,
+                alignSelf: "center",
                 paddingHorizontal: 24,
                 paddingVertical: 24,
               }}
@@ -374,7 +396,11 @@ export default function SignIn() {
                         placeholder={t("Email")}
                         placeholderTextColor={tokens.mutedForeground}
                         value={email}
-                        onChangeText={setEmail}
+                        onChangeText={(value) => {
+                          setEmail(value);
+                          setEmailBlurred(false);
+                        }}
+                        onBlur={() => setEmailBlurred(true)}
                         style={{
                           marginTop: mode === "up" ? 12 : 28,
                           backgroundColor: tokens.muted,
@@ -383,6 +409,18 @@ export default function SignIn() {
                           color: tokens.foreground,
                         }}
                       />
+                      {emailSuggestion && emailBlurred ? (
+                        <Pressable
+                          accessibilityRole="button"
+                          hitSlop={8}
+                          onPress={() => setEmail(emailSuggestion)}
+                          style={{ marginTop: 8, paddingHorizontal: 4 }}
+                        >
+                          <Text style={{ color: tokens.warning, fontSize: 14 }}>
+                            {t("Did you mean {email}?", { email: emailSuggestion })}
+                          </Text>
+                        </Pressable>
+                      ) : null}
                       {mode !== "forgot" ? (
                         <View
                           style={{

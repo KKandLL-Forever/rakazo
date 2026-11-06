@@ -25,6 +25,7 @@ describe("desktop release workflow", () => {
   });
 
   it("requires signed platform builds before a single publication job", () => {
+    expect(workflow).toContain('RAKAZO_DESKTOP_RELEASE: "1"');
     expect(workflow).toContain("-c.forceCodeSigning=true");
     expect(workflow).toContain("codesign --verify --deep --strict");
     expect(workflow).toContain("Get-AuthenticodeSignature");
@@ -33,7 +34,7 @@ describe("desktop release workflow", () => {
     expect(workflow).toContain("actions/attest-build-provenance@");
     expect(workflow).not.toContain("--publish always");
     expect(workflow).toContain("DESKTOP_MAC_CSC_LINK");
-    expect(workflow).toContain("DESKTOP_WIN_CSC_LINK");
+    expect(workflow).not.toContain("DESKTOP_WIN_CSC");
     expect(workflow).not.toMatch(/secrets\.DESKTOP_CSC_(?:LINK|KEY_PASSWORD)/);
     expect(workflow).not.toContain("cache: pnpm");
     expect(workflow).toContain("apps/desktop/out/latest*.yml");
@@ -55,23 +56,45 @@ describe("desktop release workflow", () => {
     );
   });
 
-  it("builds Windows only when an Authenticode certificate is configured", () => {
-    expect(workflow).toContain(
-      `WINDOWS_SIGNING: ${expression("secrets.DESKTOP_WIN_CSC_LINK != ''")}`,
-    );
+  it("always signs Windows with Azure Artifact Signing and has no unsigned fallback", () => {
+    expect(workflow).toContain('test -n "$AZURE_CLIENT_ID"');
+    expect(workflow).not.toMatch(/windows_signed|WINDOWS_SIGNING|unsigned/i);
+    expect(workflow).not.toContain("AZURE_CLIENT_SECRET");
+    expect(workflow).toContain("environment: desktop-release");
+    expect(workflow).toContain("id-token: write");
+    expect(workflow).toContain("azure/login@");
+    expect(workflow).toContain("TimeStamperCertificate");
+    expect(workflow.match(/--win --x64/g)).toHaveLength(1);
+    for (const option of [
+      "endpoint",
+      "codeSigningAccountName",
+      "certificateProfileName",
+      "publisherName",
+    ]) {
+      expect(workflow).toContain(`"-c.win.azureSignOptions.${option}=$`);
+    }
+    expect(workflow).toContain("is not signed by the configured publisher");
     expect(workflow).toContain(
       `include: ${expression("fromJSON(needs.validate.outputs.platforms)")}`,
     );
     expect(workflow).toContain(
-      `include='[{"os":"macos-26","artifact":"macos"},{"os":"ubuntu-24.04","artifact":"linux"}]'`,
-    );
-    expect(workflow).toMatch(
-      /if \[\[ "\$WINDOWS_SIGNING" == "true" \]\]; then\n\s+include=.*\{"os":"windows-2022","artifact":"windows"\}/,
+      `include='[{"os":"macos-26","artifact":"macos"},{"os":"ubuntu-24.04","artifact":"linux"},{"os":"windows-2022","artifact":"windows"}]'`,
     );
     expect(workflow.split("windows-2022")).toHaveLength(2);
-    expect(workflow).toContain(`WINDOWS_BUILT: ${expression("needs.validate.outputs.windows")}`);
-    expect(workflow).toContain('if [[ "$WINDOWS_BUILT" == "true" ]]; then');
-    expect(workflow).toContain("feeds+=(release-artifacts/latest.yml)");
+    expect(workflow).toContain("test -f release-artifacts/latest.yml");
+    expect(workflow).toContain("compgen -G 'release-artifacts/*.exe' >/dev/null");
+  });
+
+  it("signs every Linux AppImage and publishes its signature", () => {
+    expect(workflow).toContain(
+      `SIGNING_KEY: ${expression("secrets.DESKTOP_LINUX_UPDATE_SIGNING_KEY")}`,
+    );
+    expect(workflow).toMatch(/if \[\[ -z "\$SIGNING_KEY" \]\]; then\n.*\n\s+exit 1/);
+    expect(workflow).toContain(`trap 'rm -f "$key"' EXIT`);
+    expect(workflow).toContain('chmod 600 "$key"');
+    expect(workflow).toContain("pnpm exec tsx apps/desktop/scripts/sign-linux-update.ts");
+    expect(workflow).toContain("apps/desktop/out/*.AppImage.sig");
+    expect(workflow).toContain('if [[ ! -s "$image.sig" ]]; then');
   });
 
   it("pins every platform update feed to the official GitHub owner and repo", () => {
@@ -107,7 +130,10 @@ describe("desktop release workflow", () => {
     expect(workflow).toContain("latest.yml");
     expect(workflow).toContain("latest-mac.yml");
     expect(workflow).toContain("latest-linux.yml");
-    expect(workflow).toContain("--draft --generate-notes");
+    expect(workflow).toContain(
+      '--draft --notes-file "$RUNNER_TEMP/release-notes.md" --generate-notes',
+    );
+    expect(workflow).toContain("CHANGELOG.md has no [$version] section");
     expect(workflow).toContain("--draft=false --latest");
   });
 });

@@ -1,11 +1,12 @@
 import { createServer } from "node:http";
-import type { CommandResult, EntryInfo, Sandbox } from "@e2b/desktop";
+import type { CommandResult, EntryInfo } from "@e2b/desktop";
 import {
   AuthenticationError,
   CommandExitError,
   FileNotFoundError,
   FileType,
   RateLimitError,
+  Sandbox,
   SandboxError,
   SandboxNotFoundError,
   TimeoutError,
@@ -131,6 +132,59 @@ describe("E2B computer backend", () => {
     expect(globalStream).not.toHaveBeenCalled();
   });
 
+  it("e2b-screen-traffic-token sends the traffic token for screen and terminal", async () => {
+    const computer = {
+      id: "existing",
+      providerRef: "existing",
+      kind: "e2b" as const,
+      botId: "bot",
+    };
+    const provider = (trafficAccessToken?: string) => {
+      const desktop = {
+        sandboxId: "existing",
+        getHost: (port: number) => `${port}-desktop.test`,
+        setTimeout: async () => undefined,
+        commands: {
+          run: async () => ({
+            stdout: "RAKAZO_DESKTOP=0:savedkey\n",
+            stderr: "",
+            exitCode: 0,
+          }),
+        },
+        files: {
+          makeDir: async () => true,
+          list: async () => [],
+          getInfo: async () => ({ name: "x", size: 0, mode: 0 }),
+          read: async () => new Uint8Array(),
+          write: async () => undefined,
+        },
+        ...(trafficAccessToken !== undefined ? { trafficAccessToken } : {}),
+      } satisfies E2BDesktop;
+      const sdk = {
+        create: async () => desktop,
+        connect: async () => desktop,
+        pause: async () => undefined,
+        kill: async () => true,
+      } satisfies E2BSandboxSdk;
+      return new E2BSandboxProvider("test-key", sdk);
+    };
+
+    const restricted = provider("tok");
+    const screen = await restricted.connectScreen(computer, { view: "stream" }, context);
+    expect(screen.headers?.["e2b-traffic-access-token"]).toBe("tok");
+    const terminal = await restricted.connectTerminal(
+      computer,
+      { controlToken: "lease-1" },
+      context,
+    );
+    expect(terminal.headers?.["e2b-traffic-access-token"]).toBe("tok");
+
+    const open = await provider().connectScreen(computer, { view: "stream" }, context);
+    expect(open.headers).toBeUndefined();
+    const blank = await provider("").connectScreen(computer, { view: "stream" }, context);
+    expect(blank.headers).toBeUndefined();
+  });
+
   it("only filters transient cache files inside portable browser profiles", () => {
     expect(shouldSkipPortableWorkspaceFile("project/Cache/important.txt")).toBe(false);
     expect(shouldSkipPortableWorkspaceFile("project/lock")).toBe(false);
@@ -174,6 +228,66 @@ describe("E2B computer backend", () => {
       fresh: false,
     });
     expect(sdk.create).not.toHaveBeenCalled();
+  });
+
+  it("reports a sandbox running from its status without connecting to it", async () => {
+    const outage = new Error("fetch failed");
+    const sdk: E2BSandboxSdk = {
+      create: vi.fn(),
+      connect: vi.fn(),
+      pause: vi.fn(),
+      kill: vi.fn(async () => true),
+      isRunning: vi
+        .fn()
+        .mockResolvedValueOnce(true)
+        .mockResolvedValueOnce(false)
+        .mockRejectedValueOnce(new SandboxNotFoundError("Sandbox existing not found"))
+        .mockRejectedValueOnce(outage),
+    };
+    const provider = new E2BSandboxProvider("test-key", sdk);
+    const computer = {
+      id: "existing",
+      providerRef: "existing",
+      kind: "e2b" as const,
+      botId: "bot",
+    };
+
+    await expect(provider.isRunning(computer, context)).resolves.toBe(true);
+    await expect(provider.isRunning(computer, context)).resolves.toBe(false);
+    await expect(provider.isRunning(computer, context)).resolves.toBe(false);
+    await expect(provider.isRunning(computer, context)).rejects.toBe(outage);
+    await expect(provider.isRunning({ ...computer, kind: "novita" }, context)).resolves.toBe(false);
+    expect(sdk.isRunning).toHaveBeenCalledTimes(4);
+    expect(sdk.isRunning).toHaveBeenCalledWith("existing", {
+      apiKey: "test-key",
+      signal: context.signal,
+    });
+    expect(sdk.connect).not.toHaveBeenCalled();
+  });
+
+  it("reads a sandbox's status from the E2B SDK", async () => {
+    const info = (state: string) => ({ state }) as Awaited<ReturnType<typeof Sandbox.getInfo>>;
+    const getInfo = vi
+      .spyOn(Sandbox, "getInfo")
+      .mockResolvedValueOnce(info("running"))
+      .mockResolvedValueOnce(info("paused"));
+    const provider = new E2BSandboxProvider("test-key");
+    const computer = {
+      id: "existing",
+      providerRef: "existing",
+      kind: "e2b" as const,
+      botId: "bot",
+    };
+    try {
+      await expect(provider.isRunning(computer, context)).resolves.toBe(true);
+      await expect(provider.isRunning(computer, context)).resolves.toBe(false);
+      expect(getInfo).toHaveBeenCalledWith("existing", {
+        apiKey: "test-key",
+        signal: context.signal,
+      });
+    } finally {
+      getInfo.mockRestore();
+    }
   });
 
   it("creates new computers from the Rakazo computer template", async () => {
@@ -270,6 +384,11 @@ describe("E2B computer backend", () => {
     async ({ method, status, outcome }) => {
       const requests: string[] = [];
       const server = createServer((request, response) => {
+        // Local tools can probe any listening loopback port; the SDK never calls the root.
+        if (request.url === "/") {
+          response.writeHead(404).end();
+          return;
+        }
         requests.push(`${request.method} ${request.url}`);
         response.writeHead(status, { "content-type": "application/json" });
         response.end(JSON.stringify({ code: status, message: "sandbox unavailable" }));

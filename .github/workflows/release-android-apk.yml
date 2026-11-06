@@ -2,13 +2,16 @@ name: release-android-apk
 
 on:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-android-apk
+  # APK and AAB builds increment the same remote Android version counter.
+  group: release-android
   cancel-in-progress: false
+  queue: max
 
 jobs:
   release:

@@ -5,7 +5,7 @@
 x-app-environment: &app-environment
   # Runtime
   NODE_ENV: ${NODE_ENV:-production}
-  # The app's own login, subject to row-level security (docs/self-host.md#database-roles).
+  # The app's own login, subject to row-level security (docs/self-host-configuration.md#database-roles).
   DATABASE_URL: postgres://rakazo_app:${POSTGRES_APP_PASSWORD:?Set POSTGRES_APP_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-rakazo}
   REALTIME_DATABASE_URL:
   DB_POOL_MAX:
@@ -16,9 +16,9 @@ x-app-environment: &app-environment
   AWS_KMS_KEY_ARN:
   AWS_KMS_ACCESS_KEY_ID:
   AWS_KMS_SECRET_ACCESS_KEY:
-  # on encrypts new content at rest; off stores it readable (docs/self-host.md#content-encryption).
+  # on encrypts new content at rest; off stores it readable (docs/self-host-storage.md#content-encryption).
   CONTENT_ENCRYPTION: ${CONTENT_ENCRYPTION:-on}
-  # Optional: keep computer homes and artifacts in S3-compatible storage (docs/self-host.md#shared-storage-migration).
+  # Optional: keep computer homes and artifacts in S3-compatible storage (docs/self-host-storage.md#shared-storage-migration).
   OBJECT_STORAGE_BUCKET:
   OBJECT_STORAGE_ENDPOINT:
   OBJECT_STORAGE_REGION:
@@ -30,6 +30,7 @@ x-app-environment: &app-environment
   AGENT_RUNTIME: pi
   API_URL:
   MAX_UPLOAD_SIZE_MB:
+  MAX_ATTACHMENTS_PER_MESSAGE:
   RAKAZO_UPDATE_RESTART_SUPERVISOR:
   TICKET_BOARD_ENABLED:
   USER_DEVICES_ENABLED:
@@ -41,6 +42,11 @@ x-app-environment: &app-environment
   PHONE_CALL_COOLDOWN_MINUTES:
   RAKAZO_SECRETS_ALLOW_PRIVATE_HTTP:
   EXPO_ACCESS_TOKEN:
+  APNS_VOIP_KEY_ID:
+  APNS_VOIP_TEAM_ID:
+  APNS_VOIP_PRIVATE_KEY:
+  APNS_VOIP_ENVIRONMENT:
+  APNS_VOIP_BUNDLE_ID:
   # Secret storage
   SECRET_STORE: ${SECRET_STORE:-encrypted}
   INFISICAL_URL: ${INFISICAL_URL:-}
@@ -53,6 +59,9 @@ x-app-environment: &app-environment
   # Logs, errors, traces and analytics
   LOG_LEVEL:
   SECURITY_EVENT_RETENTION_DAYS:
+  AUDIT_EVENT_RETENTION_DAYS:
+  AUDIT_LOG_WEBHOOK_URL:
+  AUDIT_LOG_WEBHOOK_AUTHORIZATION:
   LOG_FORMAT:
   AXIOM_TOKEN:
   AXIOM_DATASET:
@@ -82,15 +91,18 @@ x-app-environment: &app-environment
   TYPESAFE_API_KEY:
   MAX_TOOL_CALLS_PER_TURN:
   MODEL_STREAM_MAX_RETRIES:
+  MODEL_STREAM_TIMEOUT_MS:
+  MODEL_CONNECT_TIMEOUT_MS:
+  MODEL_STREAM_IDLE_TIMEOUT_MS:
   RAKAZO_LOCAL_MODELS:
   RAKAZO_LOCAL_MODELS_URL:
   RAKAZO_LOCAL_VISION_MODELS:
+  RAKAZO_LOCAL_REASONING_MODELS:
   RAKAZO_LOCAL_CONTEXT_WINDOW:
   RAKAZO_LOCAL_MAX_TOKENS:
   RAKAZO_OPENAI_COMPATIBLE_VISION_MODELS:
   RAKAZO_OPENAI_COMPAT_ALLOW_PUBLIC:
   RAKAZO_OPENAI_COMPAT_PRIVATE_HOSTS:
-  RAKAZO_AUTO_REVIEW:
   RAKAZO_AUTO_REVIEW_PROVIDER:
   RAKAZO_AUTO_REVIEW_MODEL:
   RAKAZO_AUTO_REVIEW_MIN_CONFIDENCE:
@@ -170,8 +182,11 @@ x-app-environment: &app-environment
   SANDBOX_IDLE_MS:
   SANDBOX_MAX_COMPUTERS_PER_USER:
   COMPUTER_MAX_ACTIVE_MS:
+  COMPUTER_MAX_ACTIVE_UNBILLED_MS:
   COMPUTER_TAKEOVER_TTL_MS:
   BROWSER_PROVIDER:
+  NOVITA_API_KEY:
+  SANDBOX_TEMPLATE:
   E2B_API_KEY:
   DAYTONA_API_KEY:
   DAYTONA_API_URL:
@@ -179,16 +194,36 @@ x-app-environment: &app-environment
   DAYTONA_SNAPSHOT:
   BOAT_API_KEY:
   BOAT_API_URL:
+  BOXD_API_KEY:
+  BOXD_ORG:
   RAILWAY_API_TOKEN:
   RAILWAY_ENVIRONMENT_ID:
   RAILWAY_SANDBOX_REGION:
   RAILWAY_MAX_WORKSPACE_FILE_BYTES:
+  WUYING_ACCESS_KEY_ID:
+  WUYING_ACCESS_KEY_SECRET:
+  WUYING_DESKTOP_ID:
+  WUYING_END_USER_ID:
+  WUYING_MCP_TOKEN:
+  WUYING_MCP_URL:
+  WUYING_REGION_ID:
+  INCUS_SANDBOX_URL:
+  INCUS_SANDBOX_CLIENT_CERT:
+  INCUS_SANDBOX_CLIENT_KEY:
+  INCUS_SANDBOX_SERVER_CERT:
+  INCUS_SANDBOX_PROJECT:
+  INCUS_SANDBOX_COMPUTER_IMAGE:
+  INCUS_SANDBOX_CPU_LIMIT:
+  INCUS_SANDBOX_MEMORY_LIMIT:
+  INCUS_SANDBOX_PROCESS_LIMIT:
   CREATEOS_SANDBOX_API_KEY:
   CREATEOS_SANDBOX_BASE_URL:
   CREATEOS_SANDBOX_ROOTFS:
   CREATEOS_SANDBOX_SHAPE:
   CLOUD_AGENT_PROVIDER: ${CLOUD_AGENT_PROVIDER:-none}
   CLOUD_AGENT_SPACE_ID: ${CLOUD_AGENT_SPACE_ID:-}
+  PAYMENT_WALLET_PROVIDER: ${PAYMENT_WALLET_PROVIDER:-none}
+  PAYMENT_WALLET_CLIENT_ID: ${PAYMENT_WALLET_CLIENT_ID:-}
   CURSOR_API_KEY: ${CURSOR_API_KEY:-}
   # Tools and integrations
   WEB_PROVIDER:
@@ -204,6 +239,8 @@ x-app-environment: &app-environment
   MCP_STDIO_STARTUP_TIMEOUT_MS:
   MCP_STDIO_IDLE_MS:
   MCP_DISCOVERY_TIMEOUT_MS:
+  MCP_MAX_TOOLS:
+  MCP_MAX_PAGES:
   MCP_PACKAGES_DIR:
   MCP_ALLOW_PRIVATE_ENDPOINT:
   # Messaging (outbound delivery runs in the worker)
@@ -227,6 +264,9 @@ x-app-environment: &app-environment
   LARK_VERIFICATION_TOKEN:
   LARK_ENCRYPT_KEY:
   LARK_DOMAIN:
+  PHOTON_PROJECT_ID:
+  PHOTON_PROJECT_SECRET:
+  PHOTON_WEBHOOK_SECRET:
   # Optional egress proxy (Mainland / corporate). Empty = unset; either case works.
   HTTP_PROXY: ${HTTP_PROXY:-${http_proxy:-}}
   HTTPS_PROXY: ${HTTPS_PROXY:-${https_proxy:-}}
@@ -262,7 +302,7 @@ services:
       - postgres:/var/lib/postgresql
       # The Postgres 16 volume from earlier releases, read-only. While it holds data and no 18
       # cluster exists, the image refuses to start instead of creating an empty database; run
-      # upgrade-postgres.sh (docs/self-host.md#upgrading-to-postgres-18).
+      # upgrade-postgres.sh (docs/self-host-upgrading.md#upgrading-to-postgres-18).
       - pgdata:/var/lib/postgresql/16/docker:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rakazo} -d ${POSTGRES_DB:-rakazo}"]
@@ -290,6 +330,7 @@ services:
       SANDBOX_SCREEN_NETWORK: isolated
       SANDBOX_COMPUTER_EGRESS: ${SANDBOX_COMPUTER_EGRESS:-auto}
       SANDBOX_COMPUTER_DNS: ${SANDBOX_COMPUTER_DNS:-}
+      SANDBOX_COMPUTER_MOUNTS: ${SANDBOX_COMPUTER_MOUNTS:-}
       LOG_LEVEL: ${LOG_LEVEL:-info}
       LOG_FORMAT: ${LOG_FORMAT:-}
       AXIOM_TOKEN: ${AXIOM_TOKEN:-}
@@ -357,8 +398,9 @@ services:
       AUTH_BREACHED_PASSWORD_CHECK_ENABLED: ${AUTH_BREACHED_PASSWORD_CHECK_ENABLED:-false}
       PASSKEY_APPLE_APP_IDS:
       PASSKEY_ANDROID_CERT_SHA256:
+      COMPUTER_SETTINGS_ENABLED:
       # Proxies whose X-Forwarded-For is believed. Unset trusts this stack's own networks: the web
-      # proxy and a reverse proxy on the host. See docs/self-host.md#client-addresses.
+      # proxy and a reverse proxy on the host. See docs/self-host-production.md#client-addresses.
       TRUSTED_PROXIES:
       CLIENT_IP_HEADER:
       OIDC_ISSUER: ${OIDC_ISSUER:-}
@@ -367,6 +409,7 @@ services:
       OIDC_NAME: ${OIDC_NAME:-SSO}
       OIDC_SCOPES: ${OIDC_SCOPES:-openid email profile}
       OIDC_ALLOW_SIGNUP_BYPASS: ${OIDC_ALLOW_SIGNUP_BYPASS:-false}
+      SCIM_BEARER_TOKEN: ${SCIM_BEARER_TOKEN:-}
       SIGNUPS_ENABLED:
       SIGNUP_ALLOWLIST:
       SCREEN_PROXY_SECRET: ${SCREEN_PROXY_SECRET:?Set SCREEN_PROXY_SECRET in .env}
@@ -378,6 +421,8 @@ services:
       EMAIL_API_KEY:
       SMTP_URL:
       EMAIL_FROM:
+      EMAIL_REPLY_TO:
+      WELCOME_EMAIL_ENABLED:
       STRIPE_SECRET_KEY:
       STRIPE_WEBHOOK_SECRET:
       STRIPE_PRICE_ID:
@@ -390,6 +435,7 @@ services:
       SPACE_TEARDOWN_TIMEOUT_MS:
       RAKAZO_MIN_CLIENT_BUILD:
       RAKAZO_NAV_LINKS:
+      RAKAZO_ADMIN_EMAILS:
       VOICE_SUMMARY_MIN_CHARS:
     healthcheck:
       test:
@@ -419,6 +465,9 @@ services:
     # Directly, not through pnpm, so a stop reaches it (see the api command).
     working_dir: /app/apps/worker
     command: ["node", "--enable-source-maps", "dist/index.js"]
+    # A stop lets the running jobs finish rather than killing them mid-way, which would leave each
+    # locked for hours. Above JOB_DRAIN_TIMEOUT_MS in packages/adapters/src/wakeup.ts.
+    stop_grace_period: 50m
     healthcheck:
       test: ["CMD", "node", "dist/health-check.js"]
       interval: 30s
@@ -455,9 +504,10 @@ services:
       RAKAZO_HOST: ${RAKAZO_HOST:-localhost}
       RAKAZO_CSP_SCRIPT_SRC: ${RAKAZO_CSP_SCRIPT_SRC:-}
       RAKAZO_CSP_CONNECT_SRC: ${RAKAZO_CSP_CONNECT_SRC:-}
+      RAKAZO_THEME: ${RAKAZO_THEME:-}
       CRISP_WEBSITE_ID:
     ports:
-      - "127.0.0.1:5173:5173"
+      - "${RAKAZO_WEB_BIND:-127.0.0.1}:5173:5173"
     depends_on:
       - api
 

@@ -8,7 +8,7 @@ import { discardBotIntroFromCreate } from "./discard-bot-intro.js";
 import { sessionCookieHeader } from "./index.js";
 import { asSystem } from "./system-db.js";
 
-type App = { request: (input: string, init?: RequestInit) => Promise<Response> };
+type App = { request: (input: string, init?: RequestInit) => Response | Promise<Response> };
 
 process.env.WAKEUP_DRIVER = "memory";
 process.env.SANDBOX_PROVIDER = "fake";
@@ -199,7 +199,12 @@ describeAttachments("chat attachments", () => {
     )!;
     expect(reply.replyToMessageId).toBe(parent.id);
     expect(reply.replyQuote).toBe("Parent first line");
-    expect(reply.replyPreview).toEqual({ role: "user", text: "Parent first line" });
+    const me = await rpc<{ userId: string }>(app, cookie, "me");
+    expect(reply.replyPreview).toEqual({
+      role: "user",
+      author: { id: me.userId, name: "Reply User" },
+      text: "Parent first line",
+    });
     const event = await asSystem(botIntroHarness!.prisma).event.findFirst({
       where: {
         threadId: snapshot.threadId,

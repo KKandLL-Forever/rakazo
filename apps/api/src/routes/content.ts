@@ -2,9 +2,9 @@ import { ORPCError } from "@orpc/server";
 import type { UsageOperationKind } from "@rakazo/adapter-kit";
 import { resolveBotWorkspacePath } from "@rakazo/adapters";
 import type { ExportManifest } from "@rakazo/contracts";
-import { attachmentMaxBytes } from "@rakazo/contracts";
+import { attachmentMaxBytes, resolveBotAvatarSet } from "@rakazo/contracts";
 import { AttachmentValidationError } from "@rakazo/core";
-import { IsolationError, parseComputerMode } from "@rakazo/db";
+import { IsolationError, LISTED_ARTIFACT, parseComputerMode } from "@rakazo/db";
 import {
   ArtifactListCursorError,
   createOwnedArtifact,
@@ -15,6 +15,7 @@ import {
   listArtifactVersions,
   listSpaceArtifacts,
 } from "../artifacts.js";
+import { requireIdentityConfirmation } from "../identity-confirmation.js";
 import { listSpaceRuns } from "../runs.js";
 import { querySpaceSearch } from "../search.js";
 import { loadAllMessages } from "../thread-message-pages.js";
@@ -33,7 +34,7 @@ export function contentRoutes(ctx: RouterContext) {
             botId: input.botId,
             groupId: null,
             spaceId: context.actor.spaceId,
-            userId: context.actor.userId,
+            ...LISTED_ARTIFACT,
           },
         });
         return rows.map((row) => ({
@@ -232,9 +233,10 @@ export function contentRoutes(ctx: RouterContext) {
           exportedAt: new Date().toISOString(),
           bot: {
             name: bot.name,
-            title: bot.title,
             description: bot.description,
             instructions: bot.instructions,
+            color: bot.color,
+            avatarSet: resolveBotAvatarSet(bot.avatarSet),
           },
           memory: memory.map((m) => ({ path: m.path, content: m.content })),
           routines: routines.map((r) => ({
@@ -246,6 +248,10 @@ export function contentRoutes(ctx: RouterContext) {
           files,
           history,
         };
+      }),
+      accountToken: authed.export.accountToken.handler(async ({ context }) => {
+        await requireIdentityConfirmation(deps.auth, context);
+        return { token: await deps.auth.issueAccountExportToken(context.actor.userId) };
       }),
     },
     search: {

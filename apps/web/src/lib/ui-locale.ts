@@ -1,21 +1,7 @@
+import { AppLocaleSchema } from "@rakazo/contracts";
 import { matchUiLocale } from "@rakazo/core";
 
-export const UI_LOCALES = [
-  "en",
-  "de",
-  "ko",
-  "tr",
-  "hi",
-  "pt-BR",
-  "zh-CN",
-  "zh-TW",
-  "es",
-  "ru",
-  "fr",
-  "he",
-  "nl",
-  "ja",
-] as const;
+export const UI_LOCALES = AppLocaleSchema.options;
 
 export type UiLocale = (typeof UI_LOCALES)[number];
 
@@ -36,6 +22,7 @@ export const UI_LOCALE_LABELS: Record<UiLocale, string> = {
   he: "עברית",
   nl: "Nederlands",
   ja: "日本語",
+  pl: "Polski",
 };
 
 /** Normalize BCP-47 tags (`de-DE`, `ko-KR`, `pt-BR`, `zh-CN`, `es-ES`) to a supported UI locale, else `en`. */

@@ -1,6 +1,12 @@
 import { ORPCError } from "@orpc/server";
 import { MEMORY_REVISION_CONFLICT_ERROR } from "@rakazo/adapter-kit";
-import { isScratchpadStatus, listScratchpadItems, mapScratchpadItem } from "@rakazo/adapters";
+import {
+  buildAgentMemoryPrompt,
+  isScratchpadStatus,
+  listScratchpadItems,
+  mapScratchpadItem,
+  readAgentMemory,
+} from "@rakazo/adapters";
 import { isDeletableMemoryDocument } from "@rakazo/contracts";
 import { findSpaceMemoryConfig, IsolationError } from "@rakazo/db";
 import {
@@ -19,7 +25,6 @@ export function memoryRoutes(ctx: RouterContext) {
         const docs = await deps.prisma.memoryDocument.findMany({
           where: {
             spaceId: context.actor.spaceId,
-            userId: context.actor.userId,
             ...(input.botId ? { botId: input.botId } : {}),
             ...(input.scope ? { scope: input.scope } : {}),
           },
@@ -34,12 +39,24 @@ export function memoryRoutes(ctx: RouterContext) {
           updatedAt: doc.updatedAt.toISOString(),
         }));
       }),
+      budget: authed.memory.budget.handler(async ({ context, input }) => {
+        await repos.getBot(context.actor, input.botId);
+        // Read through the store a run uses, so the numbers match what the bot receives.
+        const documents = await readAgentMemory(deps.memory, input.botId, {
+          operationId: "mem",
+          traceId: "mem",
+          spaceId: context.actor.spaceId,
+          userId: context.actor.userId,
+          botId: input.botId,
+          signal: context.signal ?? new AbortController().signal,
+        });
+        return buildAgentMemoryPrompt(documents).plan;
+      }),
       update: authed.memory.update.handler(async ({ context, input }) => {
         const doc = await deps.prisma.memoryDocument.findFirst({
           where: {
             id: input.documentId,
             spaceId: context.actor.spaceId,
-            userId: context.actor.userId,
           },
         });
         if (!doc) throw new IsolationError();
@@ -81,7 +98,6 @@ export function memoryRoutes(ctx: RouterContext) {
           where: {
             id: input.documentId,
             spaceId: context.actor.spaceId,
-            userId: context.actor.userId,
           },
         });
         if (!doc) throw new IsolationError();
@@ -111,7 +127,6 @@ export function memoryRoutes(ctx: RouterContext) {
         const docs = await deps.prisma.memoryDocument.findMany({
           where: {
             spaceId: context.actor.spaceId,
-            userId: context.actor.userId,
             ...(input.botId ? { botId: input.botId } : {}),
           },
         });
@@ -163,7 +178,6 @@ export function memoryRoutes(ctx: RouterContext) {
           where: {
             id: input.itemId,
             spaceId: context.actor.spaceId,
-            userId: context.actor.userId,
           },
         });
         if (!existing) throw new IsolationError();
@@ -185,7 +199,6 @@ export function memoryRoutes(ctx: RouterContext) {
           where: {
             id: input.itemId,
             spaceId: context.actor.spaceId,
-            userId: context.actor.userId,
           },
         });
         if (!existing) throw new IsolationError();
